@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { Backend } from "./backend";
 import { Dialog, type DialogSpec } from "./components/Modal";
 import { Grid } from "./components/Grid";
@@ -39,18 +39,43 @@ export function App({ backend }: { backend: Backend }) {
   const sheet = useMemo(() => snap?.file.sheets.find((s) => s.id === sheetId) ?? snap?.file.sheets[0], [snap, sheetId]);
   const schema = useMemo(() => sheet?.schemas.find((s) => s.id === schemaId) ?? sheet?.schemas[0], [sheet, schemaId]);
 
+  /** 保存する。保存先の選択をキャンセルした場合や失敗した場合は false。 */
   const save = useCallback(
-    async (as = false) => {
-      if (!snap) return;
+    async (as = false): Promise<boolean> => {
+      if (!snap) return false;
       let path: string | null = null;
       if (as || !snap.path) {
         path = await backend.pickSavePath(`${snap.file.name || "無題"}.jxcel`);
-        if (!path) return;
+        if (!path) return false;
       }
-      if (await run(backend.saveFile(path, message), true)) setMessage("");
+      const ok = await run(backend.saveFile(path, message), true);
+      if (ok) setMessage("");
+      return ok;
     },
     [backend, snap, message, run],
   );
+
+  // 未保存の変更を捨てることになる操作の前に確認する。保存に失敗/キャンセルしたら先へ進まない。
+  const guard = (title: string, action: () => void) => {
+    if (!snap?.dirty) return action();
+    setDialog({
+      kind: "unsaved",
+      title,
+      message: "保存されていない変更があります。",
+      onSave: async () => {
+        if (await save()) action();
+      },
+      onDiscard: action,
+    });
+  };
+
+  // ウィンドウを閉じる操作。ハンドラは一度だけ登録するので、最新の guard を ref 越しに呼ぶ。
+  const closeGuard = useRef<() => void>(() => {});
+  closeGuard.current = () => guard("終了前の確認", () => void backend.closeWindow());
+  useEffect(() => {
+    const unlisten = backend.onCloseRequested(() => closeGuard.current());
+    return () => void unlisten.then((f) => f());
+  }, [backend]);
 
   useEffect(() => {
     const h = (e: KeyboardEvent) => {
@@ -63,17 +88,19 @@ export function App({ backend }: { backend: Backend }) {
     return () => window.removeEventListener("keydown", h);
   }, [save]);
 
-  const open = async () => {
-    const p = await backend.pickOpenPath();
-    if (p && (await run(backend.openFile(p)))) {
-      setSheetId(null);
-      setSchemaId(null);
-      setHistoryKey((k) => k + 1);
-    }
-  };
+  const open = () =>
+    guard("ファイルを開く前の確認", async () => {
+      const p = await backend.pickOpenPath();
+      if (p && (await run(backend.openFile(p)))) {
+        setSheetId(null);
+        setSchemaId(null);
+        setHistoryKey((k) => k + 1);
+      }
+    });
 
   const create = () =>
-    setDialog({
+    guard("新規作成前の確認", () =>
+      setDialog({
       kind: "prompt",
       title: "新しいファイル",
       initial: "無題",
@@ -84,7 +111,8 @@ export function App({ backend }: { backend: Backend }) {
           setHistoryKey((k) => k + 1);
         }
       },
-    });
+      }),
+    );
 
   const toolbar = (
     <header className="toolbar">

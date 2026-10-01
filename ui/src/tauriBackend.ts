@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { FILE_FILTER, type Backend } from "./backend";
 
@@ -28,4 +29,12 @@ export const tauriBackend: Backend = {
   historyLog: () => invoke("history_log"),
   historyDiff: (from, to) => invoke("history_diff", { from, to }),
   restore: (rev) => invoke("restore", { rev }),
+
+  onCloseRequested: (handler) =>
+    getCurrentWindow().onCloseRequested((event) => {
+      event.preventDefault();
+      handler();
+    }),
+  // close() だと上の handler が再び呼ばれるので、確認済みの終了は destroy() で行う
+  closeWindow: () => getCurrentWindow().destroy(),
 };

@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "メインウィンドウに許可する権限",
   "windows": ["main"],
-  "permissions": ["core:default", "dialog:allow-open", "dialog:allow-save"]
+  "permissions": ["core:default", "dialog:allow-open", "dialog:allow-save", "core:window:allow-destroy"]
 }

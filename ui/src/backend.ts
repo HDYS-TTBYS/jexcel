@@ -23,6 +23,11 @@ export interface Backend {
   historyLog(): Promise<CommitInfo[]>;
   historyDiff(from: string, to: string): Promise<Change[]>;
   restore(rev: string): Promise<Snapshot>;
+
+  /** ウィンドウを閉じる操作を横取りする。`handler` が呼ばれたら、閉じるかどうかは UI が決める。 */
+  onCloseRequested(handler: () => void): Promise<() => void>;
+  /** 確認なしでウィンドウを閉じる。 */
+  closeWindow(): Promise<void>;
 }
 
 export const FILE_FILTER = { name: "jxcel", extensions: ["jxcel"] };

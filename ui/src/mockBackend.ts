@@ -226,5 +226,18 @@ export function createMockBackend(): Backend {
       dirty = true;
       return snap();
     },
+
+    // ブラウザには「閉じる」を横取りする手段がないので、テスト用に window から呼べるようにする
+    onCloseRequested: async (handler) => {
+      const w = window as unknown as { __requestClose?: () => void };
+      w.__requestClose = handler;
+      // StrictMode の再マウントで後から登録された分を消さないよう、自分の分だけ解除する
+      return () => {
+        if (w.__requestClose === handler) delete w.__requestClose;
+      };
+    },
+    closeWindow: async () => {
+      (window as unknown as { __closed?: boolean }).__closed = true;
+    },
   };
 }

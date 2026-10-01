@@ -19,12 +19,42 @@ export function Modal({ title, onClose, children, wide }: { title: string; onClo
 // WebView によっては window.prompt / confirm が使えないため、自前のダイアログを使う。
 export type DialogSpec =
   | { kind: "prompt"; title: string; initial: string; onOk: (value: string) => void }
-  | { kind: "confirm"; title: string; message: string; onOk: () => void };
+  | { kind: "confirm"; title: string; message: string; onOk: () => void }
+  // 未保存の変更がある状態で先へ進むときの 3 択。閉じる/Esc はキャンセル扱い。
+  | { kind: "unsaved"; title: string; message: string; onSave: () => void; onDiscard: () => void };
 
 export function Dialog({ spec, onClose }: { spec: DialogSpec; onClose: () => void }) {
   const [value, setValue] = useState(spec.kind === "prompt" ? spec.initial : "");
   const ref = useRef<HTMLInputElement>(null);
   useEffect(() => ref.current?.select(), []);
+  if (spec.kind === "unsaved") {
+    return (
+      <Modal title={spec.title} onClose={onClose}>
+        <p>{spec.message}</p>
+        <div className="actions">
+          <button onClick={onClose}>キャンセル</button>
+          <button
+            onClick={() => {
+              onClose();
+              spec.onDiscard();
+            }}
+          >
+            破棄して続行
+          </button>
+          <button
+            className="primary"
+            autoFocus
+            onClick={() => {
+              onClose();
+              spec.onSave();
+            }}
+          >
+            保存して続行
+          </button>
+        </div>
+      </Modal>
+    );
+  }
   const ok = () => {
     if (spec.kind === "prompt") {
       if (!value.trim()) return;
