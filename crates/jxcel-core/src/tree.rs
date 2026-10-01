@@ -169,20 +169,24 @@ impl JxcelFile {
 
     /// zip（ファイルの実体）に書き出す。同じ内容なら同じバイト列になる。
     pub fn to_zip(&self) -> Result<Vec<u8>> {
-        let tree = self.to_tree()?;
-        let mut w = zip::ZipWriter::new(Cursor::new(Vec::new()));
-        let opts = zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Deflated);
-        for (path, bytes) in &tree {
-            w.start_file(path, opts)?;
-            w.write_all(bytes)?;
-        }
-        Ok(w.finish()?.into_inner())
+        write_zip_tree(&self.to_tree()?)
     }
 
     pub fn from_zip(bytes: &[u8]) -> Result<Self> {
         Self::from_tree(&read_zip_tree(bytes)?)
     }
+}
+
+/// 展開ツリーを zip に詰める。パス順・固定タイムスタンプで決定的。
+pub fn write_zip_tree(tree: &FileTree) -> Result<Vec<u8>> {
+    let mut w = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let opts = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    for (path, bytes) in tree {
+        w.start_file(path, opts)?;
+        w.write_all(bytes)?;
+    }
+    Ok(w.finish()?.into_inner())
 }
 
 pub fn read_zip_tree(bytes: &[u8]) -> Result<FileTree> {

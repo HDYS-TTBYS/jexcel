@@ -8,6 +8,8 @@ use git2::{ObjectType, Oid, Repository, Signature, TreeWalkMode, TreeWalkResult}
 use jxcel_core::diff::{diff, Change};
 use jxcel_core::tree::FileTree;
 use jxcel_core::JxcelFile;
+pub mod archive;
+
 use std::collections::BTreeMap;
 use std::path::Path;
 use thiserror::Error;

@@ -22,11 +22,12 @@ cargo fmt
 ## Architecture
 
 - `crates/jxcel-core` — UI/Tauri 非依存。データモデル(`model`)、型と検証(`types`)、永続化(`tree`)、構造差分(`diff`)。
-- `crates/jxcel-git` — `jxcel-core` の展開ツリーを内蔵 git（ベアリポジトリ、`git2`）にコミットする `History`。リポジトリの置き場所は呼び出し側が渡す（未決定事項）。
+- `crates/jxcel-git` — `jxcel-core` の展開ツリーを内蔵 git（ベアリポジトリ、`git2`）にコミットする `History`と、履歴を zip に内包する `Archive`。
 
 複数ファイルにまたがる設計上の要点:
 
 - **永続化は「展開ツリー」が中心**。`JxcelFile::to_tree()` が `manifest.json` / `sheets/<id>/sheet.json` / `sheets/<id>/<schemaId>.rows.jsonl` のパス→バイト列を作り、zip 化(`to_zip`)も git コミット(`History::commit`)も同じツリーを使う。だから git の差分が行単位で意味を持つ。出力は決定的（キー順固定、行は ID 順、zip タイムスタンプ固定）で、この性質はテストで固定されている。壊さないこと。
+- **履歴は zip に内包する**（`jxcel-git/src/archive.rs`）。zip には現在の状態（`manifest.json`, `sheets/**`）と履歴のベアリポジトリ（`history/HEAD`, `history/objects/**`, `history/refs/**`）が同居する。`Archive::open` が `history/` を一時ディレクトリに展開して `History` を開き、`Archive::save` がコミットしてから詰め直す。`jxcel-core` の `from_zip` は `history/` を無視するので、履歴なしでも現在の状態は読める。履歴のない素の zip も開ける（初回保存で履歴が始まる）。内容が同じなら保存結果のバイト列も同じ。
 - 行の並びは `sheet.json` の `rowOrder` に分離している。並べ替えで行本体のファイルが変わらないようにするため。
 - 突合はすべて安定 ID（行は `rowId`(ULID)、列は `columnId`）。列の表示名は変更可、ID は不変。`diff` もこの ID で行・列・セル単位の `Change` を返す。
 - `DataType::Custom` + `TypeRegistry` は将来の JS 型拡張の差し込み口。未登録のカスタム型は検証エラーになる。
