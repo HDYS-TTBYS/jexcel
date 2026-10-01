@@ -6,6 +6,7 @@ describe("mock backend + describeChange", () => {
   it("編集→保存→差分→復元", async () => {
     const b = createMockBackend();
     let s = await b.newFile("台帳");
+    expect(s.dirty).toBe(false); // 新規直後は変更なし。編集で変更ありになる
     const sheet = s.file.sheets[0];
     const schema = sheet.schemas[0];
     const col = schema.columns[0];

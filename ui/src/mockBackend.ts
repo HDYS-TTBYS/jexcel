@@ -135,7 +135,7 @@ export function createMockBackend(): Backend {
         ],
       };
       path = null;
-      dirty = true;
+      dirty = false;
       commits.length = 0;
       return snap();
     },

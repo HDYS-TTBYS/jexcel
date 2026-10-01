@@ -108,7 +108,8 @@ impl Session {
             file,
             archive: Archive::create()?,
             path: None,
-            dirty: true,
+            // 保存先がないことと、未保存の変更があることは別。編集するまでは変更なし。
+            dirty: false,
         });
         self.snapshot()
     }
@@ -369,6 +370,9 @@ mod tests {
         let mut s = Session::new();
         assert!(matches!(s.current(), Err(Error::NoFile)));
         let snap = s.new_file("台帳").unwrap();
+        // 新規直後は未保存の変更なし（保存先がないだけ）。最初の編集で変更ありになる
+        assert!(!snap.dirty);
+        assert_eq!(snap.path, None);
         let (sh, sc, row, col) = ids(&snap);
 
         // 型を Int に変更して不正値を拒否
@@ -403,6 +407,19 @@ mod tests {
         assert_eq!(snap.file.sheets[0].schemas[0].rows[0].cells[&col], json!(1));
         s2.save(None, "復元").unwrap();
         assert_eq!(s2.history_log().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn untouched_new_file_can_still_be_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("new.jxcel");
+        let mut s = Session::new();
+        assert!(!s.new_file("x").unwrap().dirty);
+        // 変更なしでも、保存先を指定して保存できる（履歴は初回コミットから始まる）
+        let snap = s.save(Some(path.to_str().unwrap()), "").unwrap();
+        assert!(!snap.dirty);
+        assert_eq!(snap.path.as_deref(), path.to_str());
+        assert_eq!(s.history_log().unwrap().len(), 1);
     }
 
     #[test]

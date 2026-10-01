@@ -150,7 +150,7 @@ export function App({ backend }: { backend: Backend }) {
           </button>
         </main>
         {error && <div className="toast error">{error}</div>}
-        {dialog && <Dialog spec={dialog} onClose={() => setDialog(null)} />}
+        {dialog && <Dialog key={`${dialog.kind}:${dialog.title}`} spec={dialog} onClose={() => setDialog(null)} />}
       </div>
     );
   }
@@ -271,7 +271,7 @@ export function App({ backend }: { backend: Backend }) {
           onDelete={(id) => void run(backend.deleteColumn(sheet.id, schema.id, id))}
         />
       )}
-      {dialog && <Dialog spec={dialog} onClose={() => setDialog(null)} />}
+      {dialog && <Dialog key={`${dialog.kind}:${dialog.title}`} spec={dialog} onClose={() => setDialog(null)} />}
     </div>
   );
 }
