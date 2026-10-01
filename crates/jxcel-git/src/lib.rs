@@ -128,6 +128,49 @@ impl History {
         Ok(file)
     }
 
+    /// 緩いオブジェクトを 1 つのパックにまとめる（差分圧縮が効き、ファイル数も一定になる）。
+    ///
+    /// 緩いオブジェクトがなければ何もしない。内容が変わらない保存でバイト列が変わらないための条件でもある。
+    /// パックは単一スレッドで作るので、同じ履歴からは同じパックができる。
+    pub fn pack(&self) -> Result<()> {
+        if self.head_commit()?.is_none() {
+            return Ok(());
+        }
+        let objects = self.repo.path().join("objects");
+        let loose: Vec<_> = read_dir(&objects)?
+            .into_iter()
+            .filter(|p| is_loose_dir(p))
+            .collect();
+        if loose.is_empty() {
+            return Ok(());
+        }
+
+        let mut walk = self.repo.revwalk()?;
+        walk.push_head()?;
+        let mut builder = self.repo.packbuilder()?;
+        builder.set_threads(1);
+        builder.insert_walk(&mut walk)?;
+        let pack_dir = objects.join("pack");
+        std::fs::create_dir_all(&pack_dir).map_err(io)?;
+        let before = read_dir(&pack_dir)?;
+        builder.write(&pack_dir, 0)?;
+        let after = read_dir(&pack_dir)?;
+
+        // 今回書いたパック（増えたファイル）だけを残し、古いパックを消す。
+        // 同一内容のパックが既にあって増えなかった場合は、何も消さない。
+        let written: Vec<_> = after.iter().filter(|p| !before.contains(p)).collect();
+        if !written.is_empty() {
+            for old in before {
+                std::fs::remove_file(&old).map_err(io)?;
+            }
+        }
+        for dir in loose {
+            std::fs::remove_dir_all(&dir).map_err(io)?;
+        }
+        self.repo.odb()?.refresh()?;
+        Ok(())
+    }
+
     fn head_commit(&self) -> Result<Option<git2::Commit<'_>>> {
         match self.repo.head() {
             Ok(h) => Ok(Some(h.peel_to_commit()?)),
@@ -167,6 +210,28 @@ impl History {
         }
         Ok(builder.write()?)
     }
+}
+
+fn io(e: std::io::Error) -> Error {
+    jxcel_core::Error::from(e).into()
+}
+
+fn read_dir(dir: &Path) -> Result<Vec<std::path::PathBuf>> {
+    let mut out = vec![];
+    for entry in std::fs::read_dir(dir).map_err(io)? {
+        out.push(entry.map_err(io)?.path());
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// `objects/ab/` のような、緩いオブジェクトのディレクトリか。
+fn is_loose_dir(path: &Path) -> bool {
+    path.is_dir()
+        && path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.len() == 2 && n.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 #[cfg(test)]

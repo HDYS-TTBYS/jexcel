@@ -52,10 +52,11 @@ impl Archive {
         &self.history
     }
 
-    /// 現在の状態を履歴に記録し、ファイルのバイト列を返す。
+    /// 現在の状態を履歴に記録し、ファイルのバイト列を返す。履歴は 1 つのパックにまとめて詰める。
     /// 内容が直前と同じならコミットは増えないが、バイト列は返す。
     pub fn save(&self, file: &JxcelFile, message: &str) -> Result<Vec<u8>> {
         self.history.commit(file, message)?;
+        self.history.pack()?;
         let mut tree: FileTree = file.to_tree()?;
         pack_dir(self.dir.path(), self.dir.path(), &mut tree)?;
         Ok(write_zip_tree(&tree)?)
@@ -146,6 +147,88 @@ mod tests {
         let again = a.save(&f, "変更なし").unwrap();
         assert_eq!(again, v1);
         assert_eq!(a.history().log().unwrap().len(), 1);
+    }
+
+    fn history_entries(zip: &[u8]) -> Vec<String> {
+        read_zip_tree(zip)
+            .unwrap()
+            .into_keys()
+            .filter(|k| k.starts_with("history/objects/"))
+            .collect()
+    }
+
+    #[test]
+    fn history_is_packed_and_stays_small() {
+        // 行が多いファイルで 30 回保存しても、履歴のファイル数は一定（パック 1 組）
+        let big = |n: i64| {
+            let mut f = file(0);
+            let s = &mut f.sheets[0].schemas[0];
+            s.rows = (0..200)
+                .map(|i| Row {
+                    id: format!("r{i:03}"),
+                    cells: [("qty".to_string(), json!(i + n))].into(),
+                })
+                .collect();
+            f
+        };
+        let mut a = Archive::create().unwrap();
+        let mut zip = vec![];
+        let mut first_size = 0;
+        for n in 0..30 {
+            zip = a.save(&big(n), &format!("v{n}")).unwrap();
+            if n == 0 {
+                first_size = zip.len();
+            }
+            a = Archive::open(&zip).unwrap().0;
+        }
+        let entries = history_entries(&zip);
+        assert_eq!(entries.len(), 2, "{entries:?}"); // pack-*.pack と pack-*.idx
+        assert!(entries
+            .iter()
+            .all(|e| e.starts_with("history/objects/pack/pack-")));
+        eprintln!("1世代: {first_size} バイト / 30世代: {} バイト", zip.len());
+        // 30 世代ぶんの履歴が、1 世代の数倍に収まる（差分圧縮が効いている）
+        assert!(
+            zip.len() < first_size * 6,
+            "first={first_size} last={}",
+            zip.len()
+        );
+
+        // パック後も全リビジョンを読め、差分も取れる
+        let (a, f) = Archive::open(&zip).unwrap();
+        assert_eq!(f, big(29));
+        let log = a.history().log().unwrap();
+        assert_eq!(log.len(), 30);
+        assert_eq!(a.history().load(&log[29].id).unwrap(), big(0));
+        assert_eq!(a.history().diff(&log[1].id, &log[0].id).unwrap().len(), 200);
+    }
+
+    #[test]
+    fn packing_is_stable_and_upgrades_loose_archives() {
+        // 緩いオブジェクトのままの旧形式（pack を呼ばずに詰めたもの）
+        let a = Archive::create().unwrap();
+        a.history().commit(&file(1), "初回").unwrap();
+        a.history().commit(&file(2), "変更").unwrap();
+        let mut tree = file(2).to_tree().unwrap();
+        pack_dir(a.dir.path(), a.dir.path(), &mut tree).unwrap();
+        let legacy = write_zip_tree(&tree).unwrap();
+        assert!(history_entries(&legacy)
+            .iter()
+            .any(|e| !e.contains("/pack/")));
+
+        // 開いて保存すると、履歴は保ったままパックに移行する
+        let (a, f) = Archive::open(&legacy).unwrap();
+        let packed = a.save(&f, "unused").unwrap();
+        assert!(history_entries(&packed)
+            .iter()
+            .all(|e| e.starts_with("history/objects/pack/")));
+        assert_eq!(a.history().log().unwrap().len(), 2);
+
+        // 変更なしで開き直して保存しても、バイト列は変わらない
+        let (a, f) = Archive::open(&packed).unwrap();
+        assert_eq!(a.save(&f, "変更なし").unwrap(), packed);
+        let (a, _) = Archive::open(&packed).unwrap();
+        assert_eq!(a.history().log().unwrap().len(), 2);
     }
 
     #[test]
