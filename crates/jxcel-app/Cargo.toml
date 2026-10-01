@@ -1,15 +1,15 @@
 [package]
-name = "jxcel-git"
+name = "jxcel-app"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
 jxcel-core = { path = "../jxcel-core" }
-git2 = { version = "0.20", default-features = false }
-thiserror.workspace = true
+jxcel-git = { path = "../jxcel-git" }
 serde.workspace = true
-tempfile = "3"
+serde_json.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
-serde_json.workspace = true
+tempfile = "3"

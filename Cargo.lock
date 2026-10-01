@@ -339,6 +339,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "jxcel-app"
+version = "0.1.0"
+dependencies = [
+ "jxcel-core",
+ "jxcel-git",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "jxcel-core"
 version = "0.1.0"
 dependencies = [
@@ -355,6 +367,7 @@ version = "0.1.0"
 dependencies = [
  "git2",
  "jxcel-core",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror",

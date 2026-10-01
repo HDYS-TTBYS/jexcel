@@ -1,0 +1,8 @@
+{
+  "name": "jxcel",
+  "private": true,
+  "scripts": {
+    "tauri": "ui/node_modules/.bin/tauri",
+    "ui": "pnpm --dir ui"
+  }
+}
