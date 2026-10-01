@@ -15,9 +15,11 @@ use crate::{Error, History, Result};
 const HISTORY_DIR: &str = "history";
 
 pub struct Archive {
+    // フィールドは宣言順に破棄される。Windows は開いたままのファイルを含むディレクトリを
+    // 消せないので、先に履歴（リポジトリのハンドル）を閉じてから作業場所を消す。
+    history: History,
     // 履歴の作業場所。Archive が生きている間だけ存在する。
     dir: tempfile::TempDir,
-    history: History,
 }
 
 impl Archive {
@@ -54,7 +56,7 @@ impl Archive {
 
     /// 現在の状態を履歴に記録し、ファイルのバイト列を返す。履歴は 1 つのパックにまとめて詰める。
     /// 内容が直前と同じならコミットは増えないが、バイト列は返す。
-    pub fn save(&self, file: &JxcelFile, message: &str) -> Result<Vec<u8>> {
+    pub fn save(&mut self, file: &JxcelFile, message: &str) -> Result<Vec<u8>> {
         self.history.commit(file, message)?;
         self.history.pack()?;
         let mut tree: FileTree = file.to_tree()?;
@@ -114,11 +116,11 @@ mod tests {
 
     #[test]
     fn history_travels_inside_the_file() {
-        let a = Archive::create().unwrap();
+        let mut a = Archive::create().unwrap();
         let v1 = a.save(&file(1), "初回").unwrap();
 
         // 開き直して編集 → 保存 を繰り返しても履歴が引き継がれる
-        let (a, f) = Archive::open(&v1).unwrap();
+        let (mut a, f) = Archive::open(&v1).unwrap();
         assert_eq!(f, file(1));
         let v2 = a.save(&file(2), "数量変更").unwrap();
 
@@ -135,6 +137,7 @@ mod tests {
 
         // 復元もファイルに残る
         let restored = a.history().restore(&log[1].id).unwrap();
+        let mut a = a;
         let v3 = a.save(&restored, "unused").unwrap();
         let (a, f) = Archive::open(&v3).unwrap();
         assert_eq!(f, file(1));
@@ -143,7 +146,7 @@ mod tests {
 
     #[test]
     fn plain_reader_ignores_history_and_unchanged_save_is_stable() {
-        let a = Archive::create().unwrap();
+        let mut a = Archive::create().unwrap();
         let v1 = a.save(&file(1), "初回").unwrap();
         assert_eq!(JxcelFile::from_zip(&v1).unwrap(), file(1));
         assert!(read_zip_tree(&v1)
@@ -151,7 +154,7 @@ mod tests {
             .keys()
             .any(|k| k.starts_with("history/")));
 
-        let (a, f) = Archive::open(&v1).unwrap();
+        let (mut a, f) = Archive::open(&v1).unwrap();
         let again = a.save(&f, "変更なし").unwrap();
         assert_eq!(again, v1);
         assert_eq!(a.history().log().unwrap().len(), 1);
@@ -242,7 +245,7 @@ mod tests {
             .any(|e| !e.contains("/pack/")));
 
         // 開いて保存すると、履歴は保ったままパックに移行する
-        let (a, f) = Archive::open(&legacy).unwrap();
+        let (mut a, f) = Archive::open(&legacy).unwrap();
         let packed = a.save(&f, "unused").unwrap();
         assert!(history_entries(&packed)
             .iter()
@@ -250,16 +253,32 @@ mod tests {
         assert_eq!(a.history().log().unwrap().len(), 2);
 
         // 変更なしで開き直して保存しても、バイト列は変わらない
-        let (a, f) = Archive::open(&packed).unwrap();
+        let (mut a, f) = Archive::open(&packed).unwrap();
         assert_eq!(a.save(&f, "変更なし").unwrap(), packed);
         let (a, _) = Archive::open(&packed).unwrap();
         assert_eq!(a.history().log().unwrap().len(), 2);
     }
 
     #[test]
+    fn repeated_saves_on_one_archive() {
+        // 開き直さずに保存を繰り返す（アプリのセッションと同じ使い方）。
+        // Windows は開いたままのパックを削除できないので、ここで失敗しないことが重要。
+        let mut a = Archive::create().unwrap();
+        let mut last = vec![];
+        for n in 0..5 {
+            last = a.save(&file(n), &format!("v{n}")).unwrap();
+        }
+        assert_eq!(a.history().log().unwrap().len(), 5);
+        let (b, f) = Archive::open(&last).unwrap();
+        assert_eq!(f, file(4));
+        assert_eq!(b.history().log().unwrap().len(), 5);
+        assert_eq!(history_entries(&last).len(), 2);
+    }
+
+    #[test]
     fn opens_file_without_history() {
         let plain = file(7).to_zip().unwrap();
-        let (a, f) = Archive::open(&plain).unwrap();
+        let (mut a, f) = Archive::open(&plain).unwrap();
         assert_eq!(f, file(7));
         assert!(a.history().log().unwrap().is_empty());
         let saved = a.save(&f, "取り込み").unwrap();

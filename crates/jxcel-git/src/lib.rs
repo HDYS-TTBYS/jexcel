@@ -137,7 +137,7 @@ impl History {
     ///
     /// 緩いオブジェクトがなければ何もしない。内容が変わらない保存でバイト列が変わらないための条件でもある。
     /// パックは単一スレッドで作るので、同じ履歴からは同じパックができる。
-    pub fn pack(&self) -> Result<()> {
+    pub fn pack(&mut self) -> Result<()> {
         if self.head_commit()?.is_none() {
             return Ok(());
         }
@@ -164,15 +164,20 @@ impl History {
         // 今回書いたパック（増えたファイル）だけを残し、古いパックを消す。
         // 同一内容のパックが既にあって増えなかった場合は、何も消さない。
         let written: Vec<_> = after.iter().filter(|p| !before.contains(p)).collect();
-        if !written.is_empty() {
-            for old in before {
-                std::fs::remove_file(&old).map_err(io)?;
-            }
+        let stale: Vec<_> = if written.is_empty() { vec![] } else { before };
+
+        // Windows では、libgit2 がメモリマップしているパックファイルは削除できない。
+        // 古いパックを開いたままのハンドルを手放すため、リポジトリを開き直してから消す。
+        drop(builder);
+        drop(walk);
+        let git_dir = self.repo.path().to_owned();
+        self.repo = Repository::open_bare(&git_dir)?;
+        for old in stale {
+            std::fs::remove_file(&old).map_err(io)?;
         }
         for dir in loose {
             std::fs::remove_dir_all(&dir).map_err(io)?;
         }
-        self.repo.odb()?.refresh()?;
         Ok(())
     }
 
