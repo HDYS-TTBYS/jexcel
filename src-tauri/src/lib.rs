@@ -1,6 +1,6 @@
 //! Tauri のコマンド層。ロジックはすべて `jxcel-app` の `Session` にあり、ここは薄い橋渡しだけ。
 
-use jxcel_app::{Session, Snapshot};
+use jxcel_app::{RunOutput, Session, Snapshot};
 use jxcel_core::diff::Change;
 use jxcel_core::Column;
 use jxcel_git::CommitInfo;
@@ -94,6 +94,27 @@ fn set_cell(
 }
 
 #[tauri::command(async)]
+fn add_macro(app: App, name: String) -> Reply<Snapshot> {
+    with(&app, |s| s.add_macro(&name))
+}
+
+#[tauri::command(async)]
+fn update_macro(app: App, id: String, name: String, source: String) -> Reply<Snapshot> {
+    with(&app, |s| s.update_macro(&id, &name, &source))
+}
+
+#[tauri::command(async)]
+fn delete_macro(app: App, id: String) -> Reply<Snapshot> {
+    with(&app, |s| s.delete_macro(&id))
+}
+
+// マクロは最大 10 秒かかりうるので async(スレッドプール)で実行する。
+#[tauri::command(async)]
+fn run_macro(app: App, id: String, source: Option<String>) -> Reply<RunOutput> {
+    with(&app, |s| s.run_macro(&id, source.as_deref()))
+}
+
+#[tauri::command(async)]
 fn history_log(app: App) -> Reply<Vec<CommitInfo>> {
     with(&app, |s| s.history_log())
 }
@@ -126,6 +147,10 @@ pub fn run() {
             add_row,
             delete_row,
             set_cell,
+            add_macro,
+            update_macro,
+            delete_macro,
+            run_macro,
             history_log,
             history_diff,
             restore,

@@ -49,3 +49,12 @@ input, select { font: inherit; padding: 4px 6px; border: 1px solid var(--bd); bo
 .changes li { padding: 3px 0; font-size: 13px; }
 .changes li.rowAdded, .changes li.columnAdded, .changes li.sheetAdded, .changes li.schemaAdded { color: #166534; }
 .changes li.rowRemoved, .changes li.columnRemoved, .changes li.sheetRemoved, .changes li.schemaRemoved { color: var(--err); }
+.macros { width: 48%; min-width: 420px; border-left: 1px solid var(--bd); display: flex; flex-direction: column; background: #fff; }
+.macro-bar { display: flex; gap: 6px; padding: 8px; border-bottom: 1px solid var(--bd); align-items: center; }
+.macro-bar select { max-width: 200px; }
+.macro-editor { flex: 1; min-height: 120px; }
+.macro-output { height: 200px; overflow: auto; border-top: 1px solid var(--bd); padding: 8px 12px; background: var(--bg2); font-size: 13px; }
+.macro-output pre { margin: 4px 0; white-space: pre-wrap; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; }
+.out-summary { margin: 0 0 4px; font-weight: 600; }
+.out-error { color: var(--err); }
+.out-result { color: #1d4ed8; }

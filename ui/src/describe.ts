@@ -35,6 +35,14 @@ export function describeChange(c: Change, file: JxcelFile): string {
       return `行を削除 ${summarizeRow(c.cells.cells)}`;
     case "cellChanged":
       return `行 ${c.row.slice(-6)} の「${colName(c.sheet, c.schema, c.column)}」: ${show(c.old)} → ${show(c.new)}`;
+    case "macroAdded":
+      return `マクロ「${c.name}」を追加`;
+    case "macroRemoved":
+      return `マクロ「${c.name}」を削除`;
+    case "macroRenamed":
+      return `マクロ名: ${c.old} → ${c.new}`;
+    case "macroEdited":
+      return `マクロ「${c.name}」のコードを変更`;
     case "rowsReordered":
       return "行の並び順を変更";
   }

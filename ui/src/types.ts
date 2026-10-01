@@ -39,9 +39,25 @@ export interface Sheet {
   schemas: DataSchema[];
 }
 
+export interface Macro {
+  id: string;
+  name: string;
+  /** ユーザーが書いたままの TypeScript */
+  source: string;
+}
+
 export interface JxcelFile {
   name: string;
   sheets: Sheet[];
+  macros: Macro[];
+}
+
+export interface RunOutput {
+  snapshot: Snapshot;
+  logs: string[];
+  result: unknown;
+  /** 書き込み操作の数（0 ならファイルは変わっていない） */
+  ops: number;
 }
 
 export interface Snapshot {
@@ -70,6 +86,10 @@ export type Change =
   | { kind: "rowAdded"; sheet: string; schema: string; row: string; cells: Row }
   | { kind: "rowRemoved"; sheet: string; schema: string; row: string; cells: Row }
   | { kind: "cellChanged"; sheet: string; schema: string; row: string; column: string; old: unknown; new: unknown }
+  | { kind: "macroAdded"; id: string; name: string }
+  | { kind: "macroRemoved"; id: string; name: string }
+  | { kind: "macroRenamed"; id: string; old: string; new: string }
+  | { kind: "macroEdited"; id: string; name: string }
   | { kind: "rowsReordered"; sheet: string; schema: string };
 
 export const SCALAR_KINDS = ["string", "int", "float", "decimal", "bool", "date", "dateTime", "enum", "any"] as const;

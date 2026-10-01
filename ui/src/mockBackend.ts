@@ -2,6 +2,8 @@
 // Rust 側の挙動を簡易的に再現するだけで、永続化はしない。
 
 import type { Backend } from "./backend";
+// Rust 側（crates/jxcel-macro）と同じ実行ライブラリを再利用する。
+import prelude from "../../crates/jxcel-macro/src/prelude.js?raw";
 import {
   defaultType,
   newId,
@@ -11,6 +13,7 @@ import {
   type DataSchema,
   type DataType,
   type JxcelFile,
+  type RunOutput,
   type Snapshot,
 } from "./types";
 
@@ -89,7 +92,37 @@ function diff(a: JxcelFile, b: JxcelFile): Change[] {
       if (!sb.schemas.some((s) => s.id === ca.id)) out.push({ kind: "schemaRemoved", sheet: sb.id, schema: ca.id, name: ca.name });
   }
   for (const sa of a.sheets) if (!b.sheets.some((s) => s.id === sa.id)) out.push({ kind: "sheetRemoved", sheet: sa.id, name: sa.name });
+  for (const m of b.macros) {
+    const old = a.macros.find((x) => x.id === m.id);
+    if (!old) out.push({ kind: "macroAdded", id: m.id, name: m.name });
+    else {
+      if (old.name !== m.name) out.push({ kind: "macroRenamed", id: m.id, old: old.name, new: m.name });
+      if (old.source !== m.source) out.push({ kind: "macroEdited", id: m.id, name: m.name });
+    }
+  }
+  for (const m of a.macros) if (!b.macros.some((x) => x.id === m.id)) out.push({ kind: "macroRemoved", id: m.id, name: m.name });
   return out;
+}
+
+type Op =
+  | { op: "add"; sheet: string; schema: string; row: string; cells: Record<string, unknown> }
+  | { op: "update"; sheet: string; schema: string; row: string; cells: Record<string, unknown> }
+  | { op: "remove"; sheet: string; schema: string; row: string };
+
+/**
+ * ブラウザ単体用のマクロ実行。TypeScript の変換はできないので、型注釈のない JS だけ動く
+ * （本物の実行は Rust 側の QuickJS）。`export default` を式にして呼ぶ。
+ */
+function runMacroInBrowser(source: string, file: JxcelFile): { ops: Op[]; logs: string[]; result: unknown } {
+  const w = window as unknown as { __newId?: () => string };
+  w.__newId = newId;
+  const fakeGlobal: Record<string, unknown> = {};
+  // prelude は globalThis.console を差し替えるので、本物の globalThis を隠して実行する
+  new Function("globalThis", prelude)(fakeGlobal);
+  const state = (fakeGlobal.__makeState as (d: JxcelFile) => { jx: unknown; finish: (r: unknown) => string })(structuredClone(file));
+  const body = source.replace(/export\s+default\s+/, "const __main = ") + "\n;return __main(jx);";
+  const result = new Function("jx", "console", body)(state.jx, (fakeGlobal.console as object) ?? console);
+  return JSON.parse(state.finish(result));
 }
 
 export function createMockBackend(): Backend {
@@ -133,6 +166,7 @@ export function createMockBackend(): Backend {
         sheets: [
           { id: newId(), name: "シート1", schemas: [{ id: newId(), name: "データ", columns: [col], rows: [{ id: newId(), cells: {} }] }] },
         ],
+        macros: [],
       };
       path = null;
       dirty = false;
@@ -212,6 +246,59 @@ export function createMockBackend(): Backend {
         if (value === null || value === undefined) delete r.cells[column];
         else r.cells[column] = value;
       }),
+
+    addMacro: async (name) =>
+      edit((f) => {
+        f.macros.push({
+          id: newId(),
+          name,
+          source: 'export default function (jx) {\n  const rows = jx.sheet("シート1").schema("データ").rows();\n  jx.log(rows.length + " 行");\n}\n',
+        });
+      }),
+    updateMacro: async (id, name, source) => {
+      const cur = file?.macros.find((m) => m.id === id);
+      if (cur && cur.name === name && cur.source === source) return snap(); // 変更なしなら未保存にしない
+      return edit((f) => {
+        const m = f.macros.find((x) => x.id === id);
+        if (!m) throw "マクロ が見つかりません";
+        m.name = name;
+        m.source = source;
+      });
+    },
+    deleteMacro: async (id) =>
+      edit((f) => {
+        if (!f.macros.some((m) => m.id === id)) throw "マクロ が見つかりません";
+        f.macros = f.macros.filter((m) => m.id !== id);
+      }),
+    runMacro: async (id, source): Promise<RunOutput> => {
+      if (!file) throw "ファイルが開かれていません";
+      const m = file.macros.find((x) => x.id === id);
+      if (!m) throw "マクロ が見つかりません";
+      let out;
+      try {
+        out = runMacroInBrowser(source ?? m.source, file);
+      } catch (e) {
+        throw `マクロ: 実行エラー: ${e instanceof Error ? e.message : String(e)}（ブラウザ単体では型注釈のない JS だけ実行できます）`;
+      }
+      if (out.ops.length > 0) {
+        const next = clone(file);
+        for (const op of out.ops) {
+          const s = schemaOf(next, op.sheet, op.schema);
+          if (op.op === "add") s.rows.push({ id: op.row, cells: Object.fromEntries(Object.entries(op.cells).filter(([, v]) => v !== null)) });
+          else if (op.op === "update") {
+            const r = s.rows.find((x) => x.id === op.row);
+            if (!r) throw "行 が見つかりません";
+            for (const [k, v] of Object.entries(op.cells)) {
+              if (v === null) delete r.cells[k];
+              else r.cells[k] = v;
+            }
+          } else s.rows = s.rows.filter((x) => x.id !== op.row);
+        }
+        file = next;
+        dirty = true;
+      }
+      return { snapshot: snap(), logs: out.logs, result: out.result ?? null, ops: out.ops.length };
+    },
 
     historyLog: async () => [...commits].reverse().map((c) => clone(c.info)),
     historyDiff: async (from, to) => {

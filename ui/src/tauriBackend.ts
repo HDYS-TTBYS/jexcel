@@ -26,6 +26,11 @@ export const tauriBackend: Backend = {
   deleteRow: (sheet, schema, row) => invoke("delete_row", { sheet, schema, row }),
   setCell: (sheet, schema, row, column, value) => invoke("set_cell", { sheet, schema, row, column, value }),
 
+  addMacro: (name) => invoke("add_macro", { name }),
+  updateMacro: (id, name, source) => invoke("update_macro", { id, name, source }),
+  deleteMacro: (id) => invoke("delete_macro", { id }),
+  runMacro: (id, source) => invoke("run_macro", { id, source }),
+
   historyLog: () => invoke("history_log"),
   historyDiff: (from, to) => invoke("history_diff", { from, to }),
   restore: (rev) => invoke("restore", { rev }),

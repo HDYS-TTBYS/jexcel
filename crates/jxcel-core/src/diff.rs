@@ -83,6 +83,24 @@ pub enum Change {
         old: Value,
         new: Value,
     },
+    MacroAdded {
+        id: String,
+        name: String,
+    },
+    MacroRemoved {
+        id: String,
+        name: String,
+    },
+    MacroRenamed {
+        id: String,
+        old: String,
+        new: String,
+    },
+    /// マクロのソースが変わった
+    MacroEdited {
+        id: String,
+        name: String,
+    },
     /// 行の並びだけが変わった（共通する行の相対順序が違う）
     RowsReordered {
         sheet: String,
@@ -146,7 +164,42 @@ pub fn diff(old: &JxcelFile, new: &JxcelFile) -> Vec<Change> {
             }
         }
     }
+    diff_macros(old, new, &mut out);
     out
+}
+
+fn diff_macros(old: &JxcelFile, new: &JxcelFile, out: &mut Vec<Change>) {
+    for m in &old.macros {
+        if !new.macros.iter().any(|n| n.id == m.id) {
+            out.push(Change::MacroRemoved {
+                id: m.id.clone(),
+                name: m.name.clone(),
+            });
+        }
+    }
+    for n in &new.macros {
+        match old.macros.iter().find(|m| m.id == n.id) {
+            None => out.push(Change::MacroAdded {
+                id: n.id.clone(),
+                name: n.name.clone(),
+            }),
+            Some(m) => {
+                if m.name != n.name {
+                    out.push(Change::MacroRenamed {
+                        id: n.id.clone(),
+                        old: m.name.clone(),
+                        new: n.name.clone(),
+                    });
+                }
+                if m.source != n.source {
+                    out.push(Change::MacroEdited {
+                        id: n.id.clone(),
+                        name: n.name.clone(),
+                    });
+                }
+            }
+        }
+    }
 }
 
 fn diff_schema(sheet: &str, old: &DataSchema, new: &DataSchema, out: &mut Vec<Change>) {
@@ -290,6 +343,48 @@ mod tests {
             .iter()
             .any(|c| matches!(c, Change::ColumnChanged { column, .. } if column == "qty")));
         assert!(!d.iter().any(|c| matches!(c, Change::RowsReordered { .. })));
+    }
+
+    #[test]
+    fn macro_changes() {
+        let old = sample();
+        let mut new = old.clone();
+        new.macros.push(crate::Macro {
+            id: "m1".into(),
+            name: "集計".into(),
+            source: "a".into(),
+        });
+        assert_eq!(
+            diff(&old, &new),
+            vec![Change::MacroAdded {
+                id: "m1".into(),
+                name: "集計".into()
+            }]
+        );
+        let mut newer = new.clone();
+        newer.macros[0].source = "b".into();
+        newer.macros[0].name = "合計".into();
+        assert_eq!(
+            diff(&new, &newer),
+            vec![
+                Change::MacroRenamed {
+                    id: "m1".into(),
+                    old: "集計".into(),
+                    new: "合計".into()
+                },
+                Change::MacroEdited {
+                    id: "m1".into(),
+                    name: "合計".into()
+                },
+            ]
+        );
+        assert_eq!(
+            diff(&newer, &old),
+            vec![Change::MacroRemoved {
+                id: "m1".into(),
+                name: "合計".into()
+            }]
+        );
     }
 
     #[test]

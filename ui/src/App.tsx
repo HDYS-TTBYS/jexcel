@@ -1,21 +1,36 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { Backend } from "./backend";
 import { Dialog, type DialogSpec } from "./components/Modal";
 import { Grid } from "./components/Grid";
 import { HistoryPanel } from "./components/HistoryPanel";
 import { SchemaEditor } from "./components/SchemaEditor";
+
+// Monaco は大きいので、マクロパネルを開いたときに初めて読み込む
+const MacroPanel = lazy(() => import("./components/MacroPanel"));
 import { newId, type Column, type Snapshot } from "./types";
 
 export function App({ backend }: { backend: Backend }) {
-  const [snap, setSnap] = useState<Snapshot | null>(null);
+  const [snap, setSnapState] = useState<Snapshot | null>(null);
+  // 非同期の途中（マクロの書き出し直後など）でも最新の状態を読めるよう、ref にも持つ
+  const snapRef = useRef<Snapshot | null>(null);
+  const setSnap = useCallback((s: Snapshot | null) => {
+    snapRef.current = s;
+    setSnapState(s);
+  }, []);
   const [sheetId, setSheetId] = useState<string | null>(null);
   const [schemaId, setSchemaId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState("");
   const [showHistory, setShowHistory] = useState(false);
   const [showSchema, setShowSchema] = useState(false);
+  const [showMacros, setShowMacros] = useState(false);
   const [dialog, setDialog] = useState<DialogSpec | null>(null);
   const [historyKey, setHistoryKey] = useState(0);
+  // マクロエディタの保留中の編集を書き出す（保存・確認の前に呼ぶ）
+  const macroFlush = useRef<(() => Promise<void>) | null>(null);
+  const registerFlush = useCallback((f: (() => Promise<void>) | null) => {
+    macroFlush.current = f;
+  }, []);
 
   const onError = useCallback((e: unknown) => setError(String(e)), []);
 
@@ -32,7 +47,7 @@ export function App({ backend }: { backend: Backend }) {
         return false;
       }
     },
-    [onError],
+    [onError, setSnap],
   );
 
   // 選択中のシート/スキーマが存在しなくなったら先頭に寄せる
@@ -42,22 +57,28 @@ export function App({ backend }: { backend: Backend }) {
   /** 保存する。保存先の選択をキャンセルした場合や失敗した場合は false。 */
   const save = useCallback(
     async (as = false): Promise<boolean> => {
-      if (!snap) return false;
+      if (!snapRef.current) return false;
+      await macroFlush.current?.(); // 入力直後に保存しても、最後の編集が入るように
+      const current = snapRef.current;
+      if (!current) return false;
       let path: string | null = null;
-      if (as || !snap.path) {
-        path = await backend.pickSavePath(`${snap.file.name || "無題"}.jxcel`);
+      if (as || !current.path) {
+        path = await backend.pickSavePath(`${current.file.name || "無題"}.jxcel`);
         if (!path) return false;
       }
       const ok = await run(backend.saveFile(path, message), true);
       if (ok) setMessage("");
       return ok;
     },
-    [backend, snap, message, run],
+    [backend, message, run],
   );
 
   // 未保存の変更を捨てることになる操作の前に確認する。保存に失敗/キャンセルしたら先へ進まない。
-  const guard = (title: string, action: () => void) => {
-    if (!snap?.dirty) return action();
+  const guard = async (title: string, action: () => void) => {
+    // 入力直後で自動保存前の編集があれば、先に反映して「未保存」を正しく判定する
+    await macroFlush.current?.();
+    const latest = snapRef.current;
+    if (!latest?.dirty) return action();
     setDialog({
       kind: "unsaved",
       title,
@@ -132,6 +153,9 @@ export function App({ backend }: { backend: Backend }) {
         onChange={(e) => setMessage(e.target.value)}
       />
       <span className="spacer" />
+      <button disabled={!snap} aria-pressed={showMacros} onClick={() => setShowMacros((v) => !v)}>
+        マクロ
+      </button>
       <button disabled={!snap} aria-pressed={showHistory} onClick={() => setShowHistory((v) => !v)}>
         履歴
       </button>
@@ -239,6 +263,19 @@ export function App({ backend }: { backend: Backend }) {
             <p className="muted pad">スキーマがありません。「+」で追加してください。</p>
           )}
         </main>
+        {showMacros && (
+          <Suspense fallback={<aside className="macros"><p className="muted pad">エディタを読み込み中…</p></aside>}>
+            <MacroPanel
+              backend={backend}
+              macros={snap.file.macros}
+              onSnapshot={setSnap}
+              onError={onError}
+              onPrompt={(title, initial, onOk) => setDialog({ kind: "prompt", title, initial, onOk })}
+              onConfirm={(title, message, onOk) => setDialog({ kind: "confirm", title, message, onOk })}
+              registerFlush={registerFlush}
+            />
+          </Suspense>
+        )}
         {showHistory && (
           <HistoryPanel
             backend={backend}

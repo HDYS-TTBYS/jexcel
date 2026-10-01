@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io::{Cursor, Read, Write};
 
-use crate::model::{Column, DataSchema, JxcelFile, Row, Sheet};
+use crate::model::{Column, DataSchema, JxcelFile, Macro, Row, Sheet};
 use crate::{Error, Result, FORMAT_VERSION};
 
 pub type FileTree = BTreeMap<String, Vec<u8>>;
@@ -21,6 +21,15 @@ struct Manifest {
     format_version: u32,
     name: String,
     sheets: Vec<String>,
+    /// マクロの一覧（順序つき）。本体は `macros/<id>.ts`。旧形式のファイルには無い。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    macros: Vec<MacroMeta>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct MacroMeta {
+    id: String,
+    name: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -41,6 +50,10 @@ struct SchemaFile {
 
 fn sheet_path(sheet_id: &str) -> String {
     format!("sheets/{sheet_id}/sheet.json")
+}
+
+fn macro_path(id: &str) -> String {
+    format!("macros/{id}.ts")
 }
 
 fn rows_path(sheet_id: &str, schema_id: &str) -> String {
@@ -106,12 +119,25 @@ impl JxcelFile {
                 }),
             );
         }
+        // マクロのソースはそのままのバイト列で保存する（git の差分でコードとして読めるように）
+        for m in &self.macros {
+            check_id(&m.id)?;
+            tree.insert(macro_path(&m.id), m.source.clone().into_bytes());
+        }
         tree.insert(
             MANIFEST.into(),
             to_json(&Manifest {
                 format_version: FORMAT_VERSION,
                 name: self.name.clone(),
                 sheets: self.sheets.iter().map(|s| s.id.clone()).collect(),
+                macros: self
+                    .macros
+                    .iter()
+                    .map(|m| MacroMeta {
+                        id: m.id.clone(),
+                        name: m.name.clone(),
+                    })
+                    .collect(),
             }),
         );
         Ok(tree)
@@ -161,9 +187,22 @@ impl JxcelFile {
                 schemas,
             });
         }
+        let mut macros = vec![];
+        for meta in manifest.macros {
+            check_id(&meta.id)?;
+            let p = macro_path(&meta.id);
+            let source = String::from_utf8(get(&p)?.clone())
+                .map_err(|_| Error::Invalid(format!("{p}: UTF-8 ではありません")))?;
+            macros.push(Macro {
+                id: meta.id,
+                name: meta.name,
+                source,
+            });
+        }
         Ok(JxcelFile {
             name: manifest.name,
             sheets,
+            macros,
         })
     }
 
@@ -242,6 +281,7 @@ pub(crate) mod tests {
                 name: "倉庫".into(),
                 schemas: vec![schema],
             }],
+            macros: Default::default(),
         }
     }
 
@@ -267,6 +307,45 @@ pub(crate) mod tests {
         let changed: Vec<_> = ta.keys().filter(|k| ta[*k] != tb[*k]).collect();
         assert_eq!(changed, vec!["sheets/sh1/sheet.json"]);
         assert_eq!(JxcelFile::from_tree(&tb).unwrap(), b);
+    }
+
+    #[test]
+    fn macros_roundtrip_as_plain_ts_files() {
+        let mut f = sample();
+        let src = "export default (jx: Jxcel) => {\n  jx.log(\"こんにちは\");\n};\n";
+        f.macros.push(Macro {
+            id: "m1".into(),
+            name: "あいさつ".into(),
+            source: src.into(),
+        });
+        let tree = f.to_tree().unwrap();
+        // ソースは変換されず、そのままのバイト列で入る
+        assert_eq!(tree["macros/m1.ts"], src.as_bytes());
+        assert_eq!(JxcelFile::from_tree(&tree).unwrap(), f);
+        assert_eq!(JxcelFile::from_zip(&f.to_zip().unwrap()).unwrap(), f);
+        // マクロの編集は、そのマクロのファイルだけを変える
+        let mut g = f.clone();
+        g.macros[0].source.push_str("// 追記\n");
+        let (a, b) = (f.to_tree().unwrap(), g.to_tree().unwrap());
+        let changed: Vec<_> = a.keys().filter(|k| a[*k] != b[*k]).collect();
+        assert_eq!(changed, vec!["macros/m1.ts"]);
+    }
+
+    #[test]
+    fn old_files_without_macros_still_open() {
+        // manifest に macros がない旧形式
+        let mut t = sample().to_tree().unwrap();
+        t.insert(
+            MANIFEST.into(),
+            r#"{"formatVersion":1,"name":"台帳","sheets":["sh1"]}"#
+                .as_bytes()
+                .to_vec(),
+        );
+        let f = JxcelFile::from_tree(&t).unwrap();
+        assert!(f.macros.is_empty());
+        // マクロのないファイルの manifest には macros キーを出さない（既存ファイルの差分を増やさない）
+        let out = sample().to_tree().unwrap();
+        assert!(!String::from_utf8_lossy(&out[MANIFEST]).contains("macros"));
     }
 
     #[test]

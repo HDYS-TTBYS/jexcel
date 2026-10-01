@@ -9,6 +9,27 @@ use crate::types::{DataType, TypeRegistry};
 pub struct JxcelFile {
     pub name: String,
     pub sheets: Vec<Sheet>,
+    /// ファイルに保存される TS マクロ。旧形式のファイルには無いので省略可。
+    #[serde(default)]
+    pub macros: Vec<Macro>,
+}
+
+/// TypeScript で書いたマクロ。`source` はユーザーが書いたままの TS（実行時に JS へ変換する）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Macro {
+    pub id: String,
+    pub name: String,
+    pub source: String,
+}
+
+impl Macro {
+    pub fn new(name: impl Into<String>, source: impl Into<String>) -> Self {
+        Self {
+            id: crate::new_id(),
+            name: name.into(),
+            source: source.into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

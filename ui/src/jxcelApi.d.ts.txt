@@ -1,0 +1,42 @@
+// マクロに渡される jx の型。実行側（crates/jxcel-macro/src/prelude.js）と対応させる。
+
+/** 行。`_id` が行 ID、それ以外のキーは列名。値が空のセルは null。 */
+interface JxcelRow {
+  _id: string;
+  [column: string]: any;
+}
+
+interface JxcelColumn {
+  name: string;
+  /** 型の種類（string / int / float / decimal / bool / date / dateTime / enum / object / array / any） */
+  type: string;
+  required: boolean;
+}
+
+/** データスキーマ（シートの中の表）。書き込みは実行後に型検証され、1 件でも不正なら全体が取り消されます。 */
+interface JxcelSchema {
+  name: string;
+  columns: JxcelColumn[];
+  /** 全行（実行中の追加・更新・削除も反映された状態） */
+  rows(): JxcelRow[];
+  /** 行 ID から行を取得。なければ例外 */
+  get(id: string): JxcelRow;
+  /** 行を追加して行 ID を返す。値は列名で指定（未指定の列は空） */
+  add(values: Record<string, unknown>): string;
+  /** 指定した列だけ更新（null で空にする） */
+  update(id: string, values: Record<string, unknown>): void;
+  remove(id: string): void;
+}
+
+interface JxcelSheet {
+  name: string;
+  /** スキーマを名前で取得。なければ例外 */
+  schema(name: string): JxcelSchema;
+}
+
+interface Jxcel {
+  /** シートを名前で取得。なければ例外 */
+  sheet(name: string): JxcelSheet;
+  /** 出力欄に表示するログ（console.log も同じ） */
+  log(...args: unknown[]): void;
+}

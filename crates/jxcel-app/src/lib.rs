@@ -5,7 +5,7 @@
 
 use jxcel_core::diff::Change;
 use jxcel_core::types::TypeRegistry;
-use jxcel_core::{new_id, Column, DataSchema, JxcelFile, Row, Sheet};
+use jxcel_core::{new_id, Column, DataSchema, JxcelFile, Macro, Row, Sheet};
 use jxcel_git::archive::Archive;
 use jxcel_git::CommitInfo;
 use serde::Serialize;
@@ -29,6 +29,8 @@ pub enum Error {
     Core(#[from] jxcel_core::Error),
     #[error(transparent)]
     Git(#[from] jxcel_git::Error),
+    #[error("マクロ: {0}")]
+    Macro(#[from] jxcel_macro::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -41,6 +43,24 @@ pub struct Snapshot {
     pub path: Option<String>,
     pub dirty: bool,
 }
+
+/// マクロ実行の結果。書き込みがあればファイルに反映済みで、`snapshot` はその後の状態。
+#[derive(Debug, Clone, Serialize)]
+pub struct RunOutput {
+    pub snapshot: Snapshot,
+    pub logs: Vec<String>,
+    pub result: Option<Value>,
+    /// 書き込み操作の数（0 ならファイルは変わっていない）
+    pub ops: usize,
+}
+
+const MACRO_TEMPLATE: &str = r#"// jx からファイルの読み書きができます（型は Jxcel）。
+// 列は名前で指定し、行の ID は _id で参照します。
+export default function (jx: Jxcel) {
+  const rows = jx.sheet("シート1").schema("データ").rows();
+  jx.log(`${rows.length} 行`);
+}
+"#;
 
 struct Doc {
     file: JxcelFile,
@@ -103,6 +123,7 @@ impl Session {
                 name: "シート1".into(),
                 schemas: vec![schema],
             }],
+            macros: Default::default(),
         };
         self.doc = Some(Doc {
             file,
@@ -309,6 +330,76 @@ impl Session {
         })
     }
 
+    // ---- マクロ ----
+
+    pub fn add_macro(&mut self, name: &str) -> Result<Snapshot> {
+        let name = name.to_string();
+        self.edit(move |f, _| {
+            f.macros.push(Macro::new(name, MACRO_TEMPLATE));
+            Ok(())
+        })
+    }
+
+    pub fn update_macro(&mut self, id: &str, name: &str, source: &str) -> Result<Snapshot> {
+        // 変更がなければ未保存にしない（エディタが同じ内容を送り直しても dirty にならない）
+        let current = self
+            .doc()?
+            .file
+            .macros
+            .iter()
+            .find(|m| m.id == id)
+            .ok_or(Error::NotFound("マクロ"))?;
+        if current.name == name && current.source == source {
+            return self.snapshot();
+        }
+        let (id, name, source) = (id.to_string(), name.to_string(), source.to_string());
+        self.edit(move |f, _| {
+            let m = f
+                .macros
+                .iter_mut()
+                .find(|m| m.id == id)
+                .ok_or(Error::NotFound("マクロ"))?;
+            m.name = name;
+            m.source = source;
+            Ok(())
+        })
+    }
+
+    pub fn delete_macro(&mut self, id: &str) -> Result<Snapshot> {
+        let id = id.to_string();
+        self.edit(move |f, _| {
+            let before = f.macros.len();
+            f.macros.retain(|m| m.id != id);
+            (f.macros.len() != before)
+                .then_some(())
+                .ok_or(Error::NotFound("マクロ"))
+        })
+    }
+
+    /// マクロを実行する。書き込みが検証を通れば反映して未保存にし、失敗したら何も変えない。
+    /// `source` を渡すと、保存前のエディタの内容で実行できる（渡さなければ保存済みのソース）。
+    pub fn run_macro(&mut self, id: &str, source: Option<&str>) -> Result<RunOutput> {
+        let d = self.doc()?;
+        let saved = d
+            .file
+            .macros
+            .iter()
+            .find(|m| m.id == id)
+            .ok_or(Error::NotFound("マクロ"))?;
+        let code = source.unwrap_or(&saved.source).to_string();
+        let run = jxcel_macro::run(&code, &d.file, &jxcel_macro::Options::default())?;
+        if run.ops > 0 {
+            d.file = run.file;
+            d.dirty = true;
+        }
+        Ok(RunOutput {
+            snapshot: self.snapshot()?,
+            logs: run.logs,
+            result: run.result,
+            ops: run.ops,
+        })
+    }
+
     // ---- 履歴 ----
 
     pub fn history_log(&mut self) -> Result<Vec<CommitInfo>> {
@@ -407,6 +498,90 @@ mod tests {
         assert_eq!(snap.file.sheets[0].schemas[0].rows[0].cells[&col], json!(1));
         s2.save(None, "復元").unwrap();
         assert_eq!(s2.history_log().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn macros_edit_run_save_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.jxcel");
+        let path = path.to_str().unwrap();
+
+        let mut s = Session::new();
+        let snap = s.new_file("x").unwrap();
+        let (sh, sc, row, col) = ids(&snap);
+        s.update_column(&sh, &sc, Column::new(&col, "数量", DataType::Int))
+            .unwrap();
+        s.set_cell(&sh, &sc, &row, &col, json!(1)).unwrap();
+        s.save(Some(path), "初回").unwrap();
+
+        // 追加・編集: テンプレートが入り、編集で未保存になる
+        let snap = s.add_macro("集計").unwrap();
+        let id = snap.file.macros[0].id.clone();
+        assert!(snap.file.macros[0].source.contains("export default"));
+        let src = r#"export default (jx: Jxcel) => {
+            const s = jx.sheet("シート1").schema("データ");
+            s.rows().forEach((r: any) => s.update(r._id, { 数量: r.数量 + 10 }));
+            jx.log("done");
+            return s.rows().length;
+        }"#;
+        s.update_macro(&id, "加算", src).unwrap();
+        s.save(None, "マクロ追加").unwrap();
+        // 同じ内容の更新は未保存にしない
+        assert!(!s.update_macro(&id, "加算", src).unwrap().dirty);
+        assert!(s.update_macro(&id, "加算2", src).unwrap().dirty);
+        s.update_macro(&id, "加算", src).unwrap();
+        s.save(None, "名前を戻す").unwrap();
+
+        // 実行: 反映されて未保存になり、ログと戻り値が返る
+        let out = s.run_macro(&id, None).unwrap();
+        assert_eq!(
+            (out.ops, out.logs, out.result),
+            (1, vec!["done".to_string()], Some(json!(1)))
+        );
+        assert!(out.snapshot.dirty);
+        assert_eq!(
+            out.snapshot.file.sheets[0].schemas[0].rows[0].cells[&col],
+            json!(11)
+        );
+
+        // 保存前のエディタの内容で実行できる。何も書き込まなければ未保存にならない
+        s.save(None, "実行結果").unwrap();
+        let out = s
+            .run_macro(&id, Some("export default (jx: Jxcel) => 42"))
+            .unwrap();
+        assert_eq!((out.ops, out.result), (0, Some(json!(42))));
+        assert!(!out.snapshot.dirty);
+
+        // 失敗したマクロは何も変えない（途中の書き込みも残らない）
+        let bad = r#"export default (jx: Jxcel) => {
+            const s = jx.sheet("シート1").schema("データ");
+            s.update(s.rows()[0]._id, { 数量: 999 });
+            s.add({ 数量: "x" });
+        }"#;
+        assert!(matches!(s.run_macro(&id, Some(bad)), Err(Error::Macro(_))));
+        let cur = s.current().unwrap();
+        assert_eq!(cur.file.sheets[0].schemas[0].rows[0].cells[&col], json!(11));
+        assert!(!cur.dirty);
+
+        // 開き直してもマクロが残り、履歴の差分にも出る
+        let mut s2 = Session::new();
+        let snap = s2.open(path).unwrap();
+        assert_eq!(
+            (snap.file.macros[0].name.as_str(), snap.file.macros.len()),
+            ("加算", 1)
+        );
+        let log = s2.history_log().unwrap();
+        let d = s2.history_diff(&log[log.len() - 1].id, &log[0].id).unwrap();
+        assert!(
+            d.iter().any(|c| matches!(c, Change::MacroAdded { .. })),
+            "{d:?}"
+        );
+
+        // 削除
+        s.delete_macro(&id).unwrap();
+        assert!(s.current().unwrap().file.macros.is_empty());
+        assert!(matches!(s.delete_macro(&id), Err(Error::NotFound(_))));
+        assert!(matches!(s.run_macro(&id, None), Err(Error::NotFound(_))));
     }
 
     #[test]

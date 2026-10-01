@@ -111,6 +111,7 @@ mod tests {
                 name: "倉庫".into(),
                 schemas: vec![s],
             }],
+            macros: Default::default(),
         }
     }
 
