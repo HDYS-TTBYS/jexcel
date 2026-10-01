@@ -1,4 +1,4 @@
-import type { Change, Column, CommitInfo, RunOutput, Snapshot } from "./types";
+import type { Change, Column, CommitInfo, MacroSample, RunOutput, Snapshot } from "./types";
 
 /** UI が必要とする操作。Tauri 実装とブラウザ単体用のモック実装がある。 */
 export interface Backend {
@@ -20,7 +20,9 @@ export interface Backend {
   deleteRow(sheet: string, schema: string, row: string): Promise<Snapshot>;
   setCell(sheet: string, schema: string, row: string, column: string, value: unknown): Promise<Snapshot>;
 
-  addMacro(name: string): Promise<Snapshot>;
+  /** `source` を渡すとその内容（サンプルなど）で、無ければ雛形で追加する */
+  addMacro(name: string, source?: string): Promise<Snapshot>;
+  macroSamples(): Promise<MacroSample[]>;
   updateMacro(id: string, name: string, source: string): Promise<Snapshot>;
   deleteMacro(id: string): Promise<Snapshot>;
   /** `source` を渡すと保存前のエディタの内容で実行する。失敗したときは何も変更しない。 */

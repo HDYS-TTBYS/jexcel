@@ -4,6 +4,7 @@
 import type { Backend } from "./backend";
 // Rust 側（crates/jxcel-macro）と同じ実行ライブラリを再利用する。
 import prelude from "../../crates/jxcel-macro/src/prelude.js?raw";
+import stdLib from "../../crates/jxcel-macro/src/std.js?raw";
 import {
   defaultType,
   newId,
@@ -15,6 +16,7 @@ import {
   type DataSchema,
   type DataType,
   type JxcelFile,
+  type MacroSample,
   type RunOutput,
   type Snapshot,
 } from "./types";
@@ -116,15 +118,21 @@ type Op =
  * （本物の実行は Rust 側の QuickJS）。`export default` を式にして呼ぶ。
  */
 function runMacroInBrowser(source: string, file: JxcelFile): { ops: Op[]; logs: string[]; result: unknown } {
-  const w = window as unknown as { __newId?: () => string };
-  w.__newId = newId;
-  const fakeGlobal: Record<string, unknown> = {};
   // prelude は globalThis.console を差し替えるので、本物の globalThis を隠して実行する
-  new Function("globalThis", prelude)(fakeGlobal);
+  const fakeGlobal = loadRuntime();
   const state = (fakeGlobal.__makeState as (d: JxcelFile) => { jx: unknown; finish: (r: unknown) => string })(structuredClone(file));
   const body = source.replace(/export\s+default\s+/, "const __main = ") + "\n;return __main(jx);";
-  const result = new Function("jx", "console", body)(state.jx, (fakeGlobal.console as object) ?? console);
+  const result = new Function("jx", "console", "std", body)(state.jx, (fakeGlobal.console as object) ?? console, fakeGlobal.std);
   return JSON.parse(state.finish(result));
+}
+
+/** prelude と std を、本物の globalThis を隠した環境に読み込む。マクロ・計算式に std を渡すために使う。 */
+function loadRuntime(): Record<string, unknown> {
+  (window as unknown as { __newId?: () => string }).__newId = newId;
+  const fake: Record<string, unknown> = {};
+  new Function("globalThis", prelude)(fake);
+  new Function("globalThis", stdLib)(fake);
+  return fake;
 }
 
 /**
@@ -132,6 +140,8 @@ function runMacroInBrowser(source: string, file: JxcelFile): { ops: Op[]; logs: 
  * TypeScript は変換できないので、型注釈のない JS の式だけ動く。
  */
 function computeInBrowser(file: JxcelFile): ComputedValues {
+  if (!file.sheets.some((s) => s.schemas.some((c) => c.columns.some((x) => x.computed)))) return {};
+  const runtime = loadRuntime();
   const specs: { sheet: string; schema: string; column: string; error?: string }[] = [];
   const fns: (Function | undefined)[] = [];
   for (const sh of file.sheets)
@@ -143,7 +153,7 @@ function computeInBrowser(file: JxcelFile): ComputedValues {
         if (!src.trim()) spec.error = "式が空です";
         else {
           try {
-            const f = new Function(src.replace(/export\s+default\s+/, "const __f = ") + "\n;return __f;")();
+            const f = new Function("std", src.replace(/export\s+default\s+/, "const __f = ") + "\n;return __f;")(runtime.std);
             if (typeof f !== "function") throw new Error("export default function (row, jx) { return ... } の形で書いてください");
             fns[specs.length] = f;
           } catch (e) {
@@ -154,9 +164,8 @@ function computeInBrowser(file: JxcelFile): ComputedValues {
       }
   if (specs.length === 0) return {};
 
-  (window as unknown as { __newId?: () => string }).__newId = newId;
-  const fake: Record<string, unknown> = { __fns: fns };
-  new Function("globalThis", prelude)(fake);
+  const fake = runtime;
+  fake.__fns = fns;
   const state = (fake.__makeState as (d: JxcelFile) => { computeAll: (s: unknown) => void; finish: (r: unknown) => string })(
     structuredClone(file),
   );
@@ -175,6 +184,23 @@ function computeInBrowser(file: JxcelFile): ComputedValues {
     ((result[c.schema] ??= {})[c.column] ??= {})[c.row] = cell;
   }
   return result;
+}
+
+// サンプルマクロ（実体は Rust 側と共通の crates/jxcel-macro/samples/*.ts）。@name / @desc の行は取り除く
+const sampleFiles = import.meta.glob("../../crates/jxcel-macro/samples/*.ts", { query: "?raw", import: "default", eager: true }) as Record<string, string>;
+function mockSamples(): MacroSample[] {
+  return Object.entries(sampleFiles).map(([path, src]) => {
+    const id = path.split("/").pop()!.replace(/\.ts$/, "");
+    let name = id;
+    let description = "";
+    const body: string[] = [];
+    for (const line of src.split("\n")) {
+      if (line.startsWith("// @name ")) name = line.slice(9).trim();
+      else if (line.startsWith("// @desc ")) description = line.slice(9).trim();
+      else body.push(line);
+    }
+    return { id, name, description, source: `// ${description}\n${body.join("\n").replace(/^\n+/, "")}\n` };
+  });
 }
 
 export function createMockBackend(): Backend {
@@ -309,14 +335,17 @@ export function createMockBackend(): Backend {
         else r.cells[column] = value;
       }),
 
-    addMacro: async (name) =>
+    addMacro: async (name, source) =>
       edit((f) => {
         f.macros.push({
           id: newId(),
           name,
-          source: 'export default function (jx) {\n  const rows = jx.sheet("シート1").schema("データ").rows();\n  jx.log(rows.length + " 行");\n}\n',
+          source:
+            source ??
+            'export default function (jx) {\n  const rows = jx.sheet("シート1").schema("データ").rows();\n  jx.log(rows.length + " 行");\n}\n',
         });
       }),
+    macroSamples: async () => mockSamples(),
     updateMacro: async (id, name, source) => {
       const cur = file?.macros.find((m) => m.id === id);
       if (cur && cur.name === name && cur.source === source) return snap(); // 変更なしなら未保存にしない

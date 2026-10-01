@@ -2,7 +2,7 @@ import Editor from "@monaco-editor/react";
 import { useEffect, useRef, useState } from "react";
 import "../monacoSetup";
 import type { Backend } from "../backend";
-import type { Macro, RunOutput, Snapshot } from "../types";
+import type { Macro, MacroSample, RunOutput, Snapshot } from "../types";
 
 interface Props {
   backend: Backend;
@@ -24,6 +24,18 @@ export default function MacroPanel({ backend, macros, onSnapshot, onError, onPro
   const [output, setOutput] = useState<Output>(null);
   const [running, setRunning] = useState(false);
   const saveTimer = useRef<number>(undefined);
+  // 追加メニュー（空のマクロ / サンプルから）。サンプルは開いたときに初めて取得する
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [samples, setSamples] = useState<MacroSample[] | null>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!menuOpen) return;
+    const close = (e: MouseEvent) => {
+      if (!menuRef.current?.contains(e.target as Node)) setMenuOpen(false);
+    };
+    window.addEventListener("mousedown", close);
+    return () => window.removeEventListener("mousedown", close);
+  }, [menuOpen]);
 
   // 選択したマクロが変わったとき、または履歴の復元などで外から差し替わったときに、エディタの内容を合わせる
   const savedSource = selected?.source;
@@ -85,16 +97,24 @@ export default function MacroPanel({ backend, macros, onSnapshot, onError, onPro
     }
   };
 
-  const add = () =>
-    onPrompt("マクロの追加", `マクロ${macros.length + 1}`, async (name) => {
+  const toggleMenu = () => {
+    setMenuOpen((open) => !open);
+    if (!samples) backend.macroSamples().then(setSamples, (e) => onError(String(e)));
+  };
+
+  /** `sample` が null なら空のマクロ（雛形）を追加する */
+  const add = (sample: MacroSample | null) => {
+    setMenuOpen(false);
+    onPrompt("マクロの追加", sample?.name ?? `マクロ${macros.length + 1}`, async (name) => {
       try {
-        const snap = await backend.addMacro(name);
+        const snap = await backend.addMacro(name, sample?.source);
         onSnapshot(snap);
         setSelectedId(snap.file.macros[snap.file.macros.length - 1].id);
       } catch (e) {
         onError(String(e));
       }
     });
+  };
 
   return (
     <aside className="macros" aria-label="マクロ">
@@ -107,7 +127,26 @@ export default function MacroPanel({ backend, macros, onSnapshot, onError, onPro
             </option>
           ))}
         </select>
-        <button onClick={add}>+ 追加</button>
+        <div className="add-menu-wrap" ref={menuRef}>
+          <button onClick={toggleMenu} aria-haspopup="menu" aria-expanded={menuOpen}>
+            + 追加 ▾
+          </button>
+          {menuOpen && (
+            <div className="add-menu" role="menu">
+              <button role="menuitem" onClick={() => add(null)}>
+                <strong>空のマクロ</strong>
+              </button>
+              <div className="menu-title">サンプルから</div>
+              {samples === null && <p className="muted pad-s">読み込み中…</p>}
+              {samples?.map((sm) => (
+                <button key={sm.id} role="menuitem" onClick={() => add(sm)}>
+                  <strong>{sm.name}</strong>
+                  <span className="muted">{sm.description}</span>
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
         {selected && (
           <>
             <button onClick={() => onPrompt("マクロ名の変更", selected.name, (n) => void flush(selected.id, n, draft))}>名前変更</button>
@@ -161,7 +200,7 @@ export default function MacroPanel({ backend, macros, onSnapshot, onError, onPro
           </div>
         </>
       ) : (
-        <p className="muted pad">マクロがありません。「+ 追加」で作成できます。</p>
+        <p className="muted pad">マクロがありません。「+ 追加」から、空のマクロまたはサンプルを作成できます。</p>
       )}
     </aside>
   );

@@ -16,7 +16,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
+pub mod samples;
+
 const PRELUDE: &str = include_str!("prelude.js");
+/// 標準ライブラリ `std`。マクロにも計算列の式にも、グローバルとして見える。
+const STD: &str = include_str!("std.js");
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -285,6 +289,9 @@ fn execute(file: &JxcelFile, main_js: Option<&str>, opts: &Options) -> Result<Ou
         ctx.eval::<(), _>(PRELUDE)
             .catch(&ctx)
             .map_err(|e| e.to_string())?;
+        ctx.eval::<(), _>(STD)
+            .catch(&ctx)
+            .map_err(|e| e.to_string())?;
         ctx.eval::<(), _>(
             "globalThis.__state = __makeState(JSON.parse(__data)); globalThis.__fns = [];",
         )
@@ -459,6 +466,7 @@ mod tests {
     use super::*;
     use jxcel_core::{Column, DataSchema, DataType, Sheet};
     use serde_json::json;
+    use std::collections::BTreeMap;
 
     /// 「倉庫」シートの「在庫」スキーマ（品名: 文字列・必須、数量: 整数）に 2 行
     fn sample() -> JxcelFile {
@@ -638,15 +646,17 @@ mod tests {
 
     #[test]
     fn sandbox_has_no_io() {
+        // QuickJS 付属の std / os モジュール（ファイル・プロセス・環境変数にアクセスできる）は見えない。
+        // `std` は jxcel の標準ライブラリで同名だが、入出力の関数は持たない。
         let r = run_ok(
-            r#"export default () => [typeof require, typeof process, typeof fetch, typeof XMLHttpRequest, typeof std, typeof os].join(",")"#,
+            r#"export default () => [
+                typeof require, typeof process, typeof fetch, typeof XMLHttpRequest, typeof os,
+                typeof (std as any).open, typeof (std as any).loadFile, typeof (std as any).getenv,
+                typeof (std as any).popen, typeof (std as any).evalScript, typeof (std as any).urlGet,
+                typeof (std as any).exit, typeof (std as any).writeFile,
+            ].join(",")"#,
         );
-        assert_eq!(
-            r.result,
-            Some(json!(
-                "undefined,undefined,undefined,undefined,undefined,undefined"
-            ))
-        );
+        assert_eq!(r.result, Some(json!(vec!["undefined"; 13].join(","))));
     }
 
     // ---- 計算列 ----
@@ -911,5 +921,404 @@ mod tests {
             serde_json::to_value(CellResult::Error("だめ".into())).unwrap(),
             json!({ "e": "だめ" })
         );
+    }
+
+    // ---- 標準ライブラリ std ----
+
+    /// 式を並べて 1 回の実行で評価し、結果の配列を返す。`rows` は「在庫」表の全行。
+    fn eval_all(file: &JxcelFile, exprs: &[&str]) -> Vec<Value> {
+        let src = format!(
+            "export default (jx: Jxcel) => {{ const rows = jx.sheet('倉庫').schema('在庫').rows(); return [{}]; }}",
+            exprs.join(",\n")
+        );
+        match run(&src, file, &Options::default()) {
+            Ok(r) => r.result.unwrap().as_array().unwrap().clone(),
+            Err(e) => panic!("{e}"),
+        }
+    }
+
+    fn check_table(file: &JxcelFile, cases: &[(&str, Value)]) {
+        let exprs: Vec<&str> = cases.iter().map(|(e, _)| *e).collect();
+        let got = eval_all(file, &exprs);
+        for ((expr, want), got) in cases.iter().zip(got) {
+            assert_eq!(&got, want, "{expr}");
+        }
+    }
+
+    /// 品名・数量・区分のある 5 行（区分: 金属 / 樹脂、数量が空の行と、区分が空の行を含む）
+    fn stock() -> JxcelFile {
+        let mut f = sample();
+        let s = &mut f.sheets[0].schemas[0];
+        s.columns
+            .push(Column::new("kind", "区分", DataType::String));
+        s.rows.clear();
+        for (id, name, qty, kind) in [
+            ("a", "ねじ", Some(10), Some("金属")),
+            ("b", "ナット", Some(5), Some("金属")),
+            ("c", "ワッシャー", None, Some("樹脂")),
+            ("d", "ばね", Some(20), None),
+            ("e", "ピン", Some(2), Some("金属")),
+        ] {
+            let mut cells: std::collections::BTreeMap<String, Value> =
+                [("name".to_string(), json!(name))].into();
+            if let Some(q) = qty {
+                cells.insert("qty".into(), json!(q));
+            }
+            if let Some(k) = kind {
+                cells.insert("kind".into(), json!(k));
+            }
+            s.rows.push(Row {
+                id: id.into(),
+                cells,
+            });
+        }
+        f
+    }
+
+    #[test]
+    fn std_aggregates_and_rounding() {
+        check_table(
+            &stock(),
+            &[
+                ("std.sum([1, 2, null, '3'])", json!(6)),
+                ("std.sum([])", json!(0)),
+                ("std.avg([1, 2, null])", json!(1.5)),
+                ("std.avg([null])", json!(null)),
+                ("std.min([3, 1, null, 2])", json!(1)),
+                ("std.max([3, 1, null, 2])", json!(3)),
+                ("std.max([])", json!(null)),
+                ("std.median([3, 1, 2])", json!(2)),
+                ("std.median([4, 1, 3, 2])", json!(2.5)),
+                ("std.count([1, null, 0, '', undefined])", json!(3)),
+                ("std.round(1.005, 2)", json!(1.01)),
+                ("std.round(2.5)", json!(3)),
+                ("std.round(-2.5)", json!(-3)),
+                ("std.round(1234.5678, -2)", json!(1200)),
+                ("std.round(null)", json!(null)),
+                ("std.floor(1.239, 2)", json!(1.23)),
+                ("std.floor(-1.5)", json!(-2)),
+                ("std.ceil(1.231, 2)", json!(1.24)),
+                ("std.clamp(15, 0, 10)", json!(10)),
+                ("std.clamp(-1, 0, 10)", json!(0)),
+                ("std.coalesce(null, undefined, 0, 5)", json!(0)),
+                ("std.coalesce(null)", json!(null)),
+            ],
+        );
+        // 数値でない値は黙って 0 にせず、例外にする
+        let e = run(
+            "export default () => std.sum([1, 'abc'])",
+            &sample(),
+            &Options::default(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&e, Error::Runtime(m) if m.contains("数値ではありません")),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn std_table_helpers() {
+        check_table(
+            &stock(),
+            &[
+                (
+                    "std.pluck(rows, '品名')",
+                    json!(["ねじ", "ナット", "ワッシャー", "ばね", "ピン"]),
+                ),
+                ("std.sumBy(rows, '数量')", json!(37)),
+                ("std.avgBy(rows, '数量')", json!(9.25)),
+                ("std.countBy(rows, '数量')", json!(4)),
+                (
+                    "std.where(rows, '区分', '金属').map((r: any) => r.品名)",
+                    json!(["ねじ", "ナット", "ピン"]),
+                ),
+                (
+                    "std.where(rows, '区分', null).map((r: any) => r.品名)",
+                    json!(["ばね"]),
+                ),
+                ("std.find(rows, '品名', 'ばね')._id", json!("d")),
+                ("std.find(rows, '品名', 'なし')", json!(null)),
+                ("std.lookup(rows, '品名', 'ナット', '数量')", json!(5)),
+                ("std.lookup(rows, '品名', 'なし', '数量', -1)", json!(-1)),
+                ("std.lookup(rows, '品名', 'なし', '数量')", json!(null)),
+                // 出現順を保ち、空の区分も 1 つのグループになる
+                (
+                    "std.groupBy(rows, '区分').map((g: any) => [g.key, std.sumBy(g.rows, '数量')])",
+                    json!([["金属", 17], ["樹脂", 0], [null, 20]]),
+                ),
+                (
+                    "std.uniq([1, 2, 1, '1', null, null])",
+                    json!([1, 2, "1", null]),
+                ),
+                (
+                    "std.sortBy(rows, '数量').map((r: any) => r.品名)",
+                    json!(["ピン", "ナット", "ねじ", "ばね", "ワッシャー"]),
+                ),
+                (
+                    "std.sortBy(rows, '数量', 'desc').map((r: any) => r.品名)",
+                    json!(["ばね", "ねじ", "ナット", "ピン", "ワッシャー"]),
+                ),
+                // 文字列は文字コード順（五十音順ではない）なので「樹脂」(U+6A39) が「金属」(U+91D1) より前。
+                // 同じ値は元の順を保つ（金属 3 件は ねじ → ナット → ピン のまま）。空は最後
+                (
+                    "std.sortBy(rows, '区分').map((r: any) => r.品名)",
+                    json!(["ワッシャー", "ねじ", "ナット", "ピン", "ばね"]),
+                ),
+            ],
+        );
+        // 存在しない列は、黙って空にせず例外
+        let e = run("export default (jx: Jxcel) => std.pluck(jx.sheet('倉庫').schema('在庫').rows(), '無い列')", &sample(), &Options::default()).unwrap_err();
+        assert!(
+            matches!(&e, Error::Runtime(m) if m.contains("無い列")),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn std_dates() {
+        check_table(
+            &sample(),
+            &[
+                ("std.date.addDays('2024-02-28', 2)", json!("2024-03-01")),
+                ("std.date.addDays('2023-02-28', 2)", json!("2023-03-02")),
+                ("std.date.addDays('2024-01-01', -1)", json!("2023-12-31")),
+                ("std.date.addMonths('2024-01-31', 1)", json!("2024-02-29")),
+                ("std.date.addMonths('2023-01-31', 1)", json!("2023-02-28")),
+                ("std.date.addMonths('2024-03-31', -1)", json!("2024-02-29")),
+                ("std.date.addMonths('2024-11-15', 3)", json!("2025-02-15")),
+                ("std.date.addYears('2024-02-29', 1)", json!("2025-02-28")),
+                ("std.date.diffDays('2024-03-01', '2024-02-01')", json!(29)),
+                ("std.date.diffDays('2024-02-01', '2024-03-01')", json!(-29)),
+                ("std.date.startOfMonth('2024-02-10')", json!("2024-02-01")),
+                ("std.date.endOfMonth('2024-02-10')", json!("2024-02-29")),
+                ("std.date.endOfMonth('2023-12-05')", json!("2023-12-31")),
+                ("std.date.weekday('2024-01-31')", json!(3)),
+                ("std.date.weekday('1970-01-01')", json!(4)),
+                ("std.date.isWeekend('2024-02-03')", json!(true)),
+                ("std.date.isWeekend('2024-02-05')", json!(false)),
+                ("std.date.addWorkdays('2024-01-31', 3)", json!("2024-02-05")),
+                (
+                    "std.date.addWorkdays('2024-02-05', -1)",
+                    json!("2024-02-02"),
+                ),
+                // 祝日（2/5 を休みにすると、さらに 1 日後ろへ）
+                (
+                    "std.date.addWorkdays('2024-01-31', 3, ['2024-02-05'])",
+                    json!("2024-02-06"),
+                ),
+                (
+                    "std.date.workdaysBetween('2024-01-29', '2024-02-04')",
+                    json!(5),
+                ),
+                (
+                    "std.date.workdaysBetween('2024-02-04', '2024-01-29')",
+                    json!(-5),
+                ),
+                (
+                    "std.date.format('2024-01-31', 'YYYY年M月D日(ddd)')",
+                    json!("2024年1月31日(水)"),
+                ),
+                (
+                    "std.date.format('2024-03-05', 'YY/MM/DD')",
+                    json!("24/03/05"),
+                ),
+                (
+                    "std.date.format('2024-03-05T10:20:30+09:00', 'YYYY-MM-DD')",
+                    json!("2024-03-05"),
+                ),
+                ("std.date.toWareki('2024-01-31')", json!("令和6年1月31日")),
+                ("std.date.toWareki('2019-05-01')", json!("令和元年5月1日")),
+                ("std.date.toWareki('2019-04-30')", json!("平成31年4月30日")),
+                ("std.date.toWareki('1989-01-07')", json!("昭和64年1月7日")),
+                ("std.date.toWareki('1912-07-30')", json!("大正元年7月30日")),
+                ("std.date.isValid('2024-02-30')", json!(false)),
+                ("std.date.isValid('2024-02-29')", json!(true)),
+                ("std.date.addDays(null, 1)", json!(null)),
+                ("std.date.diffDays(null, '2024-01-01')", json!(null)),
+                ("std.date.today().length", json!(10)),
+            ],
+        );
+        let e = run(
+            "export default () => std.date.addDays('2024-02-30', 1)",
+            &sample(),
+            &Options::default(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&e, Error::Runtime(m) if m.contains("存在しない日付")),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn std_decimals_are_exact() {
+        check_table(
+            &sample(),
+            &[
+                // number なら 0.30000000000000004 になる計算が、誤差なく出る
+                ("0.1 + 0.2 === 0.3", json!(false)),
+                ("std.dec.add('0.1', '0.2')", json!("0.3")),
+                ("std.dec.add('1.5', '2')", json!("3.5")),
+                ("std.dec.sub('1', '1.5')", json!("-0.5")),
+                ("std.dec.sub('1.5', '1.5')", json!("0.0")),
+                ("std.dec.mul('1.10', '3')", json!("3.30")),
+                ("std.dec.mul('-0.5', '0.5')", json!("-0.25")),
+                ("std.dec.div('1', '3', 4)", json!("0.3333")),
+                ("std.dec.div('2', '3', 2)", json!("0.67")),
+                ("std.dec.div('-2', '3', 2)", json!("-0.67")),
+                ("std.dec.div('10', '4', 0)", json!("3")),
+                ("std.dec.round('2.675', 2)", json!("2.68")),
+                ("std.dec.round('-2.5', 0)", json!("-3")),
+                ("std.dec.round('2.4', 0)", json!("2")),
+                ("std.dec.round('1234.5678', 1)", json!("1234.6")),
+                ("std.dec.fixed('1.5', 2)", json!("1.50")),
+                ("std.dec.sum(['0.1', '0.2', '0.3', null])", json!("0.6")),
+                ("std.dec.sum([])", json!("0")),
+                ("std.dec.cmp('1.0', '1')", json!(0)),
+                ("std.dec.cmp('1.01', '1.1')", json!(-1)),
+                ("std.dec.cmp('-1', '-2')", json!(1)),
+                ("std.dec.toNumber('1.5')", json!(1.5)),
+                ("std.dec.add(0.1, 0.2)", json!("0.3")),
+                ("std.dec.round(null)", json!(null)),
+            ],
+        );
+        let e = run(
+            "export default () => std.dec.div('1', '0', 2)",
+            &sample(),
+            &Options::default(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&e, Error::Runtime(m) if m.contains("0 で割れません")),
+            "{e}"
+        );
+        let e = run(
+            "export default () => std.dec.add('abc', '1')",
+            &sample(),
+            &Options::default(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&e, Error::Runtime(m) if m.contains("10進数ではありません")),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn std_text() {
+        check_table(
+            &sample(),
+            &[
+                (
+                    "std.text.normalize('  Ａ１２３　ﾊﾟｿｺﾝ   一覧 ')",
+                    json!("A123 パソコン 一覧"),
+                ),
+                ("std.text.normalize(null)", json!(null)),
+                ("std.text.trim('\\u3000 abc \\u3000')", json!("abc")),
+                (
+                    "std.text.toHalfWidth('ＡＢＣ　１２３！')",
+                    json!("ABC 123!"),
+                ),
+                ("std.text.toFullWidth('ABC 12')", json!("ＡＢＣ　１２")),
+                ("std.text.toFullWidth('ﾊﾟｿｺﾝ')", json!("パソコン")),
+                ("std.text.toKatakana('ひらがな')", json!("ヒラガナ")),
+                ("std.text.toHiragana('カタカナ')", json!("かたかな")),
+                ("std.text.isBlank(null)", json!(true)),
+                ("std.text.isBlank(' \\u3000')", json!(true)),
+                ("std.text.isBlank('a')", json!(false)),
+                ("std.text.isBlank(0)", json!(false)),
+                ("std.text.zeroPad(7, 3)", json!("007")),
+                (
+                    "std.text.formatNumber(1234567.891, 1)",
+                    json!("1,234,567.9"),
+                ),
+                ("std.text.formatNumber(-1234)", json!("-1,234")),
+                ("std.text.formatNumber(999)", json!("999")),
+                ("std.text.formatNumber(1000)", json!("1,000")),
+                ("std.text.formatNumber(0.5, 2)", json!("0.50")),
+                ("std.text.yen(1234567)", json!("¥1,234,567")),
+                ("std.text.yen(-500)", json!("-¥500")),
+                ("std.text.yen(null)", json!(null)),
+            ],
+        );
+    }
+
+    #[test]
+    fn std_is_available_in_computed_columns() {
+        // 計算列の式からも std が使える（税込み価格を 10 進数で誤差なく計算し、四捨五入する）
+        let f = with_computed(
+            sample(),
+            "inc",
+            "税込",
+            DataType::Decimal,
+            "export default (row: any) => std.dec.round(std.dec.mul(String(row.数量), '1.10'), 0)",
+        );
+        let c = compute(&f, &Options::default());
+        assert_eq!(cell(&c, "inc", "r1"), CellResult::Value(json!("11")));
+        assert_eq!(cell(&c, "inc", "r2"), CellResult::Value(json!("6"))); // 5.5 → 6（四捨五入）
+    }
+
+    #[test]
+    fn std_cannot_be_tampered_with() {
+        // std は凍結されている。書き換えようとしても、他のマクロ・計算列に影響しない（そもそも実行ごとに作り直す）
+        let r = run_ok("export default () => { try { (std as any).sum = () => 0; } catch (e) {} return std.sum([1, 2]); }");
+        assert_eq!(r.result, Some(json!(3)));
+    }
+
+    /// 型定義（エディタの補完・ホバー用）と、実際の std が食い違わないことを検査する。
+    /// 型定義にあるのに実在しない関数（補完は出るのに実行で失敗する）も、
+    /// 実在するのに型定義が無い関数（補完・説明が出ない）も、ここで見つかる。
+    #[test]
+    fn std_matches_its_type_definitions() {
+        let dts = include_str!("../../../ui/src/jxcelApi.d.ts.txt");
+        // interface ごとに「2 文字インデントの関数名」を集める（コメント行とプロパティは除く）
+        let mut declared: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+        let mut current: Option<&str> = None;
+        for line in dts.lines() {
+            match line.trim_end() {
+                "interface JxcelStd {" => current = Some(""),
+                "interface JxcelStdDate {" => current = Some("date"),
+                "interface JxcelStdDec {" => current = Some("dec"),
+                "interface JxcelStdText {" => current = Some("text"),
+                "}" => current = None,
+                l => {
+                    let (Some(ns), Some(body)) = (current, l.strip_prefix("  ")) else {
+                        continue;
+                    };
+                    let name: String = body
+                        .chars()
+                        .take_while(|c| c.is_alphanumeric() || *c == '_')
+                        .collect();
+                    if !name.is_empty() && body[name.len()..].starts_with(['(', '<']) {
+                        declared.entry(ns).or_default().push(name);
+                    }
+                }
+            }
+        }
+        // 取りこぼしていないこと（パースが壊れて空のまま通ってしまうのを防ぐ）
+        assert!(
+            declared[""].len() >= 20
+                && declared["date"].len() >= 10
+                && declared["dec"].len() >= 8
+                && declared["text"].len() >= 8,
+            "{declared:?}"
+        );
+
+        let src = format!(
+            r#"export default () => {{
+                const declared: Record<string, string[]> = {};
+                const problems: string[] = [];
+                for (const [ns, names] of Object.entries(declared)) {{
+                    const obj: any = ns ? (std as any)[ns] : std;
+                    for (const n of names) if (typeof obj[n] !== "function") problems.push("型定義にあるが実在しない: " + (ns ? ns + "." : "") + n);
+                    for (const k of Object.keys(obj)) if (typeof obj[k] === "function" && !names.includes(k)) problems.push("型定義にない: " + (ns ? ns + "." : "") + k);
+                }}
+                return problems;
+            }}"#,
+            serde_json::to_string(&declared).unwrap()
+        );
+        let r = run(&src, &sample(), &Options::default()).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(r.result, Some(json!([])), "std と型定義が食い違っています");
     }
 }

@@ -367,12 +367,21 @@ impl Session {
 
     // ---- マクロ ----
 
-    pub fn add_macro(&mut self, name: &str) -> Result<Snapshot> {
-        let name = name.to_string();
+    /// マクロを追加する。`source` を渡すとその内容（サンプルなど）で、無ければ雛形で作る。
+    pub fn add_macro(&mut self, name: &str, source: Option<&str>) -> Result<Snapshot> {
+        let (name, source) = (
+            name.to_string(),
+            source.unwrap_or(MACRO_TEMPLATE).to_string(),
+        );
         self.edit(move |f, _| {
-            f.macros.push(Macro::new(name, MACRO_TEMPLATE));
+            f.macros.push(Macro::new(name, source));
             Ok(())
         })
+    }
+
+    /// 同梱のサンプルマクロ（ファイルを開いていなくても取得できる）。
+    pub fn macro_samples() -> Vec<jxcel_macro::samples::Sample> {
+        jxcel_macro::samples::samples()
     }
 
     pub fn update_macro(&mut self, id: &str, name: &str, source: &str) -> Result<Snapshot> {
@@ -551,7 +560,7 @@ mod tests {
         s.save(Some(path), "初回").unwrap();
 
         // 追加・編集: テンプレートが入り、編集で未保存になる
-        let snap = s.add_macro("集計").unwrap();
+        let snap = s.add_macro("集計", None).unwrap();
         let id = snap.file.macros[0].id.clone();
         assert!(snap.file.macros[0].source.contains("export default"));
         let src = r#"export default (jx: Jxcel) => {
@@ -618,6 +627,28 @@ mod tests {
         assert!(s.current().unwrap().file.macros.is_empty());
         assert!(matches!(s.delete_macro(&id), Err(Error::NotFound(_))));
         assert!(matches!(s.run_macro(&id, None), Err(Error::NotFound(_))));
+    }
+
+    #[test]
+    fn add_macro_from_a_sample() {
+        let mut s = Session::new();
+        s.new_file("x").unwrap();
+        let samples = Session::macro_samples();
+        assert!(samples.len() >= 5);
+        let sample = &samples[0];
+        let snap = s.add_macro(&sample.name, Some(&sample.source)).unwrap();
+        assert_eq!(snap.file.macros[0].name, sample.name);
+        assert_eq!(snap.file.macros[0].source, sample.source);
+        // 新規ファイルの既定の名前（シート1 / データ）に合わせてあるので、そのまま実行できる
+        let id = snap.file.macros[0].id.clone();
+        let sample = samples
+            .iter()
+            .find(|x| x.id == "remove-empty-rows")
+            .unwrap();
+        s.update_macro(&id, "空行", &sample.source).unwrap();
+        let out = s.run_macro(&id, None).unwrap();
+        // 新規ファイルの 1 行（空）が消える
+        assert_eq!((out.ops, out.result), (1, Some(json!(1))));
     }
 
     #[test]

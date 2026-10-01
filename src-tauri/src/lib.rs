@@ -94,8 +94,13 @@ fn set_cell(
 }
 
 #[tauri::command(async)]
-fn add_macro(app: App, name: String) -> Reply<Snapshot> {
-    with(&app, |s| s.add_macro(&name))
+fn add_macro(app: App, name: String, source: Option<String>) -> Reply<Snapshot> {
+    with(&app, |s| s.add_macro(&name, source.as_deref()))
+}
+
+#[tauri::command]
+fn macro_samples() -> Vec<jxcel_macro::samples::Sample> {
+    Session::macro_samples()
 }
 
 #[tauri::command(async)]
@@ -148,6 +153,7 @@ pub fn run() {
             delete_row,
             set_cell,
             add_macro,
+            macro_samples,
             update_macro,
             delete_macro,
             run_macro,

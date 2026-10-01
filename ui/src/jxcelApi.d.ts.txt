@@ -55,3 +55,133 @@ interface JxcelReadonly {
   sheet(name: string): JxcelSheetReadonly;
   log(...args: unknown[]): void;
 }
+
+// ---- 標準ライブラリ std（マクロにも計算列の式にも、import なしで使えます） ----
+
+/** 日付は "YYYY-MM-DD" の文字列で受け取り、返します（日時の値は日付部分だけを使います）。空(null)を渡すと null を返します。 */
+interface JxcelStdDate {
+  /** 今日の日付（実行した環境の日付）。計算列で使うと、日によって結果が変わります */
+  today(): string;
+  /** 存在する日付か */
+  isValid(s: string): boolean;
+  /** n 日後（負なら前） */
+  addDays(date: string | null, n: number): string | null;
+  /** n か月後。月末を超える日は月末に丸めます（1/31 + 1 か月 = 2/29 または 2/28） */
+  addMonths(date: string | null, n: number): string | null;
+  addYears(date: string | null, n: number): string | null;
+  /** a - b の日数 */
+  diffDays(a: string | null, b: string | null): number | null;
+  startOfMonth(date: string | null): string | null;
+  endOfMonth(date: string | null): string | null;
+  /** 曜日（0=日 〜 6=土） */
+  weekday(date: string | null): number | null;
+  isWeekend(date: string | null): boolean | null;
+  /** 土日と holidays（"YYYY-MM-DD" の配列）を除いて n 営業日後（負なら前）の日付 */
+  addWorkdays(date: string | null, n: number, holidays?: string[]): string | null;
+  /** 始点と終点を含む営業日数（a が b より後なら負） */
+  workdaysBetween(a: string | null, b: string | null, holidays?: string[]): number | null;
+  /** 書式: YYYY YY MM M DD D ddd（曜日 1 文字）。例: format(d, "YYYY年M月D日(ddd)") → "2024年1月31日(水)" */
+  format(date: string | null, pattern: string): string | null;
+  /** 和暦。例: "令和6年1月31日"（1 年は「元年」）。明治より前は例外 */
+  toWareki(date: string | null): string | null;
+}
+
+/**
+ * Decimal 型（文字列で保持する 10 進数）を誤差なく計算します。数値（number）の計算では 0.1 + 0.2 が
+ * 0.30000000000000004 になりますが、dec.add("0.1", "0.2") は "0.3" です。結果は文字列で返します。
+ */
+interface JxcelStdDec {
+  add(a: string | number, b: string | number): string;
+  sub(a: string | number, b: string | number): string;
+  mul(a: string | number, b: string | number): string;
+  /** a / b を小数点以下 scale 桁で（四捨五入。0.5 は 0 から遠ざかる方向）。0 で割ると例外 */
+  div(a: string | number, b: string | number, scale: number): string;
+  /** 小数点以下 scale 桁に四捨五入（既定 0 桁） */
+  round(a: string | number | null, scale?: number): string | null;
+  /** 小数点以下 scale 桁に揃えた文字列（"1.5" → "1.50"） */
+  fixed(a: string | number | null, scale: number): string | null;
+  /** 大小比較（-1 / 0 / 1） */
+  cmp(a: string | number, b: string | number): -1 | 0 | 1;
+  /** 合計。空(null)は無視します */
+  sum(values: (string | number | null)[]): string;
+  toNumber(a: string | null): number | null;
+}
+
+interface JxcelStdText {
+  /** 空(null)、空文字、空白（全角スペース含む）だけの文字列か */
+  isBlank(v: unknown): boolean;
+  /** 前後の空白（全角スペース含む）を除く */
+  trim(s: string | null): string | null;
+  /** 全角英数・記号・スペースを半角に */
+  toHalfWidth(s: string | null): string | null;
+  /** 半角英数・記号・スペースを全角に。半角カナも全角カナに */
+  toFullWidth(s: string | null): string | null;
+  toKatakana(s: string | null): string | null;
+  toHiragana(s: string | null): string | null;
+  /** 表記ゆれの整理: 全角英数・半角カナを正規化(NFKC)し、前後の空白を除き、連続する空白を 1 つに */
+  normalize(s: string | null): string | null;
+  /** 0 埋め。zeroPad(7, 3) → "007" */
+  zeroPad(n: number | string, width: number): string;
+  /** 3 桁区切り。formatNumber(1234567.891, 1) → "1,234,567.9" */
+  formatNumber(n: number | null, digits?: number): string | null;
+  /** 円表記。yen(1234567) → "¥1,234,567" */
+  yen(n: number | null): string | null;
+}
+
+interface JxcelStd {
+  // ---- 集計（空(null)は無視。数値でない値は例外になり、計算列では #ERROR になります） ----
+  /** 合計 */
+  sum(values: unknown[]): number;
+  /** 平均。値が 1 つもなければ null */
+  avg(values: unknown[]): number | null;
+  /** 最小。値が 1 つもなければ null */
+  min(values: unknown[]): number | null;
+  /** 最大。値が 1 つもなければ null */
+  max(values: unknown[]): number | null;
+  /** 中央値。値が 1 つもなければ null */
+  median(values: unknown[]): number | null;
+  /** 空(null)でない値の個数 */
+  count(values: unknown[]): number;
+  /** 四捨五入（0.5 は 0 から遠ざかる方向。round(1.005, 2) → 1.01）。digits は小数点以下の桁数（既定 0） */
+  round(x: number | string | null, digits?: number): number | null;
+  /** 切り捨て（負の数は小さい方向） */
+  floor(x: number | string | null, digits?: number): number | null;
+  /** 切り上げ（負の数は大きい方向） */
+  ceil(x: number | string | null, digits?: number): number | null;
+  /** x を lo 以上 hi 以下に収める */
+  clamp(x: number | string | null, lo: number, hi: number): number | null;
+  /** 最初の空でない値。全部空なら null */
+  coalesce<T>(...values: (T | null | undefined)[]): T | null;
+
+  // ---- 表（rows() の結果、または同じ形のオブジェクトの配列）の操作。列は名前で指定します ----
+  /** 列の値だけを取り出す */
+  pluck(rows: Record<string, any>[], col: string): any[];
+  /** 列の合計 */
+  sumBy(rows: Record<string, any>[], col: string): number;
+  /** 列の平均。値が無ければ null */
+  avgBy(rows: Record<string, any>[], col: string): number | null;
+  /** 列の、空でない値の個数 */
+  countBy(rows: Record<string, any>[], col: string): number;
+  /** 列が value に等しい行 */
+  where<T extends Record<string, any>>(rows: T[], col: string, value: unknown): T[];
+  /** 列が value に等しい最初の行。無ければ null */
+  find<T extends Record<string, any>>(rows: T[], col: string, value: unknown): T | null;
+  /** keyCol が key の最初の行の valueCol。見つからなければ fallback（既定 null）。VLOOKUP / XLOOKUP 相当 */
+  lookup(rows: Record<string, any>[], keyCol: string, key: unknown, valueCol: string, fallback?: any): any;
+  /** 列の値ごとにまとめる（出現順）。groupBy(rows, "区分").map(g => [g.key, std.sumBy(g.rows, "金額")]) */
+  groupBy<T extends Record<string, any>>(rows: T[], col: string): { key: any; rows: T[] }[];
+  /** 重複を除く（出現順） */
+  uniq<T>(values: T[]): T[];
+  /**
+   * 列で並べ替えた新しい配列。空の値は昇順でも降順でも最後。同じ値は元の順を保ちます。
+   * 文字列は文字コード順です（五十音順ではありません。ひらがなとカタカナ、漢字は混ざった順になります）。
+   */
+  sortBy<T extends Record<string, any>>(rows: T[], col: string, order?: "asc" | "desc"): T[];
+
+  date: JxcelStdDate;
+  dec: JxcelStdDec;
+  text: JxcelStdText;
+}
+
+/** 標準ライブラリ */
+declare const std: JxcelStd;

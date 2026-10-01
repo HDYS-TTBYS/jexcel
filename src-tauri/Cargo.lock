@@ -1860,6 +1860,7 @@ dependencies = [
  "jxcel-app",
  "jxcel-core",
  "jxcel-git",
+ "jxcel-macro",
  "serde_json",
  "tauri",
  "tauri-build",

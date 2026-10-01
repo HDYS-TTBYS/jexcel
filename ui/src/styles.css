@@ -64,3 +64,9 @@ input, select { font: inherit; padding: 4px 6px; border: 1px solid var(--bd); bo
 .formula-row { padding: 0 0 6px; border-bottom: 1px solid var(--bd); }
 .formula-row .muted { margin: 2px 0; }
 .formula-row .column-row { border-bottom: none; }
+.add-menu-wrap { position: relative; }
+.add-menu { position: absolute; top: 100%; left: 0; z-index: 30; width: 360px; margin-top: 4px; background: #fff; border: 1px solid var(--bd); border-radius: 8px; box-shadow: 0 6px 20px rgba(0,0,0,.15); padding: 4px; max-height: 60vh; overflow: auto; }
+.add-menu button { display: flex; flex-direction: column; align-items: flex-start; width: 100%; text-align: left; border: none; gap: 2px; padding: 6px 8px; }
+.add-menu .menu-title { padding: 6px 8px 2px; font-size: 12px; color: #6b7280; border-top: 1px solid var(--bd); margin-top: 4px; }
+.add-menu .muted { white-space: normal; }
+.pad-s { padding: 4px 8px; margin: 0; }

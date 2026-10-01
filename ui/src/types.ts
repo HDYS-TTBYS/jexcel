@@ -60,6 +60,14 @@ export interface JxcelFile {
   macros: Macro[];
 }
 
+/** 同梱のサンプルマクロ（実体は crates/jxcel-macro/samples/*.ts） */
+export interface MacroSample {
+  id: string;
+  name: string;
+  description: string;
+  source: string;
+}
+
 export interface RunOutput {
   snapshot: Snapshot;
   logs: string[];

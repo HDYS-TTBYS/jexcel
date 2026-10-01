@@ -18,6 +18,7 @@ serde_json = "1"
 jxcel-app = { path = "../crates/jxcel-app" }
 jxcel-core = { path = "../crates/jxcel-core" }
 jxcel-git = { path = "../crates/jxcel-git" }
+jxcel-macro = { path = "../crates/jxcel-macro" }
 
 # ルートの workspace とは別にビルドする（WebKit 等のシステム依存があるため）
 [workspace]
