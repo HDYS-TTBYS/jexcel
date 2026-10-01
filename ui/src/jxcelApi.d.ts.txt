@@ -11,6 +11,8 @@ interface JxcelColumn {
   /** 型の種類（string / int / float / decimal / bool / date / dateTime / enum / object / array / any） */
   type: string;
   required: boolean;
+  /** 計算列か（計算列には書き込めません） */
+  computed: boolean;
 }
 
 /** データスキーマ（シートの中の表）。書き込みは実行後に型検証され、1 件でも不正なら全体が取り消されます。 */
@@ -38,5 +40,18 @@ interface Jxcel {
   /** シートを名前で取得。なければ例外 */
   sheet(name: string): JxcelSheet;
   /** 出力欄に表示するログ（console.log も同じ） */
+  log(...args: unknown[]): void;
+}
+
+/** 計算式の中で使う jx。読み取りだけで、add / update / remove は例外になります。 */
+type JxcelSchemaReadonly = Omit<JxcelSchema, "add" | "update" | "remove">;
+
+interface JxcelSheetReadonly {
+  name: string;
+  schema(name: string): JxcelSchemaReadonly;
+}
+
+interface JxcelReadonly {
+  sheet(name: string): JxcelSheetReadonly;
   log(...args: unknown[]): void;
 }

@@ -255,6 +255,7 @@ export function App({ backend }: { backend: Backend }) {
             <Grid
               key={schema.id + schema.columns.map((c) => c.id + c.type.kind).join()}
               schema={schema}
+              computed={snap.computed[schema.id]}
               onError={onError}
               onSetCell={(row, col, value) => void run(backend.setCell(sheet.id, schema.id, row, col.id, value))}
               onDeleteRow={(row) => void run(backend.deleteRow(sheet.id, schema.id, row))}

@@ -8,8 +8,10 @@ import {
   defaultType,
   newId,
   type Change,
+  type CellResult,
   type Column,
   type CommitInfo,
+  type ComputedValues,
   type DataSchema,
   type DataType,
   type JxcelFile,
@@ -125,6 +127,56 @@ function runMacroInBrowser(source: string, file: JxcelFile): { ops: Op[]; logs: 
   return JSON.parse(state.finish(result));
 }
 
+/**
+ * ブラウザ単体用の計算列の評価。Rust 側と同じ prelude.js の computeAll を使う。
+ * TypeScript は変換できないので、型注釈のない JS の式だけ動く。
+ */
+function computeInBrowser(file: JxcelFile): ComputedValues {
+  const specs: { sheet: string; schema: string; column: string; error?: string }[] = [];
+  const fns: (Function | undefined)[] = [];
+  for (const sh of file.sheets)
+    for (const sc of sh.schemas)
+      for (const col of sc.columns) {
+        if (!col.computed) continue;
+        const spec: (typeof specs)[number] = { sheet: sh.id, schema: sc.id, column: col.id };
+        const src = col.computed.source ?? "";
+        if (!src.trim()) spec.error = "式が空です";
+        else {
+          try {
+            const f = new Function(src.replace(/export\s+default\s+/, "const __f = ") + "\n;return __f;")();
+            if (typeof f !== "function") throw new Error("export default function (row, jx) { return ... } の形で書いてください");
+            fns[specs.length] = f;
+          } catch (e) {
+            spec.error = e instanceof Error ? e.message : String(e);
+          }
+        }
+        specs.push(spec);
+      }
+  if (specs.length === 0) return {};
+
+  (window as unknown as { __newId?: () => string }).__newId = newId;
+  const fake: Record<string, unknown> = { __fns: fns };
+  new Function("globalThis", prelude)(fake);
+  const state = (fake.__makeState as (d: JxcelFile) => { computeAll: (s: unknown) => void; finish: (r: unknown) => string })(
+    structuredClone(file),
+  );
+  state.computeAll(specs);
+  const out: { schema: string; column: string; row: string; v?: unknown; e?: string }[] = JSON.parse(state.finish(null)).computed;
+
+  const result: ComputedValues = {};
+  for (const c of out) {
+    const col = file.sheets.flatMap((s) => s.schemas).find((s) => s.id === c.schema)?.columns.find((x) => x.id === c.column);
+    let cell: CellResult;
+    if (c.e !== undefined) cell = { e: c.e };
+    else {
+      const bad = col ? validate(col.type, c.v ?? null) : null;
+      cell = bad ? { e: `${col?.name}: ${bad}` } : { v: c.v ?? null };
+    }
+    ((result[c.schema] ??= {})[c.column] ??= {})[c.row] = cell;
+  }
+  return result;
+}
+
 export function createMockBackend(): Backend {
   let file: JxcelFile | null = null;
   let path: string | null = null;
@@ -136,7 +188,7 @@ export function createMockBackend(): Backend {
   const clone = <T,>(x: T): T => structuredClone(x);
   const snap = (): Snapshot => {
     if (!file) throw "ファイルが開かれていません";
-    return { file: clone(file), path, dirty };
+    return { file: clone(file), computed: computeInBrowser(file), path, dirty };
   };
   const edit = (f: (file: JxcelFile) => void): Snapshot => {
     if (!file) throw "ファイルが開かれていません";
@@ -210,7 +262,12 @@ export function createMockBackend(): Backend {
         if (!s) throw "シート が見つかりません";
         s.schemas.push({ id: newId(), name, columns, rows: [] });
       }),
-    addColumn: async (sheet, schema, column) => edit((f) => void schemaOf(f, sheet, schema).columns.push(column)),
+    addColumn: async (sheet, schema, column) =>
+      edit((f) => {
+        const s = schemaOf(f, sheet, schema);
+        if (column.computed) for (const r of s.rows) delete r.cells[column.id]; // 計算列は値を保存しない
+        s.columns.push(column);
+      }),
     updateColumn: async (sheet, schema, column) =>
       edit((f) => {
         const s = schemaOf(f, sheet, schema);
@@ -218,6 +275,10 @@ export function createMockBackend(): Backend {
         if (i < 0) throw "列 が見つかりません";
         s.columns[i] = column;
         for (const r of s.rows) {
+          if (column.computed) {
+            delete r.cells[column.id]; // 通常の列を計算列にしたら、保存していた値は捨てる
+            continue;
+          }
           const e = validate(column.type, r.cells[column.id]);
           if (e) throw `既存の値が新しい定義に合いません: ${e}`;
         }
@@ -240,6 +301,7 @@ export function createMockBackend(): Backend {
         const col = s.columns.find((c) => c.id === column);
         const r = s.rows.find((x) => x.id === row);
         if (!col || !r) throw "対象が見つかりません";
+        if (col.computed) throw `「${col.name}」は計算列なので編集できません`;
         if ((value === null || value === undefined) && col.required) throw `${col.name} は必須です`;
         const e = validate(col.type, value);
         if (e) throw e;

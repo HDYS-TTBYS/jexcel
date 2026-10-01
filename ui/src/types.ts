@@ -19,7 +19,15 @@ export interface Column {
   name: string;
   type: DataType;
   required?: boolean;
+  /** 計算列。値は保存されず、式から計算される。 */
+  computed?: { source?: string };
 }
+
+/** 計算列の 1 セルの結果。値か、そのセルだけのエラー。 */
+export type CellResult = { v: unknown } | { e: string };
+
+/** スキーマ ID → 列 ID → 行 ID → 結果 */
+export type ComputedValues = Record<string, Record<string, Record<string, CellResult>>>;
 
 export interface Row {
   id: string;
@@ -62,6 +70,8 @@ export interface RunOutput {
 
 export interface Snapshot {
   file: JxcelFile;
+  /** 計算列の値（状態を返すたびに計算される。保存はされない） */
+  computed: ComputedValues;
   path: string | null;
   dirty: boolean;
 }
@@ -112,6 +122,13 @@ export const KIND_LABEL: Record<string, string> = {
 };
 
 /** 衝突しない ID（ULID の代わりに UUID を使う。サーバ側は文字種のみ検査する）。 */
+/** 計算列の式の雛形 */
+export const FORMULA_TEMPLATE = `// row: この行（列名でアクセス）。jx: 他の表を引くための読み取り専用 API。
+export default function (row: JxcelRow, jx: JxcelReadonly) {
+  return null;
+}
+`;
+
 export const newId = () => crypto.randomUUID().replace(/-/g, "");
 
 export function defaultType(kind: Kind): DataType {

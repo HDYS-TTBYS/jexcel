@@ -27,8 +27,13 @@ export function describeChange(c: Change, file: JxcelFile): string {
       return `列「${c.name}」を追加`;
     case "columnRemoved":
       return `列「${c.name}」を削除`;
-    case "columnChanged":
+    case "columnChanged": {
+      const [o, n] = [c.old.computed, c.new.computed];
+      if (!o && n) return `列「${c.new.name}」を計算列にした`;
+      if (o && !n) return `列「${c.new.name}」を通常の列に戻した`;
+      if (o && n && o.source !== n.source) return `列「${c.new.name}」の計算式を変更`;
       return `列「${c.new.name}」の定義を変更`;
+    }
     case "rowAdded":
       return `行を追加 ${summarizeRow(c.cells.cells)}`;
     case "rowRemoved":

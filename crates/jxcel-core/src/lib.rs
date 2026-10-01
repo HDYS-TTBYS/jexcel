@@ -7,7 +7,7 @@ pub mod tree;
 pub mod types;
 
 pub use error::{Error, Result};
-pub use model::{Column, DataSchema, JxcelFile, Macro, Row, Sheet};
+pub use model::{Column, Computed, DataSchema, JxcelFile, Macro, Row, Sheet};
 pub use types::{DataType, TypeRegistry};
 
 /// 永続化フォーマットのバージョン。互換性を壊す変更で上げる。

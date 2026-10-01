@@ -10,7 +10,7 @@
 use jxcel_core::types::TypeRegistry;
 use jxcel_core::{new_id, JxcelFile, Row};
 use rquickjs::{CatchResultExt, Context, Function, Module, Runtime};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
@@ -108,7 +108,31 @@ struct Output {
     ops: Vec<Op>,
     logs: Vec<String>,
     result: Value,
+    #[serde(default)]
+    computed: Vec<RawCell>,
 }
+
+/// JS 側から返る、計算列の 1 セル分の結果。
+#[derive(Deserialize)]
+struct RawCell {
+    schema: String,
+    column: String,
+    row: String,
+    v: Option<Value>,
+    e: Option<String>,
+}
+
+/// 計算列の 1 セルの結果。値か、そのセルだけのエラー。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub enum CellResult {
+    #[serde(rename = "v")]
+    Value(Value),
+    #[serde(rename = "e")]
+    Error(String),
+}
+
+/// スキーマ ID → 列 ID → 行 ID → 結果。
+pub type ComputedValues = BTreeMap<String, BTreeMap<String, BTreeMap<String, CellResult>>>;
 
 #[derive(Deserialize)]
 #[serde(tag = "op", rename_all = "camelCase")]
@@ -133,14 +157,115 @@ enum Op {
 }
 
 /// マクロを実行し、結果を検証したうえで適用後のファイルを返す。
+/// 計算列があれば先に評価するので、マクロからは計算列の値も読める（実行開始時点の値）。
 pub fn run(source: &str, file: &JxcelFile, opts: &Options) -> Result<MacroRun> {
     let js = transpile(source)?;
-    let data = serde_json::to_string(file).expect("serialize");
-    let output = execute(&js, &data, opts)?;
+    let output = execute(file, Some(&js), opts)?;
     apply(file, output)
 }
 
-fn execute(js: &str, data: &str, opts: &Options) -> Result<Output> {
+/// 計算列を評価する。値は保存しないので、読み込むたびに呼ぶ。
+///
+/// 計算列のないファイルでは何も実行しない。式の誤りや型違いは、そのセルのエラーになる
+/// （他のセルは計算を続ける）。実行基盤の失敗（時間切れなど）は、全ての計算セルのエラーにする。
+pub fn compute(file: &JxcelFile, opts: &Options) -> ComputedValues {
+    let formulas = collect_formulas(file);
+    if formulas.is_empty() {
+        return ComputedValues::new();
+    }
+    match execute(file, None, opts) {
+        Ok(output) => into_values(file, output.computed),
+        Err(e) => {
+            let message = e.to_string();
+            let mut out = ComputedValues::new();
+            for f in &formulas {
+                let cells = out
+                    .entry(f.schema.clone())
+                    .or_default()
+                    .entry(f.column.clone())
+                    .or_default();
+                for row in file_rows(file, &f.sheet, &f.schema) {
+                    cells.insert(row, CellResult::Error(message.clone()));
+                }
+            }
+            out
+        }
+    }
+}
+
+fn file_rows(file: &JxcelFile, sheet: &str, schema: &str) -> Vec<String> {
+    file.sheets
+        .iter()
+        .find(|s| s.id == sheet)
+        .and_then(|s| s.schemas.iter().find(|s| s.id == schema))
+        .map(|s| s.rows.iter().map(|r| r.id.clone()).collect())
+        .unwrap_or_default()
+}
+
+/// 結果を列の型で検査する。合わなければそのセルのエラーにする。
+fn into_values(file: &JxcelFile, cells: Vec<RawCell>) -> ComputedValues {
+    let registry = TypeRegistry::default();
+    let mut out = ComputedValues::new();
+    for c in cells {
+        let column = file
+            .sheets
+            .iter()
+            .flat_map(|s| &s.schemas)
+            .find(|s| s.id == c.schema)
+            .and_then(|s| s.columns.iter().find(|x| x.id == c.column));
+        let result = match (c.e, c.v, column) {
+            (Some(e), _, _) => CellResult::Error(e),
+            (None, Some(v), Some(col)) => match col.ty.validate(&v, &registry) {
+                Ok(()) => CellResult::Value(v),
+                Err(why) => CellResult::Error(format!("{}: {why}", col.name)),
+            },
+            (None, v, _) => CellResult::Value(v.unwrap_or(Value::Null)),
+        };
+        out.entry(c.schema)
+            .or_default()
+            .entry(c.column)
+            .or_default()
+            .insert(c.row, result);
+    }
+    out
+}
+
+struct Formula {
+    sheet: String,
+    schema: String,
+    column: String,
+    /// 変換後の JS。構文エラーなら、そのメッセージ。
+    js: std::result::Result<String, String>,
+}
+
+/// ファイル内の計算列を、シート・スキーマ・列の並び順で集める（評価もこの順）。
+fn collect_formulas(file: &JxcelFile) -> Vec<Formula> {
+    let mut out = vec![];
+    for sheet in &file.sheets {
+        for schema in &sheet.schemas {
+            for col in &schema.columns {
+                let Some(comp) = &col.computed else { continue };
+                let js = if comp.source.trim().is_empty() {
+                    Err("式が空です".to_string())
+                } else {
+                    transpile(&comp.source).map_err(|e| e.to_string())
+                };
+                out.push(Formula {
+                    sheet: sheet.id.clone(),
+                    schema: schema.id.clone(),
+                    column: col.id.clone(),
+                    js,
+                });
+            }
+        }
+    }
+    out
+}
+
+fn execute(file: &JxcelFile, main_js: Option<&str>, opts: &Options) -> Result<Output> {
+    let data = serde_json::to_string(file).expect("serialize");
+    let formulas = collect_formulas(file);
+
     let rt = Runtime::new().map_err(|e| Error::Runtime(e.to_string()))?;
     rt.set_memory_limit(opts.memory_limit);
     rt.set_max_stack_size(512 * 1024);
@@ -160,28 +285,73 @@ fn execute(js: &str, data: &str, opts: &Options) -> Result<Output> {
         ctx.eval::<(), _>(PRELUDE)
             .catch(&ctx)
             .map_err(|e| e.to_string())?;
-        ctx.eval::<(), _>("globalThis.__state = __makeState(JSON.parse(__data));")
-            .catch(&ctx)
-            .map_err(|e| e.to_string())?;
+        ctx.eval::<(), _>(
+            "globalThis.__state = __makeState(JSON.parse(__data)); globalThis.__fns = [];",
+        )
+        .catch(&ctx)
+        .map_err(|e| e.to_string())?;
 
-        let (module, promise) = Module::declare(ctx.clone(), "macro", js)
-            .catch(&ctx)
-            .map_err(|e| e.to_string())?
-            .eval()
-            .catch(&ctx)
-            .map_err(|e| e.to_string())?;
-        promise
-            .finish::<()>()
-            .catch(&ctx)
-            .map_err(|e| e.to_string())?;
-        let main: Function = module
-            .get("default")
-            .map_err(|_| "export default function (jx) { ... } の形で書いてください".to_string())?;
-        let jx: rquickjs::Value = ctx
-            .eval("globalThis.__state.jx")
-            .catch(&ctx)
-            .map_err(|e| e.to_string())?;
-        let result: rquickjs::Value = main.call((jx,)).catch(&ctx).map_err(|e| e.to_string())?;
+        // 計算式: 1 列 1 モジュールとして読み込み、default の関数を __fns[i] に置く。
+        // 構文エラーなどはその列のエラーとして JS 側へ渡す（他の列は計算する）。
+        if !formulas.is_empty() {
+            let fns: rquickjs::Array = globals.get("__fns").map_err(|e| e.to_string())?;
+            let mut specs = vec![];
+            for (i, f) in formulas.iter().enumerate() {
+                let loaded = f.js.clone().and_then(|js| {
+                    let (module, promise) = Module::declare(ctx.clone(), format!("formula{i}"), js)
+                        .catch(&ctx)
+                        .map_err(|e| e.to_string())?
+                        .eval()
+                        .catch(&ctx)
+                        .map_err(|e| e.to_string())?;
+                    promise
+                        .finish::<()>()
+                        .catch(&ctx)
+                        .map_err(|e| e.to_string())?;
+                    let func: Function = module.get("default").map_err(|_| {
+                        "export default function (row, jx) { return ... } の形で書いてください"
+                            .to_string()
+                    })?;
+                    fns.set(i, func).map_err(|e| e.to_string())
+                });
+                let mut spec =
+                    serde_json::json!({ "sheet": f.sheet, "schema": f.schema, "column": f.column });
+                if let Err(message) = loaded {
+                    spec["error"] = Value::String(message);
+                }
+                specs.push(spec);
+            }
+            let specs = serde_json::to_string(&specs).expect("serialize");
+            globals.set("__specs", specs).map_err(|e| e.to_string())?;
+            ctx.eval::<(), _>("globalThis.__state.computeAll(JSON.parse(__specs));")
+                .catch(&ctx)
+                .map_err(|e| e.to_string())?;
+        }
+
+        // マクロ本体（計算列だけを評価する場合は無い）
+        let result: rquickjs::Value = match main_js {
+            None => rquickjs::Value::new_undefined(ctx.clone()),
+            Some(js) => {
+                let (module, promise) = Module::declare(ctx.clone(), "macro", js)
+                    .catch(&ctx)
+                    .map_err(|e| e.to_string())?
+                    .eval()
+                    .catch(&ctx)
+                    .map_err(|e| e.to_string())?;
+                promise
+                    .finish::<()>()
+                    .catch(&ctx)
+                    .map_err(|e| e.to_string())?;
+                let main: Function = module.get("default").map_err(|_| {
+                    "export default function (jx) { ... } の形で書いてください".to_string()
+                })?;
+                let jx: rquickjs::Value = ctx
+                    .eval("globalThis.__state.jx")
+                    .catch(&ctx)
+                    .map_err(|e| e.to_string())?;
+                main.call((jx,)).catch(&ctx).map_err(|e| e.to_string())?
+            }
+        };
 
         // 結果は JSON で受け渡す（undefined は null になる）
         globals.set("__result", result).map_err(|e| e.to_string())?;
@@ -476,6 +646,270 @@ mod tests {
             Some(json!(
                 "undefined,undefined,undefined,undefined,undefined,undefined"
             ))
+        );
+    }
+
+    // ---- 計算列 ----
+
+    /// サンプルの「在庫」スキーマに計算列を足す（列 ID は `id`）。
+    fn with_computed(mut f: JxcelFile, id: &str, name: &str, ty: DataType, src: &str) -> JxcelFile {
+        f.sheets[0].schemas[0]
+            .columns
+            .push(Column::new(id, name, ty).computed(src));
+        f
+    }
+
+    fn cell(c: &ComputedValues, column: &str, row: &str) -> CellResult {
+        c["s1"][column][row].clone()
+    }
+
+    fn quick() -> Options {
+        Options {
+            timeout: Duration::from_millis(300),
+            ..Options::default()
+        }
+    }
+
+    #[test]
+    fn computed_values_from_row() {
+        let f = with_computed(
+            sample(),
+            "dbl",
+            "倍",
+            DataType::Int,
+            "export default (row: JxcelRow, jx: Jxcel): number => row.数量 * 2;",
+        );
+        let f = with_computed(
+            f,
+            "label",
+            "表示",
+            DataType::String,
+            "export default (row: any) => `${row.品名}(${row.数量})`",
+        );
+        let c = compute(&f, &Options::default());
+        assert_eq!(cell(&c, "dbl", "r1"), CellResult::Value(json!(20)));
+        assert_eq!(cell(&c, "dbl", "r2"), CellResult::Value(json!(10)));
+        assert_eq!(
+            cell(&c, "label", "r1"),
+            CellResult::Value(json!("ねじ(10)"))
+        );
+    }
+
+    #[test]
+    fn no_computed_columns_means_nothing_runs() {
+        assert!(compute(&sample(), &Options::default()).is_empty());
+    }
+
+    #[test]
+    fn a_bad_row_fails_only_that_cell() {
+        let mut f = sample();
+        f.sheets[0].schemas[0].rows[1].cells.remove("qty"); // r2 は数量が空
+        let f = with_computed(
+            f,
+            "ratio",
+            "比",
+            DataType::Int,
+            "export default (row: any) => { if (row.数量 === null) throw new Error('数量が空です'); return row.数量 * 2; }",
+        );
+        let c = compute(&f, &Options::default());
+        assert_eq!(cell(&c, "ratio", "r1"), CellResult::Value(json!(20)));
+        assert!(
+            matches!(cell(&c, "ratio", "r2"), CellResult::Error(m) if m.contains("数量が空です"))
+        );
+    }
+
+    #[test]
+    fn result_must_match_the_column_type() {
+        // Int 列なのに、小数や文字列を返した行だけがエラーになる
+        let f = with_computed(
+            sample(),
+            "half",
+            "半分",
+            DataType::Int,
+            "export default (row: any) => row.品名 === 'ねじ' ? row.数量 / 4 : row.数量 / 5",
+        );
+        let c = compute(&f, &Options::default());
+        assert!(
+            matches!(cell(&c, "half", "r1"), CellResult::Error(m) if m.contains("半分")),
+            "{:?}",
+            cell(&c, "half", "r1")
+        );
+        assert_eq!(cell(&c, "half", "r2"), CellResult::Value(json!(1)));
+    }
+
+    #[test]
+    fn syntax_error_marks_that_column_only() {
+        let f = with_computed(
+            sample(),
+            "bad",
+            "壊れ",
+            DataType::Int,
+            "export default (row => ",
+        );
+        let f = with_computed(
+            f,
+            "ok",
+            "正常",
+            DataType::Int,
+            "export default (row: any) => row.数量",
+        );
+        let c = compute(&f, &Options::default());
+        assert!(matches!(cell(&c, "bad", "r1"), CellResult::Error(m) if m.contains("構文エラー")));
+        assert_eq!(cell(&c, "ok", "r1"), CellResult::Value(json!(10)));
+        // 式が空、default の関数でない場合もそのセルのエラー
+        let f = with_computed(sample(), "empty", "空", DataType::Int, "  ");
+        assert!(
+            matches!(cell(&compute(&f, &Options::default()), "empty", "r1"), CellResult::Error(m) if m.contains("空"))
+        );
+        let f = with_computed(
+            sample(),
+            "nofn",
+            "非関数",
+            DataType::Int,
+            "export default 5;",
+        );
+        assert!(matches!(
+            cell(&compute(&f, &Options::default()), "nofn", "r1"),
+            CellResult::Error(_)
+        ));
+    }
+
+    #[test]
+    fn later_columns_can_use_earlier_computed_columns() {
+        let f = with_computed(
+            sample(),
+            "dbl",
+            "倍",
+            DataType::Int,
+            "export default (row: any) => row.数量 * 2",
+        );
+        let f = with_computed(
+            f,
+            "quad",
+            "四倍",
+            DataType::Int,
+            "export default (row: any) => row.倍 * 2",
+        );
+        let c = compute(&f, &Options::default());
+        assert_eq!(cell(&c, "quad", "r1"), CellResult::Value(json!(40)));
+        // 後ろの計算列は、まだ計算されていないので空（null）として見える
+        let f = with_computed(
+            sample(),
+            "first",
+            "先",
+            DataType::Int,
+            "export default (row: any) => row.後 === null ? -1 : 1",
+        );
+        let f = with_computed(f, "後", "後", DataType::Int, "export default () => 5");
+        let c = compute(&f, &Options::default());
+        assert_eq!(cell(&c, "first", "r1"), CellResult::Value(json!(-1)));
+    }
+
+    #[test]
+    fn formulas_can_look_up_other_rows_read_only() {
+        // 全体に占める割合（%）: 同じ表の全行を読んで集計する
+        let f = with_computed(
+            sample(),
+            "pct",
+            "割合",
+            DataType::Int,
+            r#"export default (row: any, jx: Jxcel) => {
+                 const total = jx.sheet("倉庫").schema("在庫").rows().reduce((s: number, r: any) => s + r.数量, 0);
+                 return Math.round(row.数量 * 100 / total);
+               }"#,
+        );
+        let c = compute(&f, &Options::default());
+        assert_eq!(cell(&c, "pct", "r1"), CellResult::Value(json!(67)));
+        assert_eq!(cell(&c, "pct", "r2"), CellResult::Value(json!(33)));
+        // 計算式の中では書き込めない
+        let f = with_computed(
+            sample(),
+            "w",
+            "書込",
+            DataType::Int,
+            r#"export default (row: any, jx: Jxcel) => { jx.sheet("倉庫").schema("在庫").remove("r1"); return 1; }"#,
+        );
+        let c = compute(&f, &Options::default());
+        assert!(
+            matches!(cell(&c, "w", "r1"), CellResult::Error(m) if m.contains("書き換えられません"))
+        );
+    }
+
+    #[test]
+    fn runaway_formula_times_out_for_all_cells() {
+        let f = with_computed(
+            sample(),
+            "loop",
+            "無限",
+            DataType::Int,
+            "export default () => { while (true) {} }",
+        );
+        let started = Instant::now();
+        let c = compute(&f, &quick());
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(matches!(cell(&c, "loop", "r1"), CellResult::Error(m) if m.contains("実行時間")));
+        assert!(matches!(cell(&c, "loop", "r2"), CellResult::Error(_)));
+    }
+
+    #[test]
+    fn macros_read_computed_values_but_cannot_write_them() {
+        let f = with_computed(
+            sample(),
+            "dbl",
+            "倍",
+            DataType::Int,
+            "export default (row: any) => row.数量 * 2",
+        );
+        let r = run(
+            r#"export default (jx: Jxcel) => jx.sheet("倉庫").schema("在庫").rows().map((r: any) => r.倍)"#,
+            &f,
+            &Options::default(),
+        )
+        .unwrap();
+        assert_eq!(r.result, Some(json!([20, 10])));
+        assert_eq!(r.ops, 0);
+
+        let e = run(
+            r#"export default (jx: Jxcel) => { jx.sheet("倉庫").schema("在庫").update("r1", { 倍: 1 }); }"#,
+            &f,
+            &Options::default(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&e, Error::Runtime(m) if m.contains("計算列")),
+            "{e}"
+        );
+
+        // 通常の列への書き込みは普通にでき、計算列の値はファイルに入らない
+        let r = run(
+            r#"export default (jx: Jxcel) => { jx.sheet("倉庫").schema("在庫").update("r1", { 数量: 11 }); }"#,
+            &f,
+            &Options::default(),
+        )
+        .unwrap();
+        assert!(!r.file.sheets[0].schemas[0].rows[0]
+            .cells
+            .contains_key("dbl"));
+        assert_eq!(
+            cell(&compute(&r.file, &Options::default()), "dbl", "r1"),
+            CellResult::Value(json!(22))
+        );
+    }
+
+    #[test]
+    fn cell_results_serialize_as_ui_expects() {
+        // UI の `CellResult = { v: unknown } | { e: string }` と対応している。変えるなら ui/src/types.ts も
+        assert_eq!(
+            serde_json::to_value(CellResult::Value(json!(30))).unwrap(),
+            json!({ "v": 30 })
+        );
+        assert_eq!(
+            serde_json::to_value(CellResult::Value(Value::Null)).unwrap(),
+            json!({ "v": null })
+        );
+        assert_eq!(
+            serde_json::to_value(CellResult::Error("だめ".into())).unwrap(),
+            json!({ "e": "だめ" })
         );
     }
 }

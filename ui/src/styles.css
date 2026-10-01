@@ -58,3 +58,9 @@ input, select { font: inherit; padding: 4px 6px; border: 1px solid var(--bd); bo
 .out-summary { margin: 0 0 4px; font-weight: 600; }
 .out-error { color: var(--err); }
 .out-result { color: #1d4ed8; }
+.computed { background: #f8fafc; font-style: italic; color: #334155; }
+.cell-error { color: var(--err); font-style: normal; font-weight: 600; background: #fef2f2; }
+.formula-editor { height: 170px; border: 1px solid var(--bd); border-radius: 6px; overflow: hidden; margin: 4px 0 8px; }
+.formula-row { padding: 0 0 6px; border-bottom: 1px solid var(--bd); }
+.formula-row .muted { margin: 2px 0; }
+.formula-row .column-row { border-bottom: none; }

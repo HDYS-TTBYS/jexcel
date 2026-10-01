@@ -8,9 +8,11 @@ use jxcel_core::types::TypeRegistry;
 use jxcel_core::{new_id, Column, DataSchema, JxcelFile, Macro, Row, Sheet};
 use jxcel_git::archive::Archive;
 use jxcel_git::CommitInfo;
+use jxcel_macro::ComputedValues;
 use serde::Serialize;
 use serde_json::Value;
 use std::path::PathBuf;
+use std::time::Duration;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -40,9 +42,15 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[serde(rename_all = "camelCase")]
 pub struct Snapshot {
     pub file: JxcelFile,
+    /// 計算列の値（保存はされず、状態を返すたびに式から計算する）
+    pub computed: ComputedValues,
     pub path: Option<String>,
     pub dirty: bool,
 }
+
+/// 状態を返すたびに計算列を評価するので、暴走する式で操作が止まらないよう短くする
+/// （時間切れは、計算セルのエラーとして表示される）。
+const COMPUTE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// マクロ実行の結果。書き込みがあればファイルに反映済みで、`snapshot` はその後の状態。
 #[derive(Debug, Clone, Serialize)]
@@ -86,8 +94,16 @@ impl Session {
 
     fn snapshot(&self) -> Result<Snapshot> {
         let d = self.doc.as_ref().ok_or(Error::NoFile)?;
+        let computed = jxcel_macro::compute(
+            &d.file,
+            &jxcel_macro::Options {
+                timeout: COMPUTE_TIMEOUT,
+                ..Default::default()
+            },
+        );
         Ok(Snapshot {
             file: d.file.clone(),
+            computed,
             path: d.path.as_ref().map(|p| p.display().to_string()),
             dirty: d.dirty,
         })
@@ -227,6 +243,12 @@ impl Session {
             if s.columns.iter().any(|c| c.id == column.id) {
                 return Err(Error::Invalid("列 ID が重複しています".into()));
             }
+            // 計算列は値を保存しない
+            if column.computed.is_some() {
+                for r in &mut s.rows {
+                    r.cells.remove(&column.id);
+                }
+            }
             s.columns.push(column);
             Ok(())
         })
@@ -243,6 +265,13 @@ impl Session {
                 .find(|c| c.id == column.id)
                 .ok_or(Error::NotFound("列"))?;
             *slot = column;
+            // 通常の列を計算列に変えたら、それまでに保存していた値は捨てる（値は式から決まる）
+            if slot.computed.is_some() {
+                let id = slot.id.clone();
+                s.rows.iter_mut().for_each(|r| {
+                    r.cells.remove(&id);
+                });
+            }
             match s.validate(reg).into_iter().next() {
                 Some(v) => Err(Error::Invalid(format!(
                     "既存の値が新しい定義に合いません: {}",
@@ -315,6 +344,12 @@ impl Session {
                 .iter()
                 .find(|c| c.id == column)
                 .ok_or(Error::NotFound("列"))?;
+            if col.computed.is_some() {
+                return Err(Error::Invalid(format!(
+                    "「{}」は計算列なので編集できません",
+                    col.name
+                )));
+            }
             col.validate(&value, reg).map_err(Error::Invalid)?;
             let r = s
                 .rows
@@ -439,6 +474,7 @@ fn find_schema<'a>(f: &'a mut JxcelFile, sheet: &str, schema: &str) -> Result<&'
 mod tests {
     use super::*;
     use jxcel_core::DataType;
+    use jxcel_macro::CellResult;
     use serde_json::json;
 
     fn ids(s: &Snapshot) -> (String, String, String, String) {
@@ -582,6 +618,122 @@ mod tests {
         assert!(s.current().unwrap().file.macros.is_empty());
         assert!(matches!(s.delete_macro(&id), Err(Error::NotFound(_))));
         assert!(matches!(s.run_macro(&id, None), Err(Error::NotFound(_))));
+    }
+
+    #[test]
+    fn computed_columns_recompute_and_are_read_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.jxcel");
+        let path = path.to_str().unwrap();
+
+        let mut s = Session::new();
+        let snap = s.new_file("x").unwrap();
+        let (sh, sc, row, col) = ids(&snap);
+        s.update_column(&sh, &sc, Column::new(&col, "数量", DataType::Int))
+            .unwrap();
+        s.set_cell(&sh, &sc, &row, &col, json!(3)).unwrap();
+
+        // 計算列を足す。値は式から出て、スナップショットに載る
+        let src = "export default (row: any) => row.数量 * 10";
+        let snap = s
+            .add_column(
+                &sh,
+                &sc,
+                Column::new("dbl", "十倍", DataType::Int).computed(src),
+            )
+            .unwrap();
+        assert_eq!(
+            snap.computed[&sc]["dbl"][&row],
+            CellResult::Value(json!(30))
+        );
+        // 値はファイルのモデルには入らない
+        assert!(!snap.file.sheets[0].schemas[0].rows[0]
+            .cells
+            .contains_key("dbl"));
+
+        // 元のセルを編集すると、計算結果も変わる
+        let snap = s.set_cell(&sh, &sc, &row, &col, json!(4)).unwrap();
+        assert_eq!(
+            snap.computed[&sc]["dbl"][&row],
+            CellResult::Value(json!(40))
+        );
+        // 計算列のセルは編集できない（状態も変わらない）
+        let e = s.set_cell(&sh, &sc, &row, "dbl", json!(1)).unwrap_err();
+        assert!(
+            matches!(&e, Error::Invalid(m) if m.contains("計算列")),
+            "{e}"
+        );
+        assert_eq!(
+            s.current().unwrap().computed[&sc]["dbl"][&row],
+            CellResult::Value(json!(40))
+        );
+
+        // 行を足すと、その行の計算結果も出る（数量が空なら 0 になる式）
+        let snap = s.add_row(&sh, &sc).unwrap();
+        let new_row = snap.file.sheets[0].schemas[0].rows[1].id.clone();
+        assert_eq!(
+            snap.computed[&sc]["dbl"][&new_row],
+            CellResult::Value(json!(0))
+        );
+
+        // 保存して開き直しても、式は残り、値は計算し直される
+        s.save(Some(path), "計算列").unwrap();
+        let mut s2 = Session::new();
+        let snap = s2.open(path).unwrap();
+        let col = snap.file.sheets[0].schemas[0]
+            .columns
+            .iter()
+            .find(|c| c.id == "dbl")
+            .unwrap();
+        assert_eq!(col.computed.as_ref().unwrap().source, src);
+        assert_eq!(
+            snap.computed[&sc]["dbl"][&row],
+            CellResult::Value(json!(40))
+        );
+
+        // 式を直すと履歴の差分に出て、値は新しい式で計算される
+        let new_src = "export default (row: any) => row.数量 * 100";
+        let snap = s
+            .update_column(
+                &sh,
+                &sc,
+                Column::new("dbl", "十倍", DataType::Int).computed(new_src),
+            )
+            .unwrap();
+        assert_eq!(
+            snap.computed[&sc]["dbl"][&row],
+            CellResult::Value(json!(400))
+        );
+        s.save(None, "式を変更").unwrap();
+        let log = s.history_log().unwrap();
+        let d = s.history_diff(&log[1].id, &log[0].id).unwrap();
+        assert!(
+            d.iter()
+                .any(|c| matches!(c, Change::ColumnChanged { column, .. } if column == "dbl")),
+            "{d:?}"
+        );
+
+        // 通常の列を計算列に変えると、保存していた値は消える
+        let snap = s
+            .update_column(
+                &sh,
+                &sc,
+                Column::new(col_id(&snap), "数量", DataType::Int)
+                    .computed("export default () => 7"),
+            )
+            .unwrap();
+        assert!(!snap.file.sheets[0].schemas[0].rows[0]
+            .cells
+            .contains_key(&col_id(&snap)));
+        assert_eq!(
+            snap.computed[&sc][&col_id(&snap)][&row],
+            CellResult::Value(json!(7))
+        );
+    }
+
+    /// 最初の列（new_file の「列1」）の ID
+    fn col_id(snap: &Snapshot) -> String {
+        snap.file.sheets[0].schemas[0].columns[0].id.clone()
     }
 
     #[test]

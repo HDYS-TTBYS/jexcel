@@ -56,6 +56,10 @@ fn macro_path(id: &str) -> String {
     format!("macros/{id}.ts")
 }
 
+fn computed_path(sheet_id: &str, schema_id: &str, column_id: &str) -> String {
+    format!("sheets/{sheet_id}/computed/{schema_id}.{column_id}.ts")
+}
+
 fn rows_path(sheet_id: &str, schema_id: &str) -> String {
     format!("sheets/{sheet_id}/{schema_id}.rows.jsonl")
 }
@@ -94,10 +98,28 @@ impl JxcelFile {
             let mut schemas = vec![];
             for s in &sheet.schemas {
                 check_id(&s.id)?;
+                // 計算式は列定義から切り出して `.ts` ファイルにする（差分でコードとして読める）。
+                // 計算列の値は保存しない。
+                let mut columns = s.columns.clone();
+                for c in &mut columns {
+                    if let Some(comp) = &mut c.computed {
+                        check_id(&c.id)?;
+                        tree.insert(
+                            computed_path(&sheet.id, &s.id, &c.id),
+                            std::mem::take(&mut comp.source).into_bytes(),
+                        );
+                    }
+                }
+                let computed_ids: Vec<&str> = s
+                    .columns
+                    .iter()
+                    .filter(|c| c.computed.is_some())
+                    .map(|c| c.id.as_str())
+                    .collect();
                 schemas.push(SchemaFile {
                     id: s.id.clone(),
                     name: s.name.clone(),
-                    columns: s.columns.clone(),
+                    columns,
                     row_order: s.rows.iter().map(|r| r.id.clone()).collect(),
                 });
                 // 行本体は ID 順。並べ替えは row_order だけが変わる。
@@ -105,7 +127,13 @@ impl JxcelFile {
                 rows.sort_by(|a, b| a.id.cmp(&b.id));
                 let mut buf = vec![];
                 for r in rows {
-                    serde_json::to_writer(&mut buf, r).expect("serialize");
+                    if computed_ids.iter().any(|id| r.cells.contains_key(*id)) {
+                        let mut r = r.clone();
+                        r.cells.retain(|k, _| !computed_ids.contains(&k.as_str()));
+                        serde_json::to_writer(&mut buf, &r).expect("serialize");
+                    } else {
+                        serde_json::to_writer(&mut buf, r).expect("serialize");
+                    }
                     buf.push(b'\n');
                 }
                 tree.insert(rows_path(&sheet.id, &s.id), buf);
@@ -174,10 +202,19 @@ impl JxcelFile {
                 if let Some(extra) = by_id.keys().next() {
                     return Err(Error::Invalid(format!("{rp}: rowOrder にない行 {extra}")));
                 }
+                let mut columns = sc.columns;
+                for c in &mut columns {
+                    if let Some(comp) = &mut c.computed {
+                        check_id(&c.id)?;
+                        let cp = computed_path(sid, &sc.id, &c.id);
+                        comp.source = String::from_utf8(get(&cp)?.clone())
+                            .map_err(|_| Error::Invalid(format!("{cp}: UTF-8 ではありません")))?;
+                    }
+                }
                 schemas.push(DataSchema {
                     id: sc.id,
                     name: sc.name,
-                    columns: sc.columns,
+                    columns,
                     rows,
                 });
             }
@@ -329,6 +366,66 @@ pub(crate) mod tests {
         let (a, b) = (f.to_tree().unwrap(), g.to_tree().unwrap());
         let changed: Vec<_> = a.keys().filter(|k| a[*k] != b[*k]).collect();
         assert_eq!(changed, vec!["macros/m1.ts"]);
+    }
+
+    #[test]
+    fn computed_columns_store_formula_as_ts_and_no_values() {
+        let mut f = sample();
+        let src = "export default (row: JxcelRow) => row.数量 * 2;\n";
+        let schema = &mut f.sheets[0].schemas[0];
+        schema
+            .columns
+            .push(Column::new("dbl", "倍", DataType::Int).computed(src));
+        // 古いデータに計算列の値が残っていても、保存はしない
+        schema.rows[0].cells.insert("dbl".into(), json!(999));
+        let tree = f.to_tree().unwrap();
+
+        assert_eq!(tree["sheets/sh1/computed/s1.dbl.ts"], src.as_bytes());
+        let sheet = String::from_utf8_lossy(&tree["sheets/sh1/sheet.json"]).into_owned();
+        assert!(sheet.contains("\"computed\": {}"), "{sheet}"); // 印だけ。式は .ts に分けてある
+        assert!(!sheet.contains("row.数量"));
+        let rows = String::from_utf8_lossy(&tree["sheets/sh1/s1.rows.jsonl"]).into_owned();
+        assert!(!rows.contains("999") && !rows.contains("dbl"), "{rows}");
+
+        // 読み戻すと式が復元され、値は持たない
+        let back = JxcelFile::from_tree(&tree).unwrap();
+        let col = back.sheets[0].schemas[0].columns.last().unwrap();
+        assert_eq!(col.computed.as_ref().unwrap().source, src);
+        assert!(!back.sheets[0].schemas[0].rows[0].cells.contains_key("dbl"));
+
+        // 式の編集は、その式のファイルだけを変える
+        let mut g = back.clone();
+        g.sheets[0].schemas[0]
+            .columns
+            .last_mut()
+            .unwrap()
+            .computed
+            .as_mut()
+            .unwrap()
+            .source
+            .push_str("// x\n");
+        let (a, b) = (back.to_tree().unwrap(), g.to_tree().unwrap());
+        let changed: Vec<_> = a.keys().filter(|k| a[*k] != b[*k]).collect();
+        assert_eq!(changed, vec!["sheets/sh1/computed/s1.dbl.ts"]);
+
+        // 式のファイルが無ければ不正
+        let mut t = tree.clone();
+        t.remove("sheets/sh1/computed/s1.dbl.ts");
+        assert!(matches!(JxcelFile::from_tree(&t), Err(Error::NotFound(_))));
+    }
+
+    #[test]
+    fn computed_columns_are_skipped_by_validation() {
+        use crate::types::TypeRegistry;
+        let mut f = sample();
+        let schema = &mut f.sheets[0].schemas[0];
+        // 必須の計算列があっても、値を持たない行を不正としない
+        schema.columns.push(
+            Column::new("dbl", "倍", DataType::Int)
+                .required()
+                .computed("x"),
+        );
+        assert!(schema.validate(&TypeRegistry::default()).is_empty());
     }
 
     #[test]

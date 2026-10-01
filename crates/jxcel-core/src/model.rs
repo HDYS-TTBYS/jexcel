@@ -57,6 +57,17 @@ pub struct Column {
     pub ty: DataType,
     #[serde(default, skip_serializing_if = "is_false")]
     pub required: bool,
+    /// 計算列。値は保存せず、読み込み時に式から計算する（元データと式だけが真実）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub computed: Option<Computed>,
+}
+
+/// 計算列の式。`export default function (row, jx) { return ... }` の形の TypeScript。
+/// 永続化では `computed/<スキーマ>.<列>.ts` に分け、列定義の JSON には印だけを残す。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Computed {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source: String,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -77,7 +88,16 @@ impl Column {
             name: name.into(),
             ty,
             required: false,
+            computed: None,
         }
+    }
+
+    /// 計算列にする。
+    pub fn computed(mut self, source: impl Into<String>) -> Self {
+        self.computed = Some(Computed {
+            source: source.into(),
+        });
+        self
     }
 
     pub fn required(mut self) -> Self {
@@ -134,6 +154,10 @@ impl DataSchema {
                 }
             }
             for col in &self.columns {
+                // 計算列は値を保存しないので、検証の対象外（結果の型は計算時に検査する）
+                if col.computed.is_some() {
+                    continue;
+                }
                 let v = row.cells.get(&col.id).unwrap_or(&Value::Null);
                 if let Err(message) = col.validate(v, reg) {
                     out.push(Violation {

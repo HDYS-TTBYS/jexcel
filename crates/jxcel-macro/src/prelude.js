@@ -18,8 +18,11 @@
       return x;
     };
 
-    function schemaApi(sheet, schema) {
+    function schemaApi(sheet, schema, readOnly) {
       const column = (name) => find(schema.columns, name, "列");
+      const noWrite = () => {
+        throw new Error("計算式の中ではデータを書き換えられません");
+      };
       const toRow = (r) => {
         const o = { _id: r.id };
         for (const c of schema.columns) o[c.name] = r.cells[c.id] === undefined ? null : r.cells[c.id];
@@ -30,8 +33,11 @@
         const cells = {};
         for (const k of Object.keys(values)) {
           if (k === "_id") continue;
+          const c = column(k);
+          // 計算列は式から決まる値なので、書き込めない
+          if (c.computed) throw new Error("計算列「" + k + "」には書き込めません");
           const v = values[k];
-          cells[column(k).id] = v === undefined ? null : v;
+          cells[c.id] = v === undefined ? null : v;
         }
         return cells;
       };
@@ -42,7 +48,7 @@
       };
       return {
         name: schema.name,
-        columns: schema.columns.map((c) => ({ name: c.name, type: c.type.kind, required: !!c.required })),
+        columns: schema.columns.map((c) => ({ name: c.name, type: c.type.kind, required: !!c.required, computed: !!c.computed })),
         rows() {
           return schema.rows.map(toRow);
         },
@@ -50,6 +56,7 @@
           return toRow(row(id));
         },
         add(values) {
+          if (readOnly) noWrite();
           const cells = toCells(values || {});
           const id = __newId();
           schema.rows.push({ id, cells: Object.assign({}, cells) });
@@ -57,12 +64,14 @@
           return id;
         },
         update(id, values) {
+          if (readOnly) noWrite();
           const cells = toCells(values || {});
           const r = row(id);
           Object.assign(r.cells, cells);
           ops.push({ op: "update", sheet: sheet.id, schema: schema.id, row: id, cells });
         },
         remove(id) {
+          if (readOnly) noWrite();
           row(id);
           schema.rows = schema.rows.filter((x) => x.id !== id);
           ops.push({ op: "remove", sheet: sheet.id, schema: schema.id, row: id });
@@ -70,22 +79,62 @@
       };
     }
 
-    const jx = {
+    const makeJx = (readOnly) => ({
       log,
       sheet(name) {
         const sheet = find(data.sheets, name, "シート");
         return {
           name: sheet.name,
           schema(schemaName) {
-            return schemaApi(sheet, find(sheet.schemas, schemaName, "スキーマ"));
+            return schemaApi(sheet, find(sheet.schemas, schemaName, "スキーマ"), readOnly);
           },
         };
       },
-    };
+    });
+    const jx = makeJx(false);
+
+    // 計算列を、表ごと・列ごとに列の並び順で評価する。結果は台帳（data）にも書き込むので、
+    // 後ろの計算列や、同じ実行内のマクロ・他の表の計算式からも値が読める。
+    // 失敗は行（セル）ごとに記録し、他のセルは計算を続ける。
+    let computed = [];
+    function computeAll(specs) {
+      const ro = makeJx(true);
+      const out = [];
+      specs.forEach((spec, i) => {
+        const sheet = data.sheets.find((s) => s.id === spec.sheet);
+        const schema = sheet.schemas.find((s) => s.id === spec.schema);
+        const col = schema.columns.find((c) => c.id === spec.column);
+        const fn = globalThis.__fns && globalThis.__fns[i];
+        // get(id) は行を探すので使わず、行オブジェクトを直接作る（全行で O(n²) になるのを避ける）
+        const toRow = (r) => {
+          const o = { _id: r.id };
+          for (const c of schema.columns) o[c.name] = r.cells[c.id] === undefined ? null : r.cells[c.id];
+          return o;
+        };
+        for (const r of schema.rows) {
+          let res;
+          if (spec.error || typeof fn !== "function") {
+            res = { e: spec.error || "式が関数ではありません" };
+          } else {
+            try {
+              const v = fn(toRow(r), ro);
+              res = { v: v === undefined ? null : v };
+            } catch (e) {
+              res = { e: String((e && e.message) || e) };
+            }
+          }
+          if (res.v === undefined || res.v === null) delete r.cells[col.id];
+          else r.cells[col.id] = res.v;
+          out.push(Object.assign({ schema: schema.id, column: col.id, row: r.id }, res));
+        }
+      });
+      computed = out;
+    }
 
     return {
       jx,
-      finish: (result) => JSON.stringify({ ops, logs, result: result === undefined ? null : result }),
+      computeAll,
+      finish: (result) => JSON.stringify({ ops, logs, computed, result: result === undefined ? null : result }),
     };
   };
 })();
