@@ -54,10 +54,51 @@ export interface Macro {
   source: string;
 }
 
+export type TemplateKind = "xlsx" | "docx";
+
+/** 書き出し（テンプレートへの差し込み）の設定。テンプレート本体はバックエンドが持つ。 */
+export interface Export {
+  id: string;
+  name: string;
+  kind: TemplateKind;
+  /** 取り込んだテンプレートの元のファイル名 */
+  templateName: string;
+  /** 対象の表（シート ID・スキーマ ID） */
+  sheet: string;
+  schema: string;
+  /** 出力ファイル名（`{{ 式 }}` が使える） */
+  filename: string;
+  /** 空でなければ、この式が真になる行だけを書き出す */
+  filter?: string;
+}
+
 export interface JxcelFile {
   name: string;
   sheets: Sheet[];
   macros: Macro[];
+  exports: Export[];
+}
+
+export interface ExportPreviewRow {
+  rowNo: number;
+  /** 絞り込み条件で除外される行か */
+  excluded: boolean;
+  filename: CellResult;
+  /** `placeholders` と同じ順の、欄ごとの値かエラー */
+  values: CellResult[];
+}
+
+export interface ExportPreview {
+  placeholders: string[];
+  totalRows: number;
+  rows: ExportPreviewRow[];
+}
+
+export interface ExportResult {
+  outDir: string;
+  written: { rowNo: number; filename: string }[];
+  skipped: number;
+  errors: { rowNo: number; message: string }[];
 }
 
 /** 同梱のサンプルマクロ（実体は crates/jxcel-macro/samples/*.ts） */
@@ -108,6 +149,11 @@ export type Change =
   | { kind: "macroRemoved"; id: string; name: string }
   | { kind: "macroRenamed"; id: string; old: string; new: string }
   | { kind: "macroEdited"; id: string; name: string }
+  | { kind: "exportAdded"; id: string; name: string }
+  | { kind: "exportRemoved"; id: string; name: string }
+  | { kind: "exportRenamed"; id: string; old: string; new: string }
+  | { kind: "exportChanged"; id: string; name: string }
+  | { kind: "templateReplaced"; id: string; name: string }
   | { kind: "rowsReordered"; sheet: string; schema: string };
 
 export const SCALAR_KINDS = ["string", "int", "float", "decimal", "bool", "date", "dateTime", "enum", "any"] as const;

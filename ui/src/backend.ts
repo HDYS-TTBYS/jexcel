@@ -1,9 +1,13 @@
-import type { Change, Column, CommitInfo, MacroSample, RunOutput, Snapshot } from "./types";
+import type { Change, Column, CommitInfo, ExportPreview, ExportResult, MacroSample, RunOutput, Snapshot } from "./types";
 
 /** UI が必要とする操作。Tauri 実装とブラウザ単体用のモック実装がある。 */
 export interface Backend {
   pickOpenPath(): Promise<string | null>;
   pickSavePath(defaultName: string): Promise<string | null>;
+  /** 書き出しのテンプレート（xlsx / docx）を選ぶ */
+  pickTemplatePath(): Promise<string | null>;
+  /** 書き出し先のフォルダを選ぶ */
+  pickFolder(): Promise<string | null>;
 
   newFile(name: string): Promise<Snapshot>;
   openFile(path: string): Promise<Snapshot>;
@@ -28,6 +32,16 @@ export interface Backend {
   /** `source` を渡すと保存前のエディタの内容で実行する。失敗したときは何も変更しない。 */
   runMacro(id: string, source: string | null): Promise<RunOutput>;
 
+  /** テンプレートを取り込んで書き出しを追加する（対象は先頭の表） */
+  addExport(templatePath: string, name?: string): Promise<Snapshot>;
+  updateExport(id: string, name: string, sheet: string, schema: string, filename: string, filter: string | null): Promise<Snapshot>;
+  replaceExportTemplate(id: string, templatePath: string): Promise<Snapshot>;
+  deleteExport(id: string): Promise<Snapshot>;
+  /** 書き出す前の確認。テンプレートの欄と、先頭 limit 行の値・出力ファイル名 */
+  exportPreview(id: string, limit: number): Promise<ExportPreview>;
+  /** 全行を書き出す。既存のファイルは上書きしない */
+  runExport(id: string, outDir: string): Promise<ExportResult>;
+
   historyLog(): Promise<CommitInfo[]>;
   historyDiff(from: string, to: string): Promise<Change[]>;
   restore(rev: string): Promise<Snapshot>;
@@ -39,6 +53,7 @@ export interface Backend {
 }
 
 export const FILE_FILTER = { name: "jxcel", extensions: ["jxcel"] };
+export const TEMPLATE_FILTER = { name: "Word / Excel", extensions: ["xlsx", "docx"] };
 
 export async function createBackend(): Promise<Backend> {
   if ("__TAURI_INTERNALS__" in window) {

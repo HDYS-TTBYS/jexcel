@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io::{Cursor, Read, Write};
 
-use crate::model::{Column, DataSchema, JxcelFile, Macro, Row, Sheet};
+use crate::model::{Column, DataSchema, Export, JxcelFile, Macro, Row, Sheet};
 use crate::{Error, Result, FORMAT_VERSION};
 
 pub type FileTree = BTreeMap<String, Vec<u8>>;
@@ -24,6 +24,9 @@ struct Manifest {
     /// マクロの一覧（順序つき）。本体は `macros/<id>.ts`。旧形式のファイルには無い。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     macros: Vec<MacroMeta>,
+    /// 書き出しの設定（順序つき）。テンプレート本体は `exports/<id>.<拡張子>`。旧形式のファイルには無い。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    exports: Vec<Export>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -54,6 +57,10 @@ fn sheet_path(sheet_id: &str) -> String {
 
 fn macro_path(id: &str) -> String {
     format!("macros/{id}.ts")
+}
+
+fn export_path(e: &Export) -> String {
+    format!("exports/{}.{}", e.id, e.kind.extension())
 }
 
 fn computed_path(sheet_id: &str, schema_id: &str, column_id: &str) -> String {
@@ -152,6 +159,14 @@ impl JxcelFile {
             check_id(&m.id)?;
             tree.insert(macro_path(&m.id), m.source.clone().into_bytes());
         }
+        // テンプレート本体はそのままのバイト列で保存する（書き出し設定に対応するものだけ）
+        for e in &self.exports {
+            check_id(&e.id)?;
+            let bytes = self.templates.get(&e.id).ok_or_else(|| {
+                Error::Invalid(format!("書き出し「{}」のテンプレートがありません", e.name))
+            })?;
+            tree.insert(export_path(e), bytes.clone());
+        }
         tree.insert(
             MANIFEST.into(),
             to_json(&Manifest {
@@ -166,6 +181,7 @@ impl JxcelFile {
                         name: m.name.clone(),
                     })
                     .collect(),
+                exports: self.exports.clone(),
             }),
         );
         Ok(tree)
@@ -236,10 +252,17 @@ impl JxcelFile {
                 source,
             });
         }
+        let mut templates = std::collections::BTreeMap::new();
+        for e in &manifest.exports {
+            check_id(&e.id)?;
+            templates.insert(e.id.clone(), get(&export_path(e))?.clone());
+        }
         Ok(JxcelFile {
             name: manifest.name,
             sheets,
             macros,
+            exports: manifest.exports,
+            templates,
         })
     }
 
@@ -319,6 +342,8 @@ pub(crate) mod tests {
                 schemas: vec![schema],
             }],
             macros: Default::default(),
+            exports: Default::default(),
+            templates: Default::default(),
         }
     }
 
@@ -426,6 +451,75 @@ pub(crate) mod tests {
                 .computed("x"),
         );
         assert!(schema.validate(&TypeRegistry::default()).is_empty());
+    }
+
+    fn with_export(mut f: JxcelFile, bytes: &[u8]) -> JxcelFile {
+        f.exports.push(Export {
+            id: "ex1".into(),
+            name: "請求書".into(),
+            kind: crate::TemplateKind::Docx,
+            template_name: "請求書.docx".into(),
+            sheet: "sh1".into(),
+            schema: "s1".into(),
+            filename: "{{品名}}".into(),
+            filter: Some("数量 > 0".into()),
+        });
+        f.templates.insert("ex1".into(), bytes.to_vec());
+        f
+    }
+
+    #[test]
+    fn exports_store_the_template_as_is_and_roundtrip() {
+        // 実際の docx のバイト列（NUL や 0xFF を含む。UTF-8 として不正でも壊れない）
+        let bytes: Vec<u8> = (0..=255u8).chain([0, 0xFF, 0xFE]).collect();
+        let f = with_export(sample(), &bytes);
+        let tree = f.to_tree().unwrap();
+        assert_eq!(tree["exports/ex1.docx"], bytes);
+        let manifest = String::from_utf8_lossy(&tree["manifest.json"]).into_owned();
+        assert!(
+            manifest.contains("\"exports\"")
+                && manifest.contains("templateName")
+                && manifest.contains("請求書"),
+            "{manifest}"
+        );
+        // 往復しても、設定とテンプレートのバイト列が同じ
+        assert_eq!(JxcelFile::from_tree(&tree).unwrap(), f);
+        assert_eq!(JxcelFile::from_zip(&f.to_zip().unwrap()).unwrap(), f);
+
+        // テンプレートの差し替えは、そのファイルだけを変える
+        let g = with_export(sample(), b"another template");
+        let (a, b) = (f.to_tree().unwrap(), g.to_tree().unwrap());
+        let changed: Vec<_> = a.keys().filter(|k| a[*k] != b[*k]).collect();
+        assert_eq!(changed, vec!["exports/ex1.docx"]);
+    }
+
+    #[test]
+    fn export_templates_are_never_sent_to_the_ui() {
+        // UI に返す JSON（serde）にはテンプレートのバイト列を含めない（設定だけ）
+        let f = with_export(sample(), &[1, 2, 3]);
+        let json = serde_json::to_value(&f).unwrap();
+        assert!(json.get("templates").is_none());
+        assert_eq!(json["exports"][0]["templateName"], "請求書.docx");
+        assert_eq!(json["exports"][0]["kind"], "docx");
+        // 設定はそのまま読み戻せる（テンプレートは別に保存されているので、ここでは空）
+        let back: JxcelFile = serde_json::from_value(json).unwrap();
+        assert_eq!(back.exports, f.exports);
+        assert!(back.templates.is_empty());
+    }
+
+    #[test]
+    fn export_without_its_template_is_rejected_and_old_files_still_open() {
+        let mut f = with_export(sample(), b"x");
+        f.templates.clear();
+        assert!(
+            matches!(f.to_tree(), Err(Error::Invalid(m)) if m.contains("テンプレートがありません"))
+        );
+        let mut t = with_export(sample(), b"x").to_tree().unwrap();
+        t.remove("exports/ex1.docx");
+        assert!(matches!(JxcelFile::from_tree(&t), Err(Error::NotFound(_))));
+        // 書き出しのないファイルの manifest には exports キーを出さない（既存ファイルの差分を増やさない）
+        let out = sample().to_tree().unwrap();
+        assert!(!String::from_utf8_lossy(&out[MANIFEST]).contains("exports"));
     }
 
     #[test]

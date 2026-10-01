@@ -12,6 +12,57 @@ pub struct JxcelFile {
     /// ファイルに保存される TS マクロ。旧形式のファイルには無いので省略可。
     #[serde(default)]
     pub macros: Vec<Macro>,
+    /// 書き出し（テンプレートへの差し込み）の設定。
+    #[serde(default)]
+    pub exports: Vec<Export>,
+    /// 書き出しのテンプレート本体（xlsx / docx のバイト列。キーは `Export::id`）。
+    /// 大きいので UI へ返す JSON には含めない。永続化では `exports/<id>.<拡張子>` として別に保存する。
+    #[serde(skip)]
+    pub templates: BTreeMap<String, Vec<u8>>,
+}
+
+/// テンプレートの種類。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TemplateKind {
+    Xlsx,
+    Docx,
+}
+
+impl TemplateKind {
+    pub fn from_extension(ext: &str) -> Option<Self> {
+        match ext.trim_start_matches('.').to_ascii_lowercase().as_str() {
+            "xlsx" => Some(Self::Xlsx),
+            "docx" => Some(Self::Docx),
+            _ => None,
+        }
+    }
+
+    pub fn extension(self) -> &'static str {
+        match self {
+            Self::Xlsx => "xlsx",
+            Self::Docx => "docx",
+        }
+    }
+}
+
+/// 書き出しの設定: 表の各行をテンプレートに差し込み、行ごとに 1 ファイルを作る。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Export {
+    pub id: String,
+    pub name: String,
+    pub kind: TemplateKind,
+    /// 取り込んだテンプレートの元のファイル名（表示用）
+    pub template_name: String,
+    /// 対象の表（シート ID・スキーマ ID）
+    pub sheet: String,
+    pub schema: String,
+    /// 出力ファイル名（`{{ 式 }}` が使える。拡張子は付けなくてよい）
+    pub filename: String,
+    /// 空でなければ、この式が真になる行だけを書き出す
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<String>,
 }
 
 /// TypeScript で書いたマクロ。`source` はユーザーが書いたままの TS（実行時に JS へ変換する）。

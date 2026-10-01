@@ -120,6 +120,8 @@ mod tests {
                 schemas: vec![data, summary],
             }],
             macros: vec![],
+            exports: Default::default(),
+            templates: Default::default(),
         }
     }
 

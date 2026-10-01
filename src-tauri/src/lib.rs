@@ -1,6 +1,6 @@
 //! Tauri のコマンド層。ロジックはすべて `jxcel-app` の `Session` にあり、ここは薄い橋渡しだけ。
 
-use jxcel_app::{RunOutput, Session, Snapshot};
+use jxcel_app::{ExportPreview, ExportResult, RunOutput, Session, Snapshot};
 use jxcel_core::diff::Change;
 use jxcel_core::Column;
 use jxcel_git::CommitInfo;
@@ -120,6 +120,47 @@ fn run_macro(app: App, id: String, source: Option<String>) -> Reply<RunOutput> {
 }
 
 #[tauri::command(async)]
+fn add_export(app: App, template_path: String, name: Option<String>) -> Reply<Snapshot> {
+    with(&app, |s| s.add_export(&template_path, name.as_deref()))
+}
+
+#[tauri::command(async)]
+fn update_export(
+    app: App,
+    id: String,
+    name: String,
+    sheet: String,
+    schema: String,
+    filename: String,
+    filter: Option<String>,
+) -> Reply<Snapshot> {
+    with(&app, |s| {
+        s.update_export(&id, &name, &sheet, &schema, &filename, filter.as_deref())
+    })
+}
+
+#[tauri::command(async)]
+fn replace_export_template(app: App, id: String, template_path: String) -> Reply<Snapshot> {
+    with(&app, |s| s.replace_export_template(&id, &template_path))
+}
+
+#[tauri::command(async)]
+fn delete_export(app: App, id: String) -> Reply<Snapshot> {
+    with(&app, |s| s.delete_export(&id))
+}
+
+#[tauri::command(async)]
+fn export_preview(app: App, id: String, limit: usize) -> Reply<ExportPreview> {
+    with(&app, |s| s.export_preview(&id, limit))
+}
+
+// 全行を評価してファイルを書くので、時間がかかりうる。async(スレッドプール)で実行する。
+#[tauri::command(async)]
+fn run_export(app: App, id: String, out_dir: String) -> Reply<ExportResult> {
+    with(&app, |s| s.run_export(&id, &out_dir))
+}
+
+#[tauri::command(async)]
 fn history_log(app: App) -> Reply<Vec<CommitInfo>> {
     with(&app, |s| s.history_log())
 }
@@ -157,6 +198,12 @@ pub fn run() {
             update_macro,
             delete_macro,
             run_macro,
+            add_export,
+            update_export,
+            replace_export_template,
+            delete_export,
+            export_preview,
+            run_export,
             history_log,
             history_diff,
             restore,

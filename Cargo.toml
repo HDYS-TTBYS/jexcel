@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/jxcel-core", "crates/jxcel-git", "crates/jxcel-app", "crates/jxcel-macro"]
+members = ["crates/jxcel-core", "crates/jxcel-git", "crates/jxcel-app", "crates/jxcel-macro", "crates/jxcel-export"]
 # src-tauri は WebKit 等のシステム依存が必要なため、独立したルートとして扱う
 exclude = ["src-tauri"]
 

@@ -96,6 +96,45 @@
     // 計算列を、表ごと・列ごとに列の並び順で評価する。結果は台帳（data）にも書き込むので、
     // 後ろの計算列や、同じ実行内のマクロ・他の表の計算式からも値が読める。
     // 失敗は行（セル）ごとに記録し、他のセルは計算を続ける。
+    // 行オブジェクト（列名 → 値。_id は行 ID、計算列の値も入る）
+    const rowObject = (schema, r) => {
+      const o = { _id: r.id };
+      for (const c of schema.columns) o[c.name] = r.cells[c.id] === undefined ? null : r.cells[c.id];
+      return o;
+    };
+
+    // テンプレートの差し込み欄 `{{ 式 }}` を、表の全行について評価する。
+    // 式は列名をそのまま変数として使える（with(row)）。row・jx（読み取り専用）・std も使える。
+    // _no は 1 から始まる行番号。失敗は行・式ごとに隔離する。
+    let exprsOut = [];
+    function evalExprs(spec) {
+      const sheet = data.sheets.find((s) => s.id === spec.sheet);
+      const schema = sheet && sheet.schemas.find((s) => s.id === spec.schemaId);
+      if (!schema) throw new Error("書き出し対象の表が見つかりません");
+      const ro = makeJx(true);
+      const fns = spec.exprs.map((src) => {
+        try {
+          // 間接 eval なので、モジュールの厳格モードではなく通常のスクリプトとして評価される（with が使える）
+          return { f: (0, eval)("(function (row, jx, std) { with (row) { return (" + src + "\n); } })") };
+        } catch (e) {
+          return { e: String((e && e.message) || e) };
+        }
+      });
+      exprsOut = schema.rows.map((r, i) => {
+        const row = rowObject(schema, r);
+        row._no = i + 1;
+        return fns.map((fn) => {
+          if (fn.e) return { e: fn.e };
+          try {
+            const v = fn.f(row, ro, globalThis.std);
+            return { v: v === undefined ? null : v };
+          } catch (e) {
+            return { e: String((e && e.message) || e) };
+          }
+        });
+      });
+    }
+
     let computed = [];
     function computeAll(specs) {
       const ro = makeJx(true);
@@ -134,7 +173,8 @@
     return {
       jx,
       computeAll,
-      finish: (result) => JSON.stringify({ ops, logs, computed, result: result === undefined ? null : result }),
+      evalExprs,
+      finish: (result) => JSON.stringify({ ops, logs, computed, exprs: exprsOut, result: result === undefined ? null : result }),
     };
   };
 })();

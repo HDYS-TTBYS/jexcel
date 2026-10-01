@@ -70,3 +70,23 @@ input, select { font: inherit; padding: 4px 6px; border: 1px solid var(--bd); bo
 .add-menu .menu-title { padding: 6px 8px 2px; font-size: 12px; color: #6b7280; border-top: 1px solid var(--bd); margin-top: 4px; }
 .add-menu .muted { white-space: normal; }
 .pad-s { padding: 4px 8px; margin: 0; }
+.exports { width: 46%; min-width: 440px; border-left: 1px solid var(--bd); display: flex; flex-direction: column; background: #fff; }
+.export-body { padding: 8px 12px; overflow: auto; flex: 1; }
+.export-body h4 { margin: 14px 0 6px; display: flex; align-items: center; gap: 8px; }
+.export-body code { background: var(--bg2); padding: 0 4px; border-radius: 4px; font-size: 12px; }
+.export-form { display: flex; flex-direction: column; gap: 8px; }
+.export-form label { display: flex; flex-direction: column; gap: 3px; font-weight: 600; }
+.export-form label > .muted { font-weight: 400; }
+.template-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.actions.left { justify-content: flex-start; align-items: center; }
+.preview-scroll { overflow: auto; max-height: 260px; border: 1px solid var(--bd); border-radius: 6px; }
+.preview { border-collapse: collapse; font-size: 12px; width: 100%; }
+.preview th, .preview td { border-bottom: 1px solid var(--bd); padding: 3px 8px; text-align: left; white-space: nowrap; }
+.preview th { background: var(--bg2); position: sticky; top: 0; font-weight: 600; }
+.preview tr.excluded td { color: #9ca3af; text-decoration: line-through; }
+.preview td.cell-error { background: #fef2f2; color: var(--err); font-weight: 600; }
+.export-run { margin-top: 12px; }
+.export-run button { white-space: nowrap; flex: none; }
+.export-result { margin-top: 12px; padding: 8px 12px; background: var(--bg2); border-radius: 8px; font-size: 13px; }
+.export-result ul { margin: 4px 0; padding-left: 18px; }
+.export-result p { margin: 2px 0; }

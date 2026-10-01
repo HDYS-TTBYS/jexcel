@@ -13,6 +13,7 @@ import {
   type Column,
   type CommitInfo,
   type ComputedValues,
+  type ExportPreview,
   type DataSchema,
   type DataType,
   type JxcelFile,
@@ -105,6 +106,16 @@ function diff(a: JxcelFile, b: JxcelFile): Change[] {
     }
   }
   for (const m of a.macros) if (!b.macros.some((x) => x.id === m.id)) out.push({ kind: "macroRemoved", id: m.id, name: m.name });
+  for (const e of b.exports) {
+    const old = a.exports.find((x) => x.id === e.id);
+    if (!old) out.push({ kind: "exportAdded", id: e.id, name: e.name });
+    else {
+      if (old.name !== e.name) out.push({ kind: "exportRenamed", id: e.id, old: old.name, new: e.name });
+      if (old.sheet !== e.sheet || old.schema !== e.schema || old.filename !== e.filename || (old.filter ?? "") !== (e.filter ?? ""))
+        out.push({ kind: "exportChanged", id: e.id, name: e.name });
+    }
+  }
+  for (const e of a.exports) if (!b.exports.some((x) => x.id === e.id)) out.push({ kind: "exportRemoved", id: e.id, name: e.name });
   return out;
 }
 
@@ -203,6 +214,17 @@ function mockSamples(): MacroSample[] {
   });
 }
 
+const PLACEHOLDER_RE = /\{\{(.+?)\}\}/g;
+const placeholdersOf = (text: string) => [...text.matchAll(PLACEHOLDER_RE)].map((m) => m[1].trim()).filter(Boolean);
+
+/** 差し込み欄の式を全行で評価する（Rust 側と同じ prelude.js の evalExprs）。 */
+function evalExprsInBrowser(file: JxcelFile, sheet: string, schemaId: string, exprs: string[]): { v?: unknown; e?: string }[][] {
+  const fake = loadRuntime();
+  const state = (fake.__makeState as (d: JxcelFile) => { evalExprs: (s: unknown) => void; finish: (r: unknown) => string })(structuredClone(file));
+  state.evalExprs({ sheet, schemaId, exprs });
+  return JSON.parse(state.finish(null)).exprs;
+}
+
 export function createMockBackend(): Backend {
   let file: JxcelFile | null = null;
   let path: string | null = null;
@@ -211,6 +233,8 @@ export function createMockBackend(): Backend {
   // ブラウザ内の「ディスク」。パス → { file, commits }
   const disk = new Map<string, { file: JxcelFile; commits: typeof commits }>();
 
+  // ブラウザ単体にはテンプレートの中身を読む手段がないので、差し込み欄は「対象の表の全列」として見せる
+  const mockPlaceholders = new Map<string, string[]>();
   const clone = <T,>(x: T): T => structuredClone(x);
   const snap = (): Snapshot => {
     if (!file) throw "ファイルが開かれていません";
@@ -236,6 +260,8 @@ export function createMockBackend(): Backend {
       return first ?? null;
     },
     pickSavePath: async (name) => `/mock/${name}`,
+    pickTemplatePath: async () => "/mock/請求書.docx",
+    pickFolder: async () => "/mock/out",
 
     newFile: async (name) => {
       const col: Column = { id: newId(), name: "列1", type: defaultType("string") };
@@ -245,6 +271,7 @@ export function createMockBackend(): Backend {
           { id: newId(), name: "シート1", schemas: [{ id: newId(), name: "データ", columns: [col], rows: [{ id: newId(), cells: {} }] }] },
         ],
         macros: [],
+        exports: [],
       };
       path = null;
       dirty = false;
@@ -389,6 +416,82 @@ export function createMockBackend(): Backend {
         dirty = true;
       }
       return { snapshot: snap(), logs: out.logs, result: out.result ?? null, ops: out.ops.length };
+    },
+
+    addExport: async (templatePath, name) => {
+      const kind = /\.xlsx$/i.test(templatePath) ? "xlsx" : /\.docx$/i.test(templatePath) ? "docx" : null;
+      if (!kind) throw "テンプレートは .xlsx か .docx のファイルを選んでください";
+      return edit((f) => {
+        const sheet = f.sheets[0];
+        const schema = sheet?.schemas[0];
+        if (!schema) throw "書き出しの対象にする表（スキーマ）がありません";
+        const id = newId();
+        const fileName = templatePath.split("/").pop()!;
+        f.exports.push({
+          id,
+          name: name ?? fileName.replace(/\.[^.]+$/, ""),
+          kind,
+          templateName: fileName,
+          sheet: sheet.id,
+          schema: schema.id,
+          filename: schema.columns[0] ? `{{${schema.columns[0].name}}}` : "{{_no}}",
+        });
+        mockPlaceholders.set(id, schema.columns.map((c) => c.name));
+      });
+    },
+    updateExport: async (id, name, sheet, schema, filename, filter) =>
+      edit((f) => {
+        if (!f.sheets.some((s) => s.id === sheet && s.schemas.some((c) => c.id === schema))) throw "書き出しの対象の表 が見つかりません";
+        const e = f.exports.find((x) => x.id === id);
+        if (!e) throw "書き出し が見つかりません";
+        Object.assign(e, { name, sheet, schema, filename, filter: filter?.trim() ? filter.trim() : undefined });
+      }),
+    replaceExportTemplate: async (id, templatePath) =>
+      edit((f) => {
+        const e = f.exports.find((x) => x.id === id);
+        if (!e) throw "書き出し が見つかりません";
+        if (!new RegExp(`\\.${e.kind}$`, "i").test(templatePath)) throw `この書き出しのテンプレートは .${e.kind} です。同じ種類のファイルを選んでください`;
+        e.templateName = templatePath.split("/").pop()!;
+      }),
+    deleteExport: async (id) =>
+      edit((f) => {
+        if (!f.exports.some((e) => e.id === id)) throw "書き出し が見つかりません";
+        f.exports = f.exports.filter((e) => e.id !== id);
+        mockPlaceholders.delete(id);
+      }),
+    exportPreview: async (id, limit): Promise<ExportPreview> => {
+      if (!file) throw "ファイルが開かれていません";
+      const e = file.exports.find((x) => x.id === id);
+      if (!e) throw "書き出し が見つかりません";
+      const placeholders = mockPlaceholders.get(id) ?? [];
+      const nameExprs = placeholdersOf(e.filename || "{{_no}}");
+      const filter = e.filter?.trim();
+      const exprs = [...new Set([...placeholders, ...nameExprs, ...(filter ? [filter] : [])])];
+      const matrix = evalExprsInBrowser(file, e.sheet, e.schema, exprs);
+      const cell = (r: { v?: unknown; e?: string }): CellResult => (r.e !== undefined ? { e: r.e } : { v: r.v ?? null });
+      const used = new Set<string>();
+      return {
+        placeholders,
+        totalRows: matrix.length,
+        rows: matrix.slice(0, limit).map((row, i) => {
+          const at = (x: string) => row[exprs.indexOf(x)];
+          const bad = nameExprs.map(at).find((r) => r.e !== undefined);
+          let filename: CellResult;
+          if (bad) filename = { e: `ファイル名の「${nameExprs[nameExprs.map(at).indexOf(bad)]}」: ${bad.e}` };
+          else {
+            const stem = (e.filename || "{{_no}}").replace(PLACEHOLDER_RE, (_m, x: string) => String(at(x.trim()).v ?? "")).replace(/[\\/:*?"<>|]/g, "_").trim() || `row${i + 1}`;
+            let name = `${stem}.${e.kind}`;
+            for (let n = 2; used.has(name.toLowerCase()); n++) name = `${stem} (${n}).${e.kind}`;
+            used.add(name.toLowerCase());
+            filename = { v: name };
+          }
+          const f = filter ? at(filter) : undefined;
+          return { rowNo: i + 1, excluded: !!f && f.e === undefined && !f.v, filename, values: placeholders.map((p) => cell(at(p))) };
+        }),
+      };
+    },
+    runExport: async () => {
+      throw "ブラウザ単体ではファイルを書き出せません（デスクトップ版で実行してください）";
     },
 
     historyLog: async () => [...commits].reverse().map((c) => clone(c.info)),

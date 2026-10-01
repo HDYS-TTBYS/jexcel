@@ -5,7 +5,7 @@
 
 use jxcel_core::diff::Change;
 use jxcel_core::types::TypeRegistry;
-use jxcel_core::{new_id, Column, DataSchema, JxcelFile, Macro, Row, Sheet};
+use jxcel_core::{new_id, Column, DataSchema, Export, JxcelFile, Macro, Row, Sheet, TemplateKind};
 use jxcel_git::archive::Archive;
 use jxcel_git::CommitInfo;
 use jxcel_macro::ComputedValues;
@@ -33,6 +33,8 @@ pub enum Error {
     Git(#[from] jxcel_git::Error),
     #[error("マクロ: {0}")]
     Macro(#[from] jxcel_macro::Error),
+    #[error("書き出し: {0}")]
+    Export(#[from] jxcel_export::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -60,6 +62,55 @@ pub struct RunOutput {
     pub result: Option<Value>,
     /// 書き込み操作の数（0 ならファイルは変わっていない）
     pub ops: usize,
+}
+
+/// 書き出しの結果。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportResult {
+    pub out_dir: String,
+    pub written: Vec<WrittenFile>,
+    /// 絞り込み条件に合わず、書き出さなかった行数
+    pub skipped: usize,
+    /// 書き出せなかった行（他の行は書き出されている）
+    pub errors: Vec<ExportRowError>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WrittenFile {
+    pub row_no: usize,
+    /// 実際に書いたファイル名（同名のファイルが既にあれば番号が付く）
+    pub filename: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportRowError {
+    pub row_no: usize,
+    pub message: String,
+}
+
+/// 書き出しのプレビュー。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportPreview {
+    /// テンプレートに含まれる差し込み欄の式
+    pub placeholders: Vec<String>,
+    pub total_rows: usize,
+    pub rows: Vec<ExportPreviewRow>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportPreviewRow {
+    pub row_no: usize,
+    /// 絞り込み条件で除外される行か
+    pub excluded: bool,
+    /// 出力ファイル名（値）か、そのエラー
+    pub filename: jxcel_macro::CellResult,
+    /// `placeholders` と同じ順の、欄ごとの値かエラー
+    pub values: Vec<jxcel_macro::CellResult>,
 }
 
 const MACRO_TEMPLATE: &str = r#"// jx からファイルの読み書きができます（型は Jxcel）。
@@ -140,6 +191,8 @@ impl Session {
                 schemas: vec![schema],
             }],
             macros: Default::default(),
+            exports: Default::default(),
+            templates: Default::default(),
         };
         self.doc = Some(Doc {
             file,
@@ -444,6 +497,234 @@ impl Session {
         })
     }
 
+    // ---- 書き出し（テンプレートへの差し込み） ----
+
+    /// テンプレート（xlsx / docx）を取り込んで書き出しを追加する。対象の表は先頭のシートの先頭のスキーマ。
+    pub fn add_export(&mut self, template_path: &str, name: Option<&str>) -> Result<Snapshot> {
+        let path = std::path::Path::new(template_path);
+        let kind = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .and_then(TemplateKind::from_extension)
+            .ok_or_else(|| {
+                Error::Invalid("テンプレートは .xlsx か .docx のファイルを選んでください".into())
+            })?;
+        let bytes = std::fs::read(path)?;
+        // 取り込む前に、差し込み欄を読めるファイルか確かめる
+        jxcel_export::scan(kind, &bytes)?;
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("テンプレート")
+            .to_string();
+        let name = name
+            .map(String::from)
+            .or_else(|| path.file_stem().and_then(|s| s.to_str()).map(String::from))
+            .unwrap_or_else(|| "書き出し".into());
+
+        self.edit(move |f, _| {
+            let sheet = f
+                .sheets
+                .first()
+                .ok_or_else(|| Error::Invalid("シートがありません".into()))?;
+            let schema = sheet.schemas.first().ok_or_else(|| {
+                Error::Invalid("書き出しの対象にする表（スキーマ）がありません".into())
+            })?;
+            let filename = schema
+                .columns
+                .iter()
+                .find(|c| c.computed.is_none())
+                .map_or_else(|| "{{_no}}".to_string(), |c| format!("{{{{{}}}}}", c.name));
+            let id = new_id();
+            f.exports.push(Export {
+                id: id.clone(),
+                name,
+                kind,
+                template_name: file_name,
+                sheet: sheet.id.clone(),
+                schema: schema.id.clone(),
+                filename,
+                filter: None,
+            });
+            f.templates.insert(id, bytes);
+            Ok(())
+        })
+    }
+
+    /// 設定を更新する（対象の表・出力ファイル名・絞り込み）。`filter` が空なら絞り込みなし。
+    pub fn update_export(
+        &mut self,
+        id: &str,
+        name: &str,
+        sheet: &str,
+        schema: &str,
+        filename: &str,
+        filter: Option<&str>,
+    ) -> Result<Snapshot> {
+        let (id, name, sheet, schema, filename) = (
+            id.to_string(),
+            name.to_string(),
+            sheet.to_string(),
+            schema.to_string(),
+            filename.to_string(),
+        );
+        let filter = filter
+            .map(str::trim)
+            .filter(|f| !f.is_empty())
+            .map(String::from);
+        self.edit(move |f, _| {
+            if !f
+                .sheets
+                .iter()
+                .any(|s| s.id == sheet && s.schemas.iter().any(|c| c.id == schema))
+            {
+                return Err(Error::NotFound("書き出しの対象の表"));
+            }
+            let e = f
+                .exports
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or(Error::NotFound("書き出し"))?;
+            e.name = name;
+            e.sheet = sheet;
+            e.schema = schema;
+            e.filename = filename;
+            e.filter = filter;
+            Ok(())
+        })
+    }
+
+    /// テンプレートのファイルを差し替える（種類は同じこと）。
+    pub fn replace_export_template(&mut self, id: &str, template_path: &str) -> Result<Snapshot> {
+        let path = std::path::Path::new(template_path);
+        let id = id.to_string();
+        let kind = self
+            .doc()?
+            .file
+            .exports
+            .iter()
+            .find(|e| e.id == id)
+            .ok_or(Error::NotFound("書き出し"))?
+            .kind;
+        let actual = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .and_then(TemplateKind::from_extension);
+        if actual != Some(kind) {
+            return Err(Error::Invalid(format!(
+                "この書き出しのテンプレートは .{} です。同じ種類のファイルを選んでください",
+                kind.extension()
+            )));
+        }
+        let bytes = std::fs::read(path)?;
+        jxcel_export::scan(kind, &bytes)?;
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("テンプレート")
+            .to_string();
+        self.edit(move |f, _| {
+            let e = f
+                .exports
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or(Error::NotFound("書き出し"))?;
+            e.template_name = file_name;
+            f.templates.insert(id, bytes);
+            Ok(())
+        })
+    }
+
+    pub fn delete_export(&mut self, id: &str) -> Result<Snapshot> {
+        let id = id.to_string();
+        self.edit(move |f, _| {
+            let before = f.exports.len();
+            f.exports.retain(|e| e.id != id);
+            f.templates.remove(&id);
+            (f.exports.len() != before)
+                .then_some(())
+                .ok_or(Error::NotFound("書き出し"))
+        })
+    }
+
+    fn export_spec<'a>(file: &'a JxcelFile, id: &str) -> Result<jxcel_export::Spec<'a>> {
+        let e = file
+            .exports
+            .iter()
+            .find(|e| e.id == id)
+            .ok_or(Error::NotFound("書き出し"))?;
+        let template = file
+            .templates
+            .get(id)
+            .ok_or(Error::NotFound("テンプレート"))?;
+        Ok(jxcel_export::Spec {
+            kind: e.kind,
+            template,
+            sheet: &e.sheet,
+            schema: &e.schema,
+            filename: &e.filename,
+            filter: e.filter.as_deref(),
+        })
+    }
+
+    /// 書き出す前の確認。テンプレートの差し込み欄と、先頭 `limit` 行の値・出力ファイル名を返す。
+    pub fn export_preview(&mut self, id: &str, limit: usize) -> Result<ExportPreview> {
+        let d = self.doc()?;
+        let spec = Self::export_spec(&d.file, id)?;
+        let p = jxcel_export::preview(&d.file, &spec, limit, &jxcel_macro::Options::default())?;
+        use jxcel_macro::CellResult;
+        let cell = |r: std::result::Result<Value, String>| match r {
+            Ok(v) => CellResult::Value(v),
+            Err(e) => CellResult::Error(e),
+        };
+        Ok(ExportPreview {
+            placeholders: p.placeholders,
+            total_rows: p.total_rows,
+            rows: p
+                .rows
+                .into_iter()
+                .map(|r| ExportPreviewRow {
+                    row_no: r.row_no,
+                    excluded: r.excluded,
+                    filename: cell(r.filename.map(Value::String)),
+                    values: r.values.into_iter().map(cell).collect(),
+                })
+                .collect(),
+        })
+    }
+
+    /// 全行を書き出す。ファイルは `out_dir` に作り、既にあるファイルは上書きしない（番号を付ける）。
+    /// ファイルの内容（jxcel ファイル）は変わらない。
+    pub fn run_export(&mut self, id: &str, out_dir: &str) -> Result<ExportResult> {
+        let d = self.doc()?;
+        let spec = Self::export_spec(&d.file, id)?;
+        let report = jxcel_export::export(&d.file, &spec, &jxcel_macro::Options::default())?;
+
+        let dir = std::path::Path::new(out_dir);
+        std::fs::create_dir_all(dir)?;
+        let mut written = vec![];
+        for f in report.files {
+            let filename = write_new_file(dir, &f.filename, &f.bytes)?;
+            written.push(WrittenFile {
+                row_no: f.row_no,
+                filename,
+            });
+        }
+        Ok(ExportResult {
+            out_dir: out_dir.to_string(),
+            written,
+            skipped: report.skipped,
+            errors: report
+                .errors
+                .into_iter()
+                .map(|e| ExportRowError {
+                    row_no: e.row_no,
+                    message: e.message,
+                })
+                .collect(),
+        })
+    }
+
     // ---- 履歴 ----
 
     pub fn history_log(&mut self) -> Result<Vec<CommitInfo>> {
@@ -462,6 +743,34 @@ impl Session {
         d.dirty = true;
         self.snapshot()
     }
+}
+
+/// 既存のファイルを上書きせずに書く。同名があれば「name (2).ext」のように番号を付ける。
+/// `create_new` で作るので、確認と作成の間に同名のファイルができても上書きしない。
+fn write_new_file(dir: &std::path::Path, filename: &str, bytes: &[u8]) -> Result<String> {
+    use std::io::Write;
+    let (stem, ext) = match filename.rsplit_once('.') {
+        Some((s, e)) => (s.to_string(), format!(".{e}")),
+        None => (filename.to_string(), String::new()),
+    };
+    let mut name = filename.to_string();
+    for n in 2.. {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(dir.join(&name))
+        {
+            Ok(mut f) => {
+                f.write_all(bytes)?;
+                return Ok(name);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                name = format!("{stem} ({n}){ext}")
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    unreachable!("番号は尽きない")
 }
 
 fn find_sheet<'a>(f: &'a mut JxcelFile, id: &str) -> Result<&'a mut Sheet> {
@@ -812,5 +1121,254 @@ mod tests {
         s.delete_column(&sh, &sc, &col).unwrap();
         s.delete_sheet(&sh).unwrap();
         assert_eq!(s.current().unwrap().file.sheets.len(), 1);
+    }
+
+    // ---- 書き出し ----
+
+    fn fixture(name: &str) -> String {
+        format!(
+            "{}/../jxcel-export/tests/fixtures/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        )
+    }
+
+    /// テンプレートの欄に合わせた列名の「請求」表を持つファイルを、ディスクに書いて返す。
+    fn invoice_file(dir: &std::path::Path) -> String {
+        let names = [
+            "請求番号",
+            "取引先",
+            "数量",
+            "単価",
+            "区分",
+            "備考",
+            "品名",
+            "発行日",
+            "完了",
+        ];
+        let types = [
+            DataType::String,
+            DataType::String,
+            DataType::Int,
+            DataType::Int,
+            DataType::String,
+            DataType::String,
+            DataType::String,
+            DataType::Date,
+            DataType::Bool,
+        ];
+        let mut schema = DataSchema::new(
+            "請求",
+            names
+                .iter()
+                .zip(types)
+                .map(|(n, t)| Column::new(format!("c{n}"), *n, t))
+                .collect(),
+        );
+        for (i, (no, client, qty)) in [("INV-001", "株式会社A", 3), ("INV-002", "B商事", 10)]
+            .iter()
+            .enumerate()
+        {
+            let cells = [
+                ("請求番号", json!(no)),
+                ("取引先", json!(client)),
+                ("数量", json!(qty)),
+                ("単価", json!(100)),
+                ("区分", json!("A")),
+                ("備考", json!("メモ")),
+                ("品名", json!("ねじ")),
+                ("発行日", json!("2024-01-31")),
+                ("完了", json!(true)),
+            ]
+            .into_iter()
+            .map(|(k, v)| (format!("c{k}"), v))
+            .collect();
+            schema.rows.push(Row {
+                id: format!("r{i}"),
+                cells,
+            });
+        }
+        let file = JxcelFile {
+            name: "請求".into(),
+            sheets: vec![Sheet {
+                id: "sh".into(),
+                name: "請求".into(),
+                schemas: vec![schema],
+            }],
+            ..Default::default()
+        };
+        let path = dir.join("invoices.jxcel");
+        std::fs::write(&path, file.to_zip().unwrap()).unwrap();
+        path.to_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn export_import_preview_run_save_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out");
+        let file = invoice_file(dir.path());
+        let mut s = Session::new();
+        let snap = s.open(&file).unwrap();
+        assert!(!snap.dirty && snap.file.exports.is_empty());
+        // 履歴のないファイルは、最初の保存から履歴が始まる。取り込み前の状態を 1 件目にしておく
+        s.save(None, "取り込み前").unwrap();
+
+        // テンプレートを取り込む: 先頭の表が対象、ファイル名は先頭の列、未保存になる
+        let snap = s.add_export(&fixture("invoice.docx"), None).unwrap();
+        assert!(snap.dirty);
+        let e = &snap.file.exports[0];
+        assert_eq!(
+            (
+                e.name.as_str(),
+                e.template_name.as_str(),
+                e.filename.as_str()
+            ),
+            ("invoice", "invoice.docx", "{{請求番号}}")
+        );
+        assert_eq!((e.sheet.as_str(), e.kind), ("sh", TemplateKind::Docx));
+        let id = e.id.clone();
+
+        // プレビュー: 差し込み欄と、先頭行の値
+        let p = s.export_preview(&id, 5).unwrap();
+        assert!(p.placeholders.iter().any(|x| x == "数量 * 単価"));
+        assert_eq!(p.total_rows, 2);
+        let i = p.placeholders.iter().position(|x| x == "取引先").unwrap();
+        assert_eq!(
+            p.rows[0].values[i],
+            jxcel_macro::CellResult::Value(json!("株式会社A"))
+        );
+        assert_eq!(
+            p.rows[0].filename,
+            jxcel_macro::CellResult::Value(json!("INV-001.docx"))
+        );
+
+        // 設定を直して、全行を書き出す
+        s.update_export(
+            &id,
+            "請求書",
+            "sh",
+            &snap.file.sheets[0].schemas[0].id,
+            "{{請求番号}}_{{取引先}}",
+            Some("数量 > 5"),
+        )
+        .unwrap();
+        let r = s.run_export(&id, out.to_str().unwrap()).unwrap();
+        assert_eq!(
+            (r.written.len(), r.skipped, r.errors.len()),
+            (1, 1, 0),
+            "{r:?}"
+        );
+        assert_eq!(r.written[0].filename, "INV-002_B商事.docx");
+        assert!(out.join("INV-002_B商事.docx").is_file());
+        // 書き出しは jxcel ファイルの内容を変えない
+        assert!(s.current().unwrap().dirty); // 取り込みと設定変更で元々未保存。書き出しで増えも減りもしない
+
+        // もう一度書き出しても、既存のファイルは上書きしない（番号が付く）
+        let before = std::fs::read(out.join("INV-002_B商事.docx")).unwrap();
+        let r2 = s.run_export(&id, out.to_str().unwrap()).unwrap();
+        assert_eq!(r2.written[0].filename, "INV-002_B商事 (2).docx");
+        assert_eq!(
+            std::fs::read(out.join("INV-002_B商事.docx")).unwrap(),
+            before
+        );
+
+        // 保存して開き直しても、設定とテンプレートが残り、そのまま書き出せる
+        s.save(None, "書き出し設定").unwrap();
+        let mut s2 = Session::new();
+        let snap = s2.open(&file).unwrap();
+        assert_eq!(snap.file.exports.len(), 1);
+        let out2 = dir.path().join("out2");
+        let r3 = s2.run_export(&id, out2.to_str().unwrap()).unwrap();
+        assert_eq!(r3.written.len(), 1);
+        assert_eq!(
+            std::fs::read(out2.join("INV-002_B商事.docx")).unwrap(),
+            before
+        );
+
+        // 履歴の差分に、書き出しの追加が出る
+        let log = s2.history_log().unwrap();
+        assert_eq!(log.len(), 2);
+        let d = s2.history_diff(&log[1].id, &log[0].id).unwrap();
+        assert!(
+            d.iter().any(|c| matches!(c, Change::ExportAdded { .. })),
+            "{d:?}"
+        );
+
+        // 削除
+        let snap = s2.delete_export(&id).unwrap();
+        assert!(snap.file.exports.is_empty() && snap.file.templates.is_empty());
+        assert!(matches!(s2.delete_export(&id), Err(Error::NotFound(_))));
+        assert!(matches!(
+            s2.run_export(&id, out2.to_str().unwrap()),
+            Err(Error::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn export_template_validation_and_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = invoice_file(dir.path());
+        let mut s = Session::new();
+        s.open(&file).unwrap();
+
+        // 拡張子が違う・中身が違うファイルは取り込めない（状態は変わらない）
+        let txt = dir.path().join("t.txt");
+        std::fs::write(&txt, "x").unwrap();
+        assert!(
+            matches!(s.add_export(txt.to_str().unwrap(), None), Err(Error::Invalid(m)) if m.contains(".docx"))
+        );
+        let fake = dir.path().join("fake.docx");
+        std::fs::write(&fake, "zipではない").unwrap();
+        assert!(matches!(
+            s.add_export(fake.to_str().unwrap(), None),
+            Err(Error::Export(_))
+        ));
+        // docx の中身を xlsx と名乗らせても弾く
+        let wrong = dir.path().join("wrong.xlsx");
+        std::fs::copy(fixture("invoice.docx"), &wrong).unwrap();
+        assert!(matches!(
+            s.add_export(wrong.to_str().unwrap(), None),
+            Err(Error::Export(_))
+        ));
+        assert!(!s.current().unwrap().dirty);
+        assert!(s.current().unwrap().file.exports.is_empty());
+
+        // 差し替え: 同じ種類だけ
+        let snap = s
+            .add_export(&fixture("invoice.docx"), Some("請求書"))
+            .unwrap();
+        let id = snap.file.exports[0].id.clone();
+        assert!(
+            matches!(s.replace_export_template(&id, &fixture("invoice.xlsx")), Err(Error::Invalid(m)) if m.contains(".docx"))
+        );
+        let snap = s
+            .replace_export_template(&id, &fixture("invoice.docx"))
+            .unwrap();
+        assert_eq!(snap.file.exports[0].name, "請求書");
+        // 存在しない表を対象にはできない
+        assert!(matches!(
+            s.update_export(&id, "x", "sh", "nope", "{{_no}}", None),
+            Err(Error::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn export_xlsx_template_writes_numeric_cells() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = invoice_file(dir.path());
+        let mut s = Session::new();
+        s.open(&file).unwrap();
+        let snap = s.add_export(&fixture("invoice.xlsx"), None).unwrap();
+        let id = snap.file.exports[0].id.clone();
+        let r = s
+            .run_export(&id, dir.path().join("o").to_str().unwrap())
+            .unwrap();
+        assert_eq!(
+            r.written
+                .iter()
+                .map(|w| w.filename.as_str())
+                .collect::<Vec<_>>(),
+            ["INV-001.xlsx", "INV-002.xlsx"]
+        );
+        assert!(dir.path().join("o/INV-001.xlsx").is_file());
     }
 }

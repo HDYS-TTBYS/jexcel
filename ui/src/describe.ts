@@ -48,6 +48,16 @@ export function describeChange(c: Change, file: JxcelFile): string {
       return `マクロ名: ${c.old} → ${c.new}`;
     case "macroEdited":
       return `マクロ「${c.name}」のコードを変更`;
+    case "exportAdded":
+      return `書き出し「${c.name}」を追加`;
+    case "exportRemoved":
+      return `書き出し「${c.name}」を削除`;
+    case "exportRenamed":
+      return `書き出し名: ${c.old} → ${c.new}`;
+    case "exportChanged":
+      return `書き出し「${c.name}」の設定を変更`;
+    case "templateReplaced":
+      return `書き出し「${c.name}」のテンプレートを差し替え`;
     case "rowsReordered":
       return "行の並び順を変更";
   }

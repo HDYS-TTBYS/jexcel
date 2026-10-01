@@ -112,6 +112,8 @@ mod tests {
                 schemas: vec![s],
             }],
             macros: Default::default(),
+            exports: Default::default(),
+            templates: Default::default(),
         }
     }
 

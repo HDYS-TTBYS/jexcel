@@ -114,6 +114,15 @@ struct Output {
     result: Value,
     #[serde(default)]
     computed: Vec<RawCell>,
+    /// `evaluate_exprs` の結果（行 × 式）
+    #[serde(default)]
+    exprs: Vec<Vec<RawExpr>>,
+}
+
+#[derive(Deserialize)]
+struct RawExpr {
+    v: Option<Value>,
+    e: Option<String>,
 }
 
 /// JS 側から返る、計算列の 1 セル分の結果。
@@ -164,7 +173,7 @@ enum Op {
 /// 計算列があれば先に評価するので、マクロからは計算列の値も読める（実行開始時点の値）。
 pub fn run(source: &str, file: &JxcelFile, opts: &Options) -> Result<MacroRun> {
     let js = transpile(source)?;
-    let output = execute(file, Some(&js), opts)?;
+    let output = execute(file, Some(&js), None, opts)?;
     apply(file, output)
 }
 
@@ -177,7 +186,7 @@ pub fn compute(file: &JxcelFile, opts: &Options) -> ComputedValues {
     if formulas.is_empty() {
         return ComputedValues::new();
     }
-    match execute(file, None, opts) {
+    match execute(file, None, None, opts) {
         Ok(output) => into_values(file, output.computed),
         Err(e) => {
             let message = e.to_string();
@@ -266,7 +275,51 @@ fn collect_formulas(file: &JxcelFile) -> Vec<Formula> {
     out
 }
 
-fn execute(file: &JxcelFile, main_js: Option<&str>, opts: &Options) -> Result<Output> {
+/// 差し込み欄の式を評価する依頼。
+struct ExprRequest<'a> {
+    sheet: &'a str,
+    schema: &'a str,
+    exprs: &'a [String],
+}
+
+/// テンプレートの差し込み欄 `{{ 式 }}` を、表の全行について評価する（行の並び順 × 式の順）。
+///
+/// 式は列名をそのまま変数として使える（`{{数量 * 単価}}`）。`row`・`jx`（読み取り専用）・`std` も使える。
+/// `_no`（1 から始まる行番号）と `_id`（行 ID）も使える。式の誤りや例外は、その行・その式だけのエラー。
+/// 計算列は先に評価されるので、その値も使える。
+pub fn evaluate_exprs(
+    file: &JxcelFile,
+    sheet_id: &str,
+    schema_id: &str,
+    exprs: &[String],
+    opts: &Options,
+) -> Result<Vec<Vec<CellResult>>> {
+    let req = ExprRequest {
+        sheet: sheet_id,
+        schema: schema_id,
+        exprs,
+    };
+    let output = execute(file, None, Some(&req), opts)?;
+    Ok(output
+        .exprs
+        .into_iter()
+        .map(|row| {
+            row.into_iter()
+                .map(|c| match (c.e, c.v) {
+                    (Some(e), _) => CellResult::Error(e),
+                    (None, v) => CellResult::Value(v.unwrap_or(Value::Null)),
+                })
+                .collect()
+        })
+        .collect())
+}
+
+fn execute(
+    file: &JxcelFile,
+    main_js: Option<&str>,
+    exprs: Option<&ExprRequest>,
+    opts: &Options,
+) -> Result<Output> {
     let data = serde_json::to_string(file).expect("serialize");
     let formulas = collect_formulas(file);
 
@@ -331,6 +384,17 @@ fn execute(file: &JxcelFile, main_js: Option<&str>, opts: &Options) -> Result<Ou
             let specs = serde_json::to_string(&specs).expect("serialize");
             globals.set("__specs", specs).map_err(|e| e.to_string())?;
             ctx.eval::<(), _>("globalThis.__state.computeAll(JSON.parse(__specs));")
+                .catch(&ctx)
+                .map_err(|e| e.to_string())?;
+        }
+
+        // 差し込み欄の式（計算列の後に評価するので、計算列の値も使える）
+        if let Some(req) = exprs {
+            let spec = serde_json::json!({ "sheet": req.sheet, "schemaId": req.schema, "exprs": req.exprs });
+            globals
+                .set("__exprspec", serde_json::to_string(&spec).expect("serialize"))
+                .map_err(|e| e.to_string())?;
+            ctx.eval::<(), _>("globalThis.__state.evalExprs(JSON.parse(__exprspec));")
                 .catch(&ctx)
                 .map_err(|e| e.to_string())?;
         }
@@ -496,6 +560,8 @@ mod tests {
                 schemas: vec![schema],
             }],
             macros: Default::default(),
+            exports: Default::default(),
+            templates: Default::default(),
         }
     }
 
@@ -1320,5 +1386,119 @@ mod tests {
         );
         let r = run(&src, &sample(), &Options::default()).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(r.result, Some(json!([])), "std と型定義が食い違っています");
+    }
+
+    // ---- 差し込み欄の式 ----
+
+    fn exprs(file: &JxcelFile, exprs: &[&str]) -> Vec<Vec<CellResult>> {
+        let list: Vec<String> = exprs.iter().map(|s| s.to_string()).collect();
+        evaluate_exprs(file, "sh1", "s1", &list, &Options::default())
+            .unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    fn v(x: Value) -> CellResult {
+        CellResult::Value(x)
+    }
+
+    #[test]
+    fn exprs_use_column_names_as_variables() {
+        let got = exprs(
+            &sample(),
+            &[
+                "品名",
+                "数量 * 2",
+                "品名 + '(' + 数量 + ')'",
+                "_no",
+                "_id",
+                "row.数量",
+                "std.sum([数量, 1])",
+            ],
+        );
+        assert_eq!(got.len(), 2); // 行の数
+        assert_eq!(
+            got[0],
+            [
+                v(json!("ねじ")),
+                v(json!(20)),
+                v(json!("ねじ(10)")),
+                v(json!(1)),
+                v(json!("r1")),
+                v(json!(10)),
+                v(json!(11))
+            ]
+        );
+        assert_eq!(got[1][3], v(json!(2)));
+        assert_eq!(got[1][1], v(json!(10)));
+    }
+
+    #[test]
+    fn exprs_see_computed_columns_and_are_read_only() {
+        let f = with_computed(
+            sample(),
+            "dbl",
+            "倍",
+            DataType::Int,
+            "export default (row: any) => row.数量 * 2",
+        );
+        let got = exprs(
+            &f,
+            &["倍 + 1", "jx.sheet('倉庫').schema('在庫').remove('r1')"],
+        );
+        assert_eq!(got[0][0], v(json!(21)));
+        assert!(
+            matches!(&got[0][1], CellResult::Error(m) if m.contains("書き換えられません")),
+            "{:?}",
+            got[0][1]
+        );
+    }
+
+    #[test]
+    fn expr_errors_are_isolated_per_row_and_expression() {
+        let mut f = sample();
+        f.sheets[0].schemas[0].rows[1].cells.remove("qty");
+        let got = exprs(&f, &["数量.toFixed(1)", "存在しない列", "1 +", "品名"]);
+        // r1 は数量があるので成功、r2 は数量が null なので例外。他の式には影響しない
+        assert_eq!(got[0][0], v(json!("10.0")));
+        assert!(matches!(&got[1][0], CellResult::Error(_)));
+        assert!(
+            matches!(&got[0][1], CellResult::Error(m) if m.contains("存在しない列")),
+            "{:?}",
+            got[0][1]
+        );
+        // 構文エラーは全行のその式だけがエラー
+        assert!(got.iter().all(|r| matches!(&r[2], CellResult::Error(_))));
+        assert_eq!(got[1][3], v(json!("ナット")));
+    }
+
+    #[test]
+    fn expr_trailing_line_comment_does_not_break_evaluation() {
+        // 式の後ろに // コメントがあっても、閉じ括弧が飲み込まれない
+        let got = exprs(&sample(), &["数量 // 在庫数"]);
+        assert_eq!(got[0][0], v(json!(10)));
+    }
+
+    #[test]
+    fn exprs_report_an_unknown_target_and_time_out() {
+        let e = evaluate_exprs(
+            &sample(),
+            "sh1",
+            "nope",
+            &["1".to_string()],
+            &Options::default(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&e, Error::Runtime(m) if m.contains("書き出し対象")),
+            "{e}"
+        );
+        let e = evaluate_exprs(
+            &sample(),
+            "sh1",
+            "s1",
+            &["(() => { while (true) {} })()".to_string()],
+            &quick(),
+        )
+        .unwrap_err();
+        assert!(matches!(e, Error::Timeout(_)), "{e}");
     }
 }

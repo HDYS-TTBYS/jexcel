@@ -7,6 +7,7 @@ import { SchemaEditor } from "./components/SchemaEditor";
 
 // Monaco は大きいので、マクロパネルを開いたときに初めて読み込む
 const MacroPanel = lazy(() => import("./components/MacroPanel"));
+const ExportPanel = lazy(() => import("./components/ExportPanel"));
 import { newId, type Column, type Snapshot } from "./types";
 
 export function App({ backend }: { backend: Backend }) {
@@ -24,6 +25,7 @@ export function App({ backend }: { backend: Backend }) {
   const [showHistory, setShowHistory] = useState(false);
   const [showSchema, setShowSchema] = useState(false);
   const [showMacros, setShowMacros] = useState(false);
+  const [showExports, setShowExports] = useState(false);
   const [dialog, setDialog] = useState<DialogSpec | null>(null);
   const [historyKey, setHistoryKey] = useState(0);
   // マクロエディタの保留中の編集を書き出す（保存・確認の前に呼ぶ）
@@ -153,6 +155,9 @@ export function App({ backend }: { backend: Backend }) {
         onChange={(e) => setMessage(e.target.value)}
       />
       <span className="spacer" />
+      <button disabled={!snap} aria-pressed={showExports} onClick={() => setShowExports((v) => !v)}>
+        書き出し
+      </button>
       <button disabled={!snap} aria-pressed={showMacros} onClick={() => setShowMacros((v) => !v)}>
         マクロ
       </button>
@@ -274,6 +279,17 @@ export function App({ backend }: { backend: Backend }) {
               onPrompt={(title, initial, onOk) => setDialog({ kind: "prompt", title, initial, onOk })}
               onConfirm={(title, message, onOk) => setDialog({ kind: "confirm", title, message, onOk })}
               registerFlush={registerFlush}
+            />
+          </Suspense>
+        )}
+        {showExports && (
+          <Suspense fallback={<aside className="exports"><p className="muted pad">読み込み中…</p></aside>}>
+            <ExportPanel
+              backend={backend}
+              file={snap.file}
+              onSnapshot={setSnap}
+              onError={onError}
+              onConfirm={(title, message, onOk) => setDialog({ kind: "confirm", title, message, onOk })}
             />
           </Suspense>
         )}

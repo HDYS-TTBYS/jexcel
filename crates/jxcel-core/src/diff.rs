@@ -101,6 +101,29 @@ pub enum Change {
         id: String,
         name: String,
     },
+    ExportAdded {
+        id: String,
+        name: String,
+    },
+    ExportRemoved {
+        id: String,
+        name: String,
+    },
+    ExportRenamed {
+        id: String,
+        old: String,
+        new: String,
+    },
+    /// 対象の表・ファイル名・絞り込みのいずれかが変わった
+    ExportChanged {
+        id: String,
+        name: String,
+    },
+    /// テンプレートのファイルが差し替わった
+    TemplateReplaced {
+        id: String,
+        name: String,
+    },
     /// 行の並びだけが変わった（共通する行の相対順序が違う）
     RowsReordered {
         sheet: String,
@@ -165,7 +188,51 @@ pub fn diff(old: &JxcelFile, new: &JxcelFile) -> Vec<Change> {
         }
     }
     diff_macros(old, new, &mut out);
+    diff_exports(old, new, &mut out);
     out
+}
+
+fn diff_exports(old: &JxcelFile, new: &JxcelFile, out: &mut Vec<Change>) {
+    for e in &old.exports {
+        if !new.exports.iter().any(|n| n.id == e.id) {
+            out.push(Change::ExportRemoved {
+                id: e.id.clone(),
+                name: e.name.clone(),
+            });
+        }
+    }
+    for n in &new.exports {
+        let Some(e) = old.exports.iter().find(|e| e.id == n.id) else {
+            out.push(Change::ExportAdded {
+                id: n.id.clone(),
+                name: n.name.clone(),
+            });
+            continue;
+        };
+        if e.name != n.name {
+            out.push(Change::ExportRenamed {
+                id: n.id.clone(),
+                old: e.name.clone(),
+                new: n.name.clone(),
+            });
+        }
+        if (&e.sheet, &e.schema, &e.filename, &e.filter)
+            != (&n.sheet, &n.schema, &n.filename, &n.filter)
+        {
+            out.push(Change::ExportChanged {
+                id: n.id.clone(),
+                name: n.name.clone(),
+            });
+        }
+        if e.template_name != n.template_name
+            || old.templates.get(&e.id) != new.templates.get(&n.id)
+        {
+            out.push(Change::TemplateReplaced {
+                id: n.id.clone(),
+                name: n.name.clone(),
+            });
+        }
+    }
 }
 
 fn diff_macros(old: &JxcelFile, new: &JxcelFile, out: &mut Vec<Change>) {
@@ -383,6 +450,71 @@ mod tests {
             vec![Change::MacroRemoved {
                 id: "m1".into(),
                 name: "合計".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn export_changes() {
+        use crate::{Export, TemplateKind};
+        let base = sample();
+        let mut with = base.clone();
+        with.exports.push(Export {
+            id: "e1".into(),
+            name: "請求書".into(),
+            kind: TemplateKind::Docx,
+            template_name: "a.docx".into(),
+            sheet: "sh1".into(),
+            schema: "s1".into(),
+            filename: "{{品名}}".into(),
+            filter: None,
+        });
+        with.templates.insert("e1".into(), b"v1".to_vec());
+        assert_eq!(
+            diff(&base, &with),
+            vec![Change::ExportAdded {
+                id: "e1".into(),
+                name: "請求書".into()
+            }]
+        );
+
+        // 設定の変更・名前の変更・テンプレートの差し替えは、それぞれ別の変更として出る
+        let mut m = with.clone();
+        m.exports[0].filename = "{{取引先}}".into();
+        assert_eq!(
+            diff(&with, &m),
+            vec![Change::ExportChanged {
+                id: "e1".into(),
+                name: "請求書".into()
+            }]
+        );
+        let mut m = with.clone();
+        m.exports[0].filter = Some("数量 > 0".into());
+        assert_eq!(diff(&with, &m).len(), 1);
+        let mut m = with.clone();
+        m.exports[0].name = "納品書".into();
+        assert_eq!(
+            diff(&with, &m),
+            vec![Change::ExportRenamed {
+                id: "e1".into(),
+                old: "請求書".into(),
+                new: "納品書".into()
+            }]
+        );
+        let mut m = with.clone();
+        m.templates.insert("e1".into(), b"v2".to_vec());
+        assert_eq!(
+            diff(&with, &m),
+            vec![Change::TemplateReplaced {
+                id: "e1".into(),
+                name: "請求書".into()
+            }]
+        );
+        assert_eq!(
+            diff(&with, &base),
+            vec![Change::ExportRemoved {
+                id: "e1".into(),
+                name: "請求書".into()
             }]
         );
     }
