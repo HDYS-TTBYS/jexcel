@@ -1,0 +1,12 @@
+[package]
+name = "jxcel-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+ulid = "1"
+zip = { version = "2", default-features = false, features = ["deflate"] }
