@@ -63,11 +63,19 @@ impl Archive {
     }
 }
 
+/// zip に入れるリポジトリ内のトップレベル項目。`git init` が複製するテンプレート
+/// （hooks のサンプル等）や作業用の一時ファイルは、マシン依存のゴミなので入れない。
+const KEEP: [&str; 4] = ["HEAD", "config", "objects", "refs"];
+
 /// ベアリポジトリの中身を `history/` 配下として集める。パス順は zip 側で整う。
 fn pack_dir(root: &Path, dir: &Path, out: &mut FileTree) -> Result<()> {
     let io = |e: std::io::Error| Error::from(jxcel_core::Error::from(e));
     for entry in fs::read_dir(dir).map_err(io)? {
-        let path = entry.map_err(io)?.path();
+        let entry = entry.map_err(io)?;
+        if dir == root && !KEEP.iter().any(|k| entry.file_name() == *k) {
+            continue;
+        }
+        let path = entry.path();
         if path.is_dir() {
             pack_dir(root, &path, out)?;
         } else {
@@ -159,14 +167,14 @@ mod tests {
 
     #[test]
     fn history_is_packed_and_stays_small() {
-        // 行が多いファイルで 30 回保存しても、履歴のファイル数は一定（パック 1 組）
+        // 200 行のファイルで、毎回 1 行だけ変えて 30 回保存する（実運用に近い変更）
         let big = |n: i64| {
             let mut f = file(0);
             let s = &mut f.sheets[0].schemas[0];
             s.rows = (0..200)
                 .map(|i| Row {
                     id: format!("r{i:03}"),
-                    cells: [("qty".to_string(), json!(i + n))].into(),
+                    cells: [("qty".to_string(), json!(if i == n { 1000 + n } else { i }))].into(),
                 })
                 .collect();
             f
@@ -181,16 +189,32 @@ mod tests {
             }
             a = Archive::open(&zip).unwrap().0;
         }
-        let entries = history_entries(&zip);
-        assert_eq!(entries.len(), 2, "{entries:?}"); // pack-*.pack と pack-*.idx
-        assert!(entries
-            .iter()
-            .all(|e| e.starts_with("history/objects/pack/pack-")));
         eprintln!("1世代: {first_size} バイト / 30世代: {} バイト", zip.len());
-        // 30 世代ぶんの履歴が、1 世代の数倍に収まる（差分圧縮が効いている）
+
+        // 履歴のファイル数は一定（パック 1 組）で、テンプレート等のゴミは入らない
+        let tree = read_zip_tree(&zip).unwrap();
+        let history: Vec<_> = tree.keys().filter(|k| k.starts_with("history/")).collect();
+        let pack_files = history
+            .iter()
+            .filter(|k| k.starts_with("history/objects/pack/pack-"))
+            .count();
+        assert_eq!(pack_files, 2, "{history:?}"); // .pack と .idx
+        for k in &history {
+            let top = k.split('/').nth(1).unwrap();
+            assert!(KEEP.contains(&top), "想定外のエントリ: {k}");
+        }
+        // 同じ履歴をパックしないで詰めた場合（旧形式）より、はっきり小さい
+        let loose = Archive::create().unwrap();
+        for n in 0..30 {
+            loose.history().commit(&big(n), &format!("v{n}")).unwrap();
+        }
+        let mut loose_tree = big(29).to_tree().unwrap();
+        pack_dir(loose.dir.path(), loose.dir.path(), &mut loose_tree).unwrap();
+        let loose_len = write_zip_tree(&loose_tree).unwrap().len();
+        eprintln!("パックなし: {loose_len} バイト");
         assert!(
-            zip.len() < first_size * 6,
-            "first={first_size} last={}",
+            zip.len() * 2 < loose_len,
+            "packed={} loose={loose_len}",
             zip.len()
         );
 
@@ -200,7 +224,8 @@ mod tests {
         let log = a.history().log().unwrap();
         assert_eq!(log.len(), 30);
         assert_eq!(a.history().load(&log[29].id).unwrap(), big(0));
-        assert_eq!(a.history().diff(&log[1].id, &log[0].id).unwrap().len(), 200);
+        // v28 → v29: 28 行目が元に戻り、29 行目が変わる
+        assert_eq!(a.history().diff(&log[1].id, &log[0].id).unwrap().len(), 2);
     }
 
     #[test]

@@ -43,7 +43,12 @@ impl History {
     pub fn open_or_init(dir: &Path) -> Result<Self> {
         let repo = match Repository::open_bare(dir) {
             Ok(r) => r,
-            Err(_) => Repository::init_bare(dir)?,
+            Err(_) => {
+                // テンプレート（hooks のサンプル等）を複製しない。マシンごとに内容が違い、無駄に大きいので。
+                let mut opts = git2::RepositoryInitOptions::new();
+                opts.bare(true).external_template(false);
+                Repository::init_opts(dir, &opts)?
+            }
         };
         Ok(Self { repo })
     }

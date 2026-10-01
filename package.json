@@ -2,7 +2,7 @@
   "name": "jxcel",
   "private": true,
   "scripts": {
-    "tauri": "ui/node_modules/.bin/tauri",
+    "tauri": "node ui/node_modules/@tauri-apps/cli/tauri.js",
     "ui": "pnpm --dir ui"
   }
 }
