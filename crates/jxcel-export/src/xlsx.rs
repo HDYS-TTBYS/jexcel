@@ -13,7 +13,8 @@
 //! 要素が 0 件のときは、数式の参照が壊れないよう、値を空にした行を 1 行残す。
 //! 別の行に `{{/each}}` と書くと、その間の行（印の行を含む）がひとまとめに繰り返される。ループは入れ子にできる
 //! （`{{/each}}` を使う形で書く）。数式は、同じ繰り返しの回の中の行を指す参照が、その回のコピーを指す。
-//! ほかのシートへの参照・共有数式・名前の定義のずらしは行わない。
+//! 定義名（印刷範囲・印刷タイトル・名前付き範囲）の中の参照も、同じ規則でずらす。
+//! ほかのシートの数式からの参照・シート名つきの自シートへの参照・共有数式のずらしは行わない。
 
 use serde_json::Value;
 
@@ -93,18 +94,28 @@ pub fn process(pkg: &mut Package, src: &mut dyn Source) -> Result<()> {
         date_styles,
         date1904,
     };
+    let names = sheet_names(pkg)?;
+    // 行がずれたシートの記録（シート名 → 記録）。定義名の参照をずらすのに使う
+    let mut moved: std::collections::HashMap<String, Moves> = Default::default();
     let mut any = false;
     for name in sheets {
         let mut doc = xml::parse(pkg.get(&name).expect("listed"))?;
-        if sheet(&mut doc.root, &mut ctx)? {
+        let mut moves = None;
+        if sheet(&mut doc.root, &mut ctx, &mut moves)? {
             pkg.set(&name, xml::write(&doc)?);
             any = true;
+        }
+        if let (Some(m), Some(sheet_name)) = (moves, names.get(&name)) {
+            moved.insert(sheet_name.clone(), m);
         }
     }
     if any {
         if let Some(b) = pkg.get("xl/workbook.xml") {
             let mut doc = xml::parse(b)?;
             force_recalculation(&mut doc.root);
+            if !moved.is_empty() {
+                shift_defined_names(&mut doc.root, &moved);
+            }
             pkg.set("xl/workbook.xml", xml::write(&doc)?);
         }
     }
@@ -310,7 +321,7 @@ pub fn excel_serial(s: &str, date1904: bool) -> Option<String> {
 
 // ---- シート ----
 
-fn sheet(root: &mut Element, ctx: &mut Ctx) -> Result<bool> {
+fn sheet(root: &mut Element, ctx: &mut Ctx, moved: &mut Option<Moves>) -> Result<bool> {
     let mut changed = false;
     let mut moves = Moves::default();
     if let Some(sd) = child_mut(root, "sheetData") {
@@ -325,7 +336,179 @@ fn sheet(root: &mut Element, ctx: &mut Ctx) -> Result<bool> {
     if changed {
         drop_cached_results(root);
     }
+    if moves.active {
+        *moved = Some(moves);
+    }
     Ok(changed)
+}
+
+/// 部品のパス（`xl/worksheets/sheet1.xml`）→ シート名。`workbook.xml` と、その関係の定義から引く。
+fn sheet_names(pkg: &Package) -> Result<std::collections::HashMap<String, String>> {
+    let mut out = std::collections::HashMap::new();
+    let (Some(wb), Some(rels)) = (
+        pkg.get("xl/workbook.xml"),
+        pkg.get("xl/_rels/workbook.xml.rels"),
+    ) else {
+        return Ok(out);
+    };
+    let wb = xml::parse(wb)?;
+    let rels = xml::parse(rels)?;
+    let mut targets = std::collections::HashMap::new();
+    for n in &rels.root.children {
+        if let Node::Element(e) = n {
+            if let (Some(id), Some(t)) = (e.attr("Id"), e.attr("Target")) {
+                let path = match t.strip_prefix('/') {
+                    Some(abs) => abs.to_string(),
+                    None => format!("xl/{t}"),
+                };
+                targets.insert(id.to_string(), path);
+            }
+        }
+    }
+    if let Some(sheets) = child(&wb.root, "sheets") {
+        for n in &sheets.children {
+            let Node::Element(e) = n else { continue };
+            let rid = e
+                .attrs
+                .iter()
+                .find(|(k, _)| k == "id" || k.ends_with(":id"))
+                .map(|(_, v)| v.as_str());
+            if let (Some(name), Some(path)) = (e.attr("name"), rid.and_then(|r| targets.get(r))) {
+                out.insert(path.clone(), name.to_string());
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// 定義名（印刷範囲・印刷タイトル・名前付き範囲）の中の、行がずれたシートへの参照をずらす。
+fn shift_defined_names(workbook: &mut Element, moved: &std::collections::HashMap<String, Moves>) {
+    let Some(names) = child_mut(workbook, "definedNames") else {
+        return;
+    };
+    for n in &mut names.children {
+        let Node::Element(e) = n else { continue };
+        if e.local() != "definedName" {
+            continue;
+        }
+        let text = e.text();
+        let shifted = shift_sheet_refs(&text, moved);
+        if shifted != text {
+            e.set_text(&shifted);
+        }
+    }
+}
+
+/// `Sheet1!$A$1:$C$8` のような、シート名つきの参照（範囲・行だけの範囲 `Sheet1!$1:$3`）をずらす。
+/// 対象は `moved` にあるシートだけ。文字列リテラルの中は触らない。
+fn shift_sheet_refs(f: &str, moved: &std::collections::HashMap<String, Moves>) -> String {
+    let chars: Vec<char> = f.chars().collect();
+    let mut out = String::with_capacity(f.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '"' {
+            // 文字列リテラル（"" は引用符の文字）
+            out.push(c);
+            i += 1;
+            while i < chars.len() {
+                out.push(chars[i]);
+                if chars[i] == '"' {
+                    if chars.get(i + 1) == Some(&'"') {
+                        out.push('"');
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        // シート名: 'Sheet 1'（'' は引用符の文字）か、そのまま書ける名前
+        let (sheet, next) = if c == '\'' {
+            let mut j = i + 1;
+            let mut name = String::new();
+            while j < chars.len() {
+                if chars[j] == '\'' {
+                    if chars.get(j + 1) == Some(&'\'') {
+                        name.push('\'');
+                        j += 2;
+                        continue;
+                    }
+                    break;
+                }
+                name.push(chars[j]);
+                j += 1;
+            }
+            (name, j + 1)
+        } else if c.is_alphanumeric() || c == '_' {
+            let mut j = i;
+            while j < chars.len() && (chars[j].is_alphanumeric() || "_.".contains(chars[j])) {
+                j += 1;
+            }
+            (chars[i..j].iter().collect(), j)
+        } else {
+            out.push(c);
+            i += 1;
+            continue;
+        };
+        if chars.get(next) != Some(&'!') {
+            out.extend(&chars[i..next.min(chars.len())]);
+            i = next.min(chars.len());
+            continue;
+        }
+        out.extend(&chars[i..=next]);
+        i = next + 1;
+        // `!` の後ろの参照（`$A$1`、`$A$1:$C$8`、`$1:$3`）
+        let take = |from: usize| {
+            let mut j = from;
+            while j < chars.len() && (chars[j].is_ascii_alphanumeric() || chars[j] == '$') {
+                j += 1;
+            }
+            j
+        };
+        let a_end = take(i);
+        let a: String = chars[i..a_end].iter().collect();
+        let (b, end) = if chars.get(a_end) == Some(&':') {
+            let b_end = take(a_end + 1);
+            (
+                Some(chars[a_end + 1..b_end].iter().collect::<String>()),
+                b_end,
+            )
+        } else {
+            (None, a_end)
+        };
+        match moved.get(&sheet) {
+            Some(m) => out.push_str(&map_sheet_ref(&a, b.as_deref(), m)),
+            None => out.extend(&chars[i..end]),
+        }
+        i = end;
+    }
+    out
+}
+
+/// 行だけの参照（`$3`）の行番号。
+fn parse_row_only(s: &str) -> Option<(&str, u32)> {
+    let digits = s.strip_prefix('$').unwrap_or(s);
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let abs = if s.starts_with('$') { "$" } else { "" };
+    Some((abs, digits.parse().ok()?))
+}
+
+fn map_sheet_ref(a: &str, b: Option<&str>, moves: &Moves) -> String {
+    let rows = |a: &str, b: &str| -> Option<String> {
+        let ((xa, ra), (xb, rb)) = (parse_row_only(a)?, parse_row_only(b)?);
+        let (ra, rb) = (moves.point(ra), moves.end(rb));
+        Some(format!("{xa}{ra}:{xb}{rb}"))
+    };
+    match b {
+        Some(b) => rows(a, b).unwrap_or_else(|| map_range(&format!("{a}:{b}"), moves, &[])),
+        None => map_range(a, moves, &[]),
+    }
 }
 
 /// 数式セルの計算済みの値を捨てる。Excel は `fullCalcOnLoad` で開いたときに再計算するが、
@@ -1239,6 +1422,25 @@ mod tests {
         assert_eq!((m.end(3), m.end(6), m.end(7)), (4, 7, 8));
         // 0 件でも 1 行は残る（count は 1）ので、行を消す方向のずれはない
         assert_eq!(map_range("A1:B3", &m, &[]), "A1:B4");
+    }
+
+    #[test]
+    fn sheet_qualified_references_are_shifted_only_for_moved_sheets() {
+        let (m, _) = moves(&[(5, 3)], 12);
+        let moved: std::collections::HashMap<String, Moves> = [
+            ("請求書".to_string(), m),
+            ("Sheet 2".to_string(), moves(&[(2, 2)], 4).0),
+        ]
+        .into();
+        let s = |f: &str| shift_sheet_refs(f, &moved);
+        assert_eq!(s("請求書!$A$1:$C$8"), "請求書!$A$1:$C$10");
+        assert_eq!(s("'請求書'!$B$6"), "'請求書'!$B$8");
+        assert_eq!(s("'Sheet 2'!$1:$3"), "'Sheet 2'!$1:$4"); // 行だけの範囲
+        assert_eq!(s("'請求書'!$A:$C"), "'請求書'!$A:$C"); // 列だけは行がない
+        assert_eq!(s("他!A6+請求書!A6"), "他!A6+請求書!A8"); // 動いていないシートは触らない
+        assert_eq!(s("SUM(請求書!A6:B7)*A6"), "SUM(請求書!A8:B9)*A6"); // 関数の中・シート名なしの参照
+        assert_eq!(s("\"請求書!A6\""), "\"請求書!A6\""); // 文字列リテラル
+        assert_eq!(s("'It''s'!A6"), "'It''s'!A6");
     }
 
     #[test]

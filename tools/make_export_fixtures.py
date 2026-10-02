@@ -217,6 +217,13 @@ def make_nested_xlsx():
     ws["A6"] = "総合計"
     ws["B6"] = "=SUM(B3:B5)"                       # ループを含む範囲 → 広がる
     ws["C6"] = "=C5+1"                              # 後ろの行からの参照
+    # 定義名（印刷範囲・印刷タイトル・名前付き範囲）: ループでずれた行に合わせて直される
+    ws.print_area = "A1:D6"
+    ws.print_title_rows = "1:2"
+    from openpyxl.workbook.defined_name import DefinedName
+    wb.defined_names["合計セル"] = DefinedName("合計セル", attr_text="明細!$B$6")
+    wb.defined_names["グループ"] = DefinedName("グループ", attr_text="明細!$A$3:$C$5")
+    wb.defined_names["別シート"] = DefinedName("別シート", attr_text="Sheet9!$A$6")
     wb.save(OUT / "nested.xlsx")
 
 

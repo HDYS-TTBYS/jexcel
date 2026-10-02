@@ -636,3 +636,35 @@ fn xlsx_nested_loops_shift_rows_formulas_and_merges() {
     let refs: Vec<&str> = merges.iter().map(|m| m.attr("ref").unwrap()).collect();
     assert_eq!(refs, ["C4:D4", "C5:D5", "C8:D8"]);
 }
+
+#[test]
+fn xlsx_defined_names_follow_the_shifted_rows() {
+    let out =
+        render_with(Kind::Xlsx, NESTED_XLSX, &mut Nest::sample()).unwrap_or_else(|e| panic!("{e}"));
+    let wb = part(&out, "xl/workbook.xml");
+    let mut names = vec![];
+    elements(&wb, "definedName", &mut names);
+    let got: BTreeMap<String, String> = names
+        .iter()
+        .map(|n| (n.attr("name").unwrap().to_string(), n.text()))
+        .collect();
+    // 範囲の終わりは最後のコピーまで広がり、1 つの参照は最初のコピーを指す
+    assert_eq!(got["_xlnm.Print_Area"], "'明細'!$A$1:$D$10"); // 引用符つきのシート名
+    assert_eq!(got["合計セル"], "明細!$B$10"); // 6 行目（合計）は 10 行目へ
+    assert_eq!(got["グループ"], "明細!$A$3:$C$9");
+    // ループより前の行だけの範囲（印刷タイトル）と、ほかのシートへの参照は変わらない
+    assert_eq!(got["_xlnm.Print_Titles"], "'明細'!$1:$2");
+    assert_eq!(got["別シート"], "Sheet9!$A$6");
+
+    // ループのないテンプレートの定義名は触らない
+    let out = render_with(Kind::Xlsx, XLSX, &mut Fake::new(items(1))).unwrap();
+    let before = part(XLSX, "xl/workbook.xml");
+    let after = part(&out, "xl/workbook.xml");
+    let (mut a, mut b) = (vec![], vec![]);
+    elements(&before, "definedName", &mut a);
+    elements(&after, "definedName", &mut b);
+    assert_eq!(
+        a.iter().map(|n| n.text()).collect::<Vec<_>>(),
+        b.iter().map(|n| n.text()).collect::<Vec<_>>()
+    );
+}
