@@ -1783,7 +1783,34 @@ fn fix_references(root: &mut Element, moves: &Moves, name: Option<&str>) {
                 }
             }
             "mergeCells" => merge_cells(e, moves),
+            "extLst" => shift_extension(e, name, moves),
             _ => {}
+        }
+    }
+}
+
+/// 拡張領域（`<extLst>`。`x14` の条件付き書式・入力規則・スパークライン）の、範囲（`<xm:sqref>`）と式（`<xm:f>`）をずらす。
+fn shift_extension(e: &mut Element, name: Option<&str>, moves: &Moves) {
+    for n in &mut e.children {
+        let Node::Element(c) = n else { continue };
+        match c.local() {
+            "sqref" => {
+                let text = c.text();
+                let mapped: Vec<String> = text
+                    .split_whitespace()
+                    .map(|r| map_range(r, moves, &[]))
+                    .collect();
+                if !mapped.is_empty() {
+                    c.set_text(&mapped.join(" "));
+                }
+            }
+            "f" => {
+                let text = c.text();
+                if !text.is_empty() {
+                    c.set_text(&shift_formula(&text, name, moves, &[]));
+                }
+            }
+            _ => shift_extension(c, name, moves),
         }
     }
 }

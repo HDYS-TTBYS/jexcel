@@ -1111,3 +1111,75 @@ fn xlsx_three_d_references_are_shifted_or_rejected() {
         "SUM(明細:明細!B10)"
     );
 }
+
+/// `x14` の拡張領域（条件付き書式・入力規則・スパークライン）を持つ `<extLst>`。`f` はその中の式。
+fn x14_ext(f: &str, sqref: &str) -> String {
+    format!(
+        concat!(
+            "<extLst><ext uri=\"{{78C0D931-6437-407d-A8EE-F0AAD7539E65}}\" ",
+            "xmlns:x14=\"http://schemas.microsoft.com/office/spreadsheetml/2009/9/main\" ",
+            "xmlns:xm=\"http://schemas.microsoft.com/office/excel/2006/main\">",
+            "<x14:conditionalFormattings><x14:conditionalFormatting>",
+            "<x14:cfRule type=\"expression\" priority=\"2\"><xm:f>{f}</xm:f></x14:cfRule>",
+            "<xm:sqref>{sqref}</xm:sqref></x14:conditionalFormatting></x14:conditionalFormattings>",
+            "<x14:sparklineGroups><x14:sparklineGroup><x14:sparklines><x14:sparkline>",
+            "<xm:f>{f}</xm:f><xm:sqref>A6</xm:sqref></x14:sparkline></x14:sparklines></x14:sparklineGroup></x14:sparklineGroups>",
+            "</ext></extLst>"
+        ),
+        f = f,
+        sqref = sqref
+    )
+}
+
+#[test]
+fn xlsx_extension_formulas_and_ranges_follow_the_shifted_rows() {
+    let mut pkg = Package::read(&nested_xlsx_with_other_references()).unwrap();
+    let edit = |pkg: &mut Package, name: &str, f: &dyn Fn(String) -> String| {
+        let text = String::from_utf8(pkg.get(name).unwrap().to_vec()).unwrap();
+        pkg.set(name, f(text).into_bytes());
+    };
+    // このシート: 自分を指す式（名前なしと、名前つき）と、範囲
+    edit(&mut pkg, "xl/worksheets/sheet1.xml", &|t| {
+        t.replace(
+            "</worksheet>",
+            &format!("{}</worksheet>", x14_ext("$B$6&gt;5+明細!$B$6", "B3:B6")),
+        )
+    });
+    // 別のシート: 明細を指す式
+    edit(&mut pkg, "xl/worksheets/sheet2.xml", &|t| {
+        t.replace(
+            "</worksheet>",
+            &format!("{}</worksheet>", x14_ext("明細!$B$6&gt;1", "A1")),
+        )
+    });
+    let out = render_with(Kind::Xlsx, &pkg.write().unwrap(), &mut Nest::sample())
+        .unwrap_or_else(|e| panic!("{e}"));
+
+    fn xm(el: &Element, local: &str, out: &mut Vec<String>) {
+        for c in &el.children {
+            if let Node::Element(e) = c {
+                if e.name == format!("xm:{local}") {
+                    out.push(e.text());
+                }
+                xm(e, local, out);
+            }
+        }
+    }
+    let get = |name: &str, local: &str| {
+        let mut v = vec![];
+        xm(&part(&out, name), local, &mut v);
+        v
+    };
+    // このシート（総合計の行 6 → 10。範囲は最後のコピーまで）。名前つきの自分への参照も同じ
+    assert_eq!(
+        get("xl/worksheets/sheet1.xml", "f"),
+        ["$B$10>5+明細!$B$10", "$B$10>5+明細!$B$10"]
+    );
+    assert_eq!(get("xl/worksheets/sheet1.xml", "sqref"), ["B3:B10", "A10"]);
+    // 別のシートの拡張領域は、ほかのシートへの参照だけがずれる（範囲はそのシート自身のもの）
+    assert_eq!(
+        get("xl/worksheets/sheet2.xml", "f"),
+        ["明細!$B$10>1", "明細!$B$10>1"]
+    );
+    assert_eq!(get("xl/worksheets/sheet2.xml", "sqref"), ["A1", "A6"]);
+}
