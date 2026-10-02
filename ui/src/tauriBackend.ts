@@ -4,21 +4,39 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { FILE_FILTER, TEMPLATE_FILTER, type Backend } from "./backend";
 
+/**
+ * e2e 用: OS のファイルダイアログは WebDriver から操作できないので、`window.__jxcelDialog` に
+ * 関数（種類 → パスか null）が入っていれば、ダイアログの代わりにそれを使う。
+ * Tauri の IPC（`__TAURI_INTERNALS__`）は凍結されていて、外から差し替えられないため。
+ */
+type DialogHook = (kind: "open" | "template" | "folder" | "save") => string | null;
+const hook = (): DialogHook | undefined => (window as unknown as { __jxcelDialog?: DialogHook }).__jxcelDialog;
+
 // Rust 側コマンドの引数名は snake_case だが、Tauri が camelCase のキーで受け付ける。
 export const tauriBackend: Backend = {
   pickOpenPath: async () => {
+    const h = hook();
+    if (h) return h("open");
     const p = await open({ multiple: false, filters: [FILE_FILTER] });
     return typeof p === "string" ? p : null;
   },
   pickTemplatePath: async () => {
+    const h = hook();
+    if (h) return h("template");
     const p = await open({ multiple: false, filters: [TEMPLATE_FILTER] });
     return typeof p === "string" ? p : null;
   },
   pickFolder: async () => {
+    const h = hook();
+    if (h) return h("folder");
     const p = await open({ directory: true, multiple: false });
     return typeof p === "string" ? p : null;
   },
-  pickSavePath: (defaultName) => save({ defaultPath: defaultName, filters: [FILE_FILTER] }),
+  pickSavePath: async (defaultName) => {
+    const h = hook();
+    if (h) return h("save");
+    return save({ defaultPath: defaultName, filters: [FILE_FILTER] });
+  },
 
   newFile: (name) => invoke("new_file", { name }),
   openFile: (path) => invoke("open_file", { path }),

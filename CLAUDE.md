@@ -31,7 +31,9 @@ pnpm --dir ui e2e            # Playwright の e2e（vite の dev サーバを自
 pnpm --dir ui e2e -- guard   # 単一ファイルの絞り込み
 ```
 
-e2e（`ui/e2e/*.e2e.mjs`）は、ブラウザ単体（モックバックエンド）の UI を実際の Chromium で操作して確かめる。Vitest の対象から外すため `.e2e.mjs` という名前にしてある（`playwright.config.mjs` の `testMatch`）。Playwright 管理外の Chromium を使うときは `PW_CHROMIUM` に実行ファイルのパスを入れる（Playwright は 1.56 に固定していて、ブラウザのリビジョンが合う必要がある）。`form-page.e2e.mjs` は本物の Rust のサーバーを使うので、先に `cargo build -p jxcel-app --example serve_forms` が要る（CI では必須、ローカルで無ければスキップ）。CI の `e2e` ジョブが同じことを行い、失敗時は `playwright-report` を成果物に残す。Tauri の実ウィンドウ（ファイルダイアログや OS 連携）は対象外。
+e2e（`ui/e2e/*.e2e.mjs`）は、ブラウザ単体（モックバックエンド）の UI を実際の Chromium で操作して確かめる。Vitest の対象から外すため `.e2e.mjs` という名前にしてある（`playwright.config.mjs` の `testMatch`）。Playwright 管理外の Chromium を使うときは `PW_CHROMIUM` に実行ファイルのパスを入れる（Playwright は 1.56 に固定していて、ブラウザのリビジョンが合う必要がある）。`form-page.e2e.mjs` は本物の Rust のサーバーを使うので、先に `cargo build -p jxcel-app --example serve_forms` が要る（CI では必須、ローカルで無ければスキップ）。CI の `e2e` ジョブが同じことを行い、失敗時は `playwright-report` を成果物に残す。Tauri の実ウィンドウは次の別系統で確かめる。
+
+実ウィンドウの e2e（`ui/e2e-tauri/app.test.mjs`、Linux のみ）: `tauri-driver`（`cargo install tauri-driver --locked`）+ `WebKitWebDriver`（apt の `webkit2gtk-driver`）で、本物の Tauri アプリ（WebKitGTK）を WebDriver で操作する。先に `pnpm tauri build --debug --no-bundle`（ルートから。UI を埋め込んだデバッグ版が `src-tauri/target/debug/jxcel` に出る）、ディスプレイが無ければ `xvfb-run -a pnpm --dir ui e2e:tauri`。本物の IPC・`Session`・zip 保存・フォーム配信のスレッド・`jxcel://changed` イベントを通す（新規 → IPC でデータ作成・保存 → 「開く」→ フォームへ別クライアントから回答して UI に反映 → 履歴 → 未保存警告）。**OS のファイルダイアログは自動操作できず、Tauri の IPC（`__TAURI_INTERNALS__`）は凍結されていて差し替えられない**ので、`tauriBackend.ts` のテスト用フック `window.__jxcelDialog`（種類 → パスか null）で代用する（モックの `__mockSubmit` と同じ位置づけ。本物のダイアログ自体は未検証）。WebDriver の「ウィンドウを閉じる」はアプリを直接終了させ `onCloseRequested` を通らないので、終了前の確認はブラウザ単体の e2e（`guard`）で見る。CI は `tauri-e2e` ジョブ。
 
 Tauri アプリ（`src-tauri/`。**必ずリポジトリルートから**実行する。CLI は cwd 配下の `tauri.conf.json` を探す。ルートの `tauri` スクリプトは Windows の cmd でも動くよう、`.bin/` ではなく `node …/tauri.js` で呼んでいる）:
 

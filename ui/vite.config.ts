@@ -7,5 +7,5 @@ export default defineConfig({
   clearScreen: false,
   // モックが crates/jxcel-macro の prelude.js を ?raw で読むので、一つ上の階層まで許可する
   server: { port: 1420, strictPort: true, fs: { allow: [".."] } },
-  test: { environment: "node" },
+  test: { environment: "node", exclude: ["**/node_modules/**", "e2e-tauri/**"] },
 });
