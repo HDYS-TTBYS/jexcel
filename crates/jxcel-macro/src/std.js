@@ -91,6 +91,33 @@
     ["明治", 1868, 1, 25],
   ];
 
+  // 日時 "YYYY-MM-DDTHH:MM:SS[.fff][Z|±HH:MM]"（オフセットは省略可）。時刻は書かれたままで、タイムゾーンの変換はしない
+  function parseDateTime(s) {
+    const [y, mo, d] = parseDate(s);
+    const m = /^\d{4}-\d{2}-\d{2}[Tt ](\d{2}):(\d{2})(?::(\d{2}))?(\.\d+)?(Z|z|[+-]\d{2}:\d{2})?$/.exec(s);
+    if (!m) throw new Error("日時ではありません: " + JSON.stringify(s));
+    const [hh, mi, ss] = [Number(m[1]), Number(m[2]), Number(m[3] || 0)];
+    if (hh > 23 || mi > 59 || ss > 59) throw new Error("存在しない時刻です: " + s);
+    let off = null;
+    if (m[5]) off = /^[Zz]$/.test(m[5]) ? 0 : (m[5][0] === "-" ? -1 : 1) * (Number(m[5].slice(1, 3)) * 60 + Number(m[5].slice(4, 6)));
+    return { y, mo, d, hh, mi, ss, frac: m[4] || "", off };
+  }
+  // オフセット（分）の引数: 数値（分）・"Z"・"+09:00"
+  function offsetArg(o) {
+    if (typeof o === "number" && Number.isInteger(o) && Math.abs(o) < 24 * 60) return o;
+    if (typeof o === "string") {
+      if (/^[Zz]$/.test(o)) return 0;
+      const m = /^([+-])(\d{2}):(\d{2})$/.exec(o);
+      if (m && Number(m[2]) < 24 && Number(m[3]) < 60) return (m[1] === "-" ? -1 : 1) * (Number(m[2]) * 60 + Number(m[3]));
+    }
+    throw new Error("オフセットは \"+09:00\"・\"Z\"・分（540 など）で指定してください: " + JSON.stringify(o));
+  }
+  function fmtOffset(min, z) {
+    if (min === 0 && z) return "Z";
+    const a = Math.abs(min);
+    return (min < 0 ? "-" : "+") + pad2(Math.floor(a / 60)) + ":" + pad2(a % 60);
+  }
+
   const date = {
     today() {
       const t = new Date();
@@ -169,12 +196,38 @@
       }
       return sign * count;
     },
-    /** 書式: YYYY YY MM M DD D ddd（曜日 1 文字）。例: "YYYY年M月D日(ddd)" */
+    /** 書式: YYYY YY MM M DD D ddd（曜日 1 文字）、日時なら HH mm ss。例: "YYYY年M月D日(ddd) HH:mm" */
     format(s, pattern) {
       if (isNil(s)) return null;
       const [y, m, d] = parseDate(s);
       const map = { YYYY: String(y).padStart(4, "0"), YY: String(y).slice(-2), MM: pad2(m), M: String(m), DD: pad2(d), D: String(d), ddd: WEEK[weekday(s)] };
-      return pattern.replace(/YYYY|YY|MM|M|DD|D|ddd/g, (t) => map[t]);
+      if (/HH|mm|ss/.test(pattern)) {
+        const t = parseDateTime(s);
+        Object.assign(map, { HH: pad2(t.hh), mm: pad2(t.mi), ss: pad2(t.ss) });
+      }
+      return pattern.replace(/YYYY|YY|MM|M|DD|D|ddd|HH|mm|ss/g, (t) => map[t]);
+    },
+    /** 現在の日時（実行した環境のタイムゾーンのオフセット付き。例: "2024-01-31T10:30:00+09:00"） */
+    now() {
+      const t = new Date();
+      const off = -t.getTimezoneOffset();
+      return fmtDate(t.getFullYear(), t.getMonth() + 1, t.getDate()) + "T" + pad2(t.getHours()) + ":" + pad2(t.getMinutes()) + ":" + pad2(t.getSeconds()) + fmtOffset(off, false);
+    },
+    /** 日時のオフセット（分。"Z" と "+00:00" は 0、東京は 540）。オフセットのない日時は null */
+    offsetMinutes(s) {
+      return isNil(s) ? null : parseDateTime(s).off;
+    },
+    /** 同じ時刻を、別のタイムゾーンのオフセットで表した日時にする。例: toOffset("2024-01-31T01:30:00Z", "+09:00") → "2024-01-31T10:30:00+09:00"。元にオフセットがない日時は変換できず例外 */
+    toOffset(s, offset) {
+      if (isNil(s)) return null;
+      const t = parseDateTime(s);
+      const to = offsetArg(offset);
+      if (t.off === null) throw new Error("オフセットのない日時は変換できません: " + s);
+      const secs = toDays(t.y, t.mo, t.d) * 86400 + t.hh * 3600 + t.mi * 60 + t.ss - t.off * 60 + to * 60;
+      const z = Math.floor(secs / 86400);
+      const r = secs - z * 86400;
+      const zulu = typeof offset === "string" && /^[Zz]$/.test(offset);
+      return dateOf(z) + "T" + pad2(Math.floor(r / 3600)) + ":" + pad2(Math.floor((r % 3600) / 60)) + ":" + pad2(r % 60) + t.frac + fmtOffset(to, zulu);
     },
     /** 和暦。例: "令和6年1月31日"（1 年は「元年」） */
     toWareki(s) {

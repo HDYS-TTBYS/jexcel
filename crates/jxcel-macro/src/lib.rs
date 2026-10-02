@@ -1292,6 +1292,95 @@ mod tests {
     }
 
     #[test]
+    fn std_datetime_offsets() {
+        check_table(
+            &sample(),
+            &[
+                // 同じ時刻を別のオフセットで表す（日付をまたぐ・負のオフセット・小数秒・Z への変換）
+                (
+                    "std.date.toOffset('2024-01-31T01:30:00Z', '+09:00')",
+                    json!("2024-01-31T10:30:00+09:00"),
+                ),
+                (
+                    "std.date.toOffset('2024-01-31T20:00:00Z', '+09:00')",
+                    json!("2024-02-01T05:00:00+09:00"),
+                ),
+                (
+                    "std.date.toOffset('2024-03-01T00:30:00+09:00', 'Z')",
+                    json!("2024-02-29T15:30:00Z"),
+                ),
+                (
+                    "std.date.toOffset('2023-03-01T00:30:00+09:00', '+00:00')",
+                    json!("2023-02-28T15:30:00+00:00"),
+                ),
+                (
+                    "std.date.toOffset('2024-01-01T00:00:00.250+09:00', -300)",
+                    json!("2023-12-31T10:00:00.250-05:00"),
+                ),
+                (
+                    "std.date.toOffset('2024-01-31T10:30:00+05:30', 540)",
+                    json!("2024-01-31T14:00:00+09:00"),
+                ),
+                ("std.date.toOffset(null, '+09:00')", json!(null)),
+                ("std.date.offsetMinutes('2024-01-31T10:30:00+09:00')", json!(540)),
+                ("std.date.offsetMinutes('2024-01-31T10:30:00-03:30')", json!(-210)),
+                ("std.date.offsetMinutes('2024-01-31T10:30:00Z')", json!(0)),
+                ("std.date.offsetMinutes('2024-01-31T10:30:00')", json!(null)),
+                // 日時の書式
+                (
+                    "std.date.format('2024-01-31T09:05:07+09:00', 'YYYY年M月D日(ddd) HH:mm:ss')",
+                    json!("2024年1月31日(水) 09:05:07"),
+                ),
+                (
+                    "std.date.format(std.date.toOffset('2024-01-31T01:30:00Z', '+09:00'), 'HH:mm')",
+                    json!("10:30"),
+                ),
+                (
+                    "/^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}[+-]\\d{2}:\\d{2}$/.test(std.date.now())",
+                    json!(true),
+                ),
+            ],
+        );
+        for (src, want) in [
+            (
+                "std.date.toOffset('2024-01-31T10:30:00', '+09:00')",
+                "オフセットのない",
+            ),
+            (
+                "std.date.toOffset('2024-01-31', '+09:00')",
+                "日時ではありません",
+            ),
+            (
+                "std.date.toOffset('2024-01-31T10:30:00Z', '+9')",
+                "オフセットは",
+            ),
+            (
+                "std.date.toOffset('2024-01-31T10:30:00Z', 2000)",
+                "オフセットは",
+            ),
+            (
+                "std.date.format('2024-01-31', 'HH:mm')",
+                "日時ではありません",
+            ),
+            (
+                "std.date.format('2024-01-31T25:00:00Z', 'HH')",
+                "存在しない時刻",
+            ),
+        ] {
+            let e = run(
+                &format!("export default () => {src}"),
+                &sample(),
+                &Options::default(),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(&e, Error::Runtime(m) if m.contains(want)),
+                "{src}: {e}"
+            );
+        }
+    }
+
+    #[test]
     fn std_decimals_are_exact() {
         check_table(
             &sample(),

@@ -13,7 +13,15 @@ const bin = process.env.SERVE_FORMS_BIN || path.resolve(here, "../../target/debu
 
 test.use({ viewport: { width: 390, height: 844 } });
 
-test("フォーム配信: 回答者の画面から送信できる", async ({ page: p }) => {
+// 回答者の端末のタイムゾーンで入力した時刻が、そのオフセット付きで残る（10 月 2 日: 東京は +09:00、ニューヨークは夏時間で -04:00）
+for (const [timezoneId, offset] of [["Asia/Tokyo", "+09:00"], ["America/New_York", "-04:00"]]) {
+  test.describe(timezoneId, () => {
+    test.use({ timezoneId });
+    test(`フォーム配信: 回答者の画面から送信できる（${timezoneId}）`, async ({ page }) => runFormPage(page, offset));
+  });
+}
+
+async function runFormPage(p, offset) {
   // CI では必ず実行する（実行ファイルが無ければ、起動に失敗してテストが落ちる）
   test.skip(!existsSync(bin) && !process.env.CI, `${bin} がありません（cargo build -p jxcel-app --example serve_forms）`);
 
@@ -69,8 +77,7 @@ test("フォーム配信: 回答者の画面から送信できる", async ({ pag
     check("1 行追加された", rows.length === 1);
     const r = rows[0];
     check("値が列の型で入る", r.name === "山田 太郎" && r.people === 4 && r.price === "12000.50" && r.kind === "法人" && r.day === "2026-10-02" && r.memo === true, JSON.stringify(r));
-    const expectedAt = await p.evaluate(() => new Date("2026-10-02T10:30").toISOString());
-    check("日時はブラウザの時刻から UTC に直る", r.at === expectedAt, `${r.at} vs ${expectedAt}`);
+    check("日時は入力した時刻のまま、端末のオフセット付きで残る", r.at === `2026-10-02T10:30:00${offset}`, r.at);
     check("送信後に入力欄が空になる", (await p.locator("label", { hasText: "氏名" }).locator("input").inputValue()) === "");
 
     // トークンが違えば、フォームの存在も分からない
@@ -82,4 +89,4 @@ test("フォーム配信: 回答者の画面から送信できる", async ({ pag
     srv.stdin.write("\n");
     setTimeout(() => srv.kill(), 1000).unref();
   }
-});
+}

@@ -100,10 +100,14 @@ function collect() {
     const v = el.value.trim();
     if (v === "") continue;
     if (f.kind === "dateTime") {
-      // ブラウザの入力にはタイムゾーンが無いので、この端末の時刻として UTC に直す
+      // ブラウザの入力にはタイムゾーンが無いので、この端末のタイムゾーンのオフセット（その日時の時点のもの）を付けて送る。
+      // 例: 日本の端末で 10:30 と入力 → "2026-10-02T10:30:00+09:00"。回答者が入力したとおりの時刻が残る
       const d = new Date(v);
       if (isNaN(d.getTime())) throw new Error(f.label + ": 日時が正しくありません");
-      values[f.id] = d.toISOString();
+      const min = -d.getTimezoneOffset();
+      const a = Math.abs(min);
+      const off = (min < 0 ? "-" : "+") + String(Math.floor(a / 60)).padStart(2, "0") + ":" + String(a % 60).padStart(2, "0");
+      values[f.id] = (v.length === 16 ? v + ":00" : v) + off;
     } else values[f.id] = v;
   }
   return values;

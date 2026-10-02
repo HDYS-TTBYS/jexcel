@@ -80,8 +80,18 @@ interface JxcelStdDate {
   addWorkdays(date: string | null, n: number, holidays?: string[]): string | null;
   /** 始点と終点を含む営業日数（a が b より後なら負） */
   workdaysBetween(a: string | null, b: string | null, holidays?: string[]): number | null;
-  /** 書式: YYYY YY MM M DD D ddd（曜日 1 文字）。例: format(d, "YYYY年M月D日(ddd)") → "2024年1月31日(水)" */
+  /** 書式: YYYY YY MM M DD D ddd（曜日 1 文字）、日時なら HH mm ss。例: format(d, "YYYY年M月D日(ddd) HH:mm") → "2024年1月31日(水) 10:30"。日時の時刻は書かれたまま（タイムゾーンの変換はしません） */
   format(date: string | null, pattern: string): string | null;
+  /** 現在の日時（実行した環境のタイムゾーンのオフセット付き）。例: "2024-01-31T10:30:00+09:00"。計算列で使うと、開くたびに結果が変わります */
+  now(): string;
+  /** 日時のオフセット（分。"Z" は 0、東京は 540）。オフセットのない日時は null */
+  offsetMinutes(datetime: string | null): number | null;
+  /**
+   * 同じ時刻を、別のタイムゾーンのオフセットで表した日時にします。
+   * 例: toOffset("2024-01-31T01:30:00Z", "+09:00") → "2024-01-31T10:30:00+09:00"。
+   * offset は "+09:00"・"Z"・分（540）。元の日時にオフセットがないと例外です。
+   */
+  toOffset(datetime: string | null, offset: string | number): string | null;
   /** 和暦。例: "令和6年1月31日"（1 年は「元年」）。明治より前は例外 */
   toWareki(date: string | null): string | null;
 }
