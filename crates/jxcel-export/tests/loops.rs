@@ -1043,6 +1043,12 @@ fn xlsx_rules_charts_and_row_ranges_follow_the_shifted_rows() {
             "<xdr:twoCellAnchor><xdr:from><xdr:col>0</xdr:col><xdr:row>2</xdr:row></xdr:from><xdr:to><xdr:col>2</xdr:col><xdr:row>4</xdr:row></xdr:to></xdr:twoCellAnchor>",
             // ループより前（1 行目）は動かない
             "<xdr:oneCellAnchor><xdr:from><xdr:col>0</xdr:col><xdr:row>0</xdr:row></xdr:from></xdr:oneCellAnchor>",
+            // 絶対位置（EMU。行の高さは既定の 15pt = 190500）の図。1 つ目: 3〜5 行目に掛かる（y は 3 行目の上端）
+            "<xdr:absoluteAnchor><xdr:pos x=\"0\" y=\"381000\"/><xdr:ext cx=\"100\" cy=\"571500\"/></xdr:absoluteAnchor>",
+            // 2 つ目: 総合計の行（6 行目）の中ほどから 1 行分
+            "<xdr:absoluteAnchor><xdr:pos x=\"0\" y=\"965200\"/><xdr:ext cx=\"100\" cy=\"190500\"/></xdr:absoluteAnchor>",
+            // 3 つ目: ループより前（1 行目）は動かない
+            "<xdr:absoluteAnchor><xdr:pos x=\"0\" y=\"0\"/><xdr:ext cx=\"100\" cy=\"190500\"/></xdr:absoluteAnchor>",
             "</xdr:wsDr>"
         )
         .as_bytes()
@@ -1071,6 +1077,20 @@ fn xlsx_rules_charts_and_row_ranges_follow_the_shifted_rows() {
         formulas_of(&out, "xl/worksheets/sheet2.xml")["A2"],
         "SUM(明細!3:9)"
     );
+    // 図形・グラフの置き場所（行は 0 から数える。2 つ目の twoCellAnchor の終わりは最後のコピーまで）
+    assert_eq!(
+        texts("xl/drawings/drawing1.xml", "row"),
+        ["9", "2", "8", "0"]
+    );
+    let drawing = part(&out, "xl/drawings/drawing1.xml");
+    let (mut pos, mut ext) = (vec![], vec![]);
+    elements(&drawing, "pos", &mut pos);
+    elements(&drawing, "ext", &mut ext);
+    let y: Vec<&str> = pos.iter().map(|p| p.attr("y").unwrap()).collect();
+    let cy: Vec<&str> = ext.iter().map(|x| x.attr("cy").unwrap()).collect();
+    // 1 つ目は 3〜9 行目（7 行分 = 1333500）に伸びる。2 つ目は最初のコピー（10 行目）の同じ位置へ。3 つ目は動かない
+    assert_eq!(y, ["381000", "1727200", "0"]);
+    assert_eq!(cy, ["1333500", "190500", "190500"]);
     // グラフ
     assert_eq!(
         texts("xl/charts/chart1.xml", "f"),

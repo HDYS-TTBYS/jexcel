@@ -366,6 +366,10 @@ pub fn excel_serial(s: &str, date1904: bool) -> Option<String> {
 fn sheet(root: &mut Element, ctx: &mut Ctx, moved: &mut Option<Moves>) -> Result<bool> {
     let mut changed = false;
     let mut moves = Moves::default();
+    moves.default_height = child(root, "sheetFormatPr")
+        .and_then(|f| f.attr("defaultRowHeight"))
+        .and_then(|h| h.parse().ok())
+        .unwrap_or(15.0);
     if let Some(sd) = child_mut(root, "sheetData") {
         changed |= sheet_data(sd, ctx, &mut moves)?;
     }
@@ -495,12 +499,85 @@ fn resolve_part_path(dir: &str, target: &str) -> String {
     parts.join("/")
 }
 
+/// 行（`<row>`）の高さ（ポイント）。非表示の行は 0。指定がなければ既定。
+fn row_height(row: &Element, default: f64) -> f64 {
+    if matches!(row.attr("hidden"), Some("1" | "true")) {
+        return 0.0;
+    }
+    row.attr("ht")
+        .and_then(|h| h.parse().ok())
+        .unwrap_or(default)
+}
+
+const EMU_PER_POINT: f64 = 12700.0;
+
+/// 先頭から数えた `row`（1 から）の上端の位置（EMU）。表の外（最後の行より後ろ）は既定の高さで数える。
+fn row_top(heights: &[f64], default: f64, row: u32) -> f64 {
+    let n = (row as usize).saturating_sub(1);
+    let known: f64 = heights.iter().take(n).sum();
+    let extra = n.saturating_sub(heights.len()) as f64 * default;
+    (known + extra) * EMU_PER_POINT
+}
+
+/// 位置 `y`（EMU）がある行（1 から）と、その行の上端からの距離（EMU）。高さ 0 の行は飛ばす。
+fn row_at(heights: &[f64], default: f64, y: f64) -> (u32, f64) {
+    let mut top = 0.0;
+    let mut row = 1u32;
+    loop {
+        let h = heights.get(row as usize - 1).copied().unwrap_or(default) * EMU_PER_POINT;
+        if y < top + h || (h <= 0.0 && heights.get(row as usize - 1).is_none()) {
+            return (row, y - top);
+        }
+        top += h;
+        row += 1;
+    }
+}
+
+/// `<xdr:absoluteAnchor>`（シートの左上からの絶対位置）を、行がずれたことに合わせて動かす。位置を行の高さから行に
+/// 引き当て、上端は最初のコピー、下端は最後のコピーの行に写す（ループを含む範囲に掛かる図は伸びる）。
+fn shift_absolute_anchor(e: &mut Element, moves: &Moves) -> bool {
+    let attr = |el: &Element, name: &str| el.attr(name).and_then(|v| v.parse::<f64>().ok());
+    let (Some(y), Some(cy)) = (
+        child(e, "pos").and_then(|p| attr(p, "y")),
+        child(e, "ext").and_then(|x| attr(x, "cy")),
+    ) else {
+        return false;
+    };
+    let d = moves.default_height;
+    let (r0, off0) = row_at(&moves.heights, d, y);
+    // 下端がちょうど行の上端なら、その上の行の下端として扱う（ループの先頭の行に掛かって伸びすぎないように）
+    let (r1, off1) = {
+        let (r, off) = row_at(&moves.heights, d, y + cy);
+        if off <= 0.0 && r > 1 {
+            let h = moves.heights.get(r as usize - 2).copied().unwrap_or(d) * EMU_PER_POINT;
+            (r - 1, h)
+        } else {
+            (r, off)
+        }
+    };
+    let top = row_top(&moves.new_heights, d, moves.point(r0)) + off0;
+    let bottom = row_top(&moves.new_heights, d, moves.end(r1)) + off1;
+    let (new_y, new_cy) = (top.round(), (bottom - top).max(0.0).round());
+    if new_y == y && new_cy == cy {
+        return false;
+    }
+    if let Some(p) = child_mut(e, "pos") {
+        p.set_attr("y", &format!("{new_y:.0}"));
+    }
+    if let Some(x) = child_mut(e, "ext") {
+        x.set_attr("cy", &format!("{new_cy:.0}"));
+    }
+    true
+}
+
 /// `<xdr:from><xdr:row>`・`<xdr:to><xdr:row>`（0 から数える行）を動かす。変えたら true。
 fn shift_anchor_rows(el: &mut Element, moves: &Moves) -> bool {
     let mut changed = false;
     for n in &mut el.children {
         let Node::Element(e) = n else { continue };
-        if matches!(e.local(), "from" | "to") {
+        if e.local() == "absoluteAnchor" {
+            changed |= shift_absolute_anchor(e, moves);
+        } else if matches!(e.local(), "from" | "to") {
             let is_to = e.local() == "to";
             for m in &mut e.children {
                 let Node::Element(r) = m else { continue };
@@ -922,6 +999,11 @@ struct Moves {
     owns: Vec<Own>,
     /// 繰り返しの範囲（ループの番号, 先頭の行, 末尾の行）
     blocks: Vec<(usize, u32, u32)>,
+    /// 行の高さ（ポイント）。元の行（添字は行番号 - 1）と、ずらしたあとの行。絶対位置の図を動かすのに使う
+    heights: Vec<f64>,
+    new_heights: Vec<f64>,
+    /// 行の既定の高さ（ポイント）
+    default_height: f64,
 }
 
 /// 繰り返しの 1 回分。範囲の各行（元の行番号 `lo`〜`hi`）の、この回での新しい行番号（最初, 最後）。
@@ -1081,6 +1163,8 @@ impl Layout<'_, '_> {
                 x = b.hi + 1;
             } else {
                 self.record(x, chain);
+                let h = self.moves.heights[x as usize - 1];
+                self.moves.new_heights.push(h);
                 if let Some(&orig) = self.exists.get(&x) {
                     self.placed.push(Placed {
                         orig,
@@ -1178,6 +1262,10 @@ fn sheet_data(sd: &mut Element, ctx: &mut Ctx, moves: &mut Moves) -> Result<bool
     let max = *nums.last().expect("ループがあれば行がある");
     moves.first = vec![0; max as usize];
     moves.last = vec![0; max as usize];
+    moves.heights = vec![moves.default_height; max as usize];
+    for (row, &n) in rows.iter().zip(&nums) {
+        moves.heights[n as usize - 1] = row_height(row, moves.default_height);
+    }
     flatten(&rblocks, &mut moves.blocks);
     let exists: std::collections::HashMap<u32, usize> =
         nums.iter().enumerate().map(|(i, &r)| (r, i)).collect();
@@ -2200,5 +2288,18 @@ mod tests {
         assert_eq!(t("'Sheet 5:Sheet 5'!A6"), "'Sheet 5:Sheet 5'!A8");
         assert_eq!(t("\"A:C!A6\""), "\"A:C!A6\"");
         assert_eq!(t("'Sheet 5'!A6"), "'Sheet 5'!A8");
+    }
+
+    #[test]
+    fn row_positions_account_for_heights_hidden_rows_and_the_default_beyond() {
+        let h = [15.0, 30.0, 0.0, 15.0];
+        let e = EMU_PER_POINT;
+        assert_eq!(row_top(&h, 15.0, 1), 0.0);
+        assert_eq!(row_top(&h, 15.0, 3), 45.0 * e);
+        assert_eq!(row_top(&h, 15.0, 4), 45.0 * e); // 高さ 0 の行は幅を取らない
+        assert_eq!(row_top(&h, 15.0, 7), (60.0 + 30.0) * e); // 最後の行より後ろは既定の高さ
+        assert_eq!(row_at(&h, 15.0, 20.0 * e), (2, 5.0 * e));
+        assert_eq!(row_at(&h, 15.0, 45.0 * e), (4, 0.0)); // 高さ 0 の行（3）は飛ばす
+        assert_eq!(row_at(&h, 15.0, 70.0 * e), (5, 10.0 * e));
     }
 }
