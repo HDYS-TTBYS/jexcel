@@ -101,6 +101,8 @@ pub fn process(pkg: &mut Package, src: &mut dyn Source) -> Result<()> {
     // 行がずれたシートの記録（シート名 → 記録）。定義名の参照をずらすのに使う
     let mut moved = Moved::new(sheet_order(pkg)?);
     let mut any = false;
+    // 差し込みで書き換えたシートの名前（ピボットテーブルの元データの更新に使う）
+    let mut changed_sheets: std::collections::HashSet<String> = Default::default();
     for name in &sheets {
         let mut doc = xml::parse(pkg.get(name).expect("listed"))?;
         let mut moves = None;
@@ -108,6 +110,9 @@ pub fn process(pkg: &mut Package, src: &mut dyn Source) -> Result<()> {
         if sheet(&mut doc.root, &mut ctx, &mut moves)? {
             pkg.set(name, xml::write(&doc)?);
             any = true;
+            if let Some(n) = names.get(name) {
+                changed_sheets.insert(n.clone());
+            }
         }
         if let (Some(m), Some(sheet_name)) = (moves, names.get(name)) {
             moved.insert(sheet_name.clone(), m);
@@ -129,8 +134,8 @@ pub fn process(pkg: &mut Package, src: &mut dyn Source) -> Result<()> {
             shift_pivot_locations(pkg, part, m)?;
         }
     }
-    if !moved.is_empty() {
-        shift_pivot_sources(pkg, &moved)?;
+    if any {
+        shift_pivot_sources(pkg, &moved, &changed_sheets)?;
     }
     // グラフの系列の参照（`<c:f>Sheet1!$B$2:$B$9</c:f>`）
     if !moved.is_empty() {
@@ -446,10 +451,16 @@ fn shift_pivot_locations(pkg: &mut Package, sheet_part: &str, moves: &Moves) -> 
     Ok(())
 }
 
-/// ピボットテーブルの元データ（`xl/pivotCache/pivotCacheDefinition*.xml` の `<worksheetSource sheet ref>`）が、
-/// 行がずれたシートの範囲なら、範囲をずらす（ループを含めば最後のコピーまで広がる）。
-/// 保存済みのキャッシュは差し込み前のデータなので、開くときに更新させる（`refreshOnLoad`）。
-fn shift_pivot_sources(pkg: &mut Package, moved: &Moved) -> Result<()> {
+/// ピボットテーブルの元データ（`xl/pivotCache/pivotCacheDefinition*.xml` の `<worksheetSource sheet ref>`）について、
+/// - 行がずれたシートの範囲なら、範囲をずらす（ループを含めば最後のコピーまで広がる）
+/// - 差し込みで書き換えたシート（ループのないシートも含む）が元データなら、開くときに更新させる（`refreshOnLoad`）。
+///   保存済みのキャッシュは差し込み前のデータだから
+/// - 元データが表（テーブル）・定義名（`name`）でシートが分からないものは、どこかのシートを書き換えていれば更新させる
+fn shift_pivot_sources(
+    pkg: &mut Package,
+    moved: &Moved,
+    changed: &std::collections::HashSet<String>,
+) -> Result<()> {
     let caches: Vec<String> = pkg
         .names()
         .filter(|n| {
@@ -468,11 +479,19 @@ fn shift_pivot_sources(pkg: &mut Package, moved: &Moved) -> Result<()> {
                 if w.local() != "worksheetSource" {
                     continue;
                 }
-                let Some(m) = w.attr("sheet").and_then(|sheet| moved.get(sheet)) else {
-                    continue;
-                };
-                remap_attr(w, "ref", m);
-                hit = true;
+                match w.attr("sheet").map(String::from) {
+                    Some(sheet) => {
+                        if let Some(m) = moved.get(&sheet) {
+                            remap_attr(w, "ref", m);
+                            hit = true;
+                        }
+                        if changed.contains(&sheet) {
+                            hit = true;
+                        }
+                    }
+                    // 表・定義名が元データ（`name`）。どのシートかは引かないので、書き換えがあれば更新させる
+                    None => hit |= w.attr("name").is_some() && !changed.is_empty(),
+                }
             }
         }
         if hit {

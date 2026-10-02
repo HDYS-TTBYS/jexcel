@@ -1251,3 +1251,52 @@ fn xlsx_pivot_tables_follow_the_shifted_rows_and_refresh_on_load() {
     assert_eq!(w[0].attr("ref"), Some("A2:C5"));
     assert_eq!(c2.attr("refreshOnLoad"), None);
 }
+
+#[test]
+fn xlsx_pivot_caches_refresh_when_a_sheet_without_loops_is_filled_in() {
+    let mut pkg = Package::read(&nested_xlsx_with_other_references()).unwrap();
+    // Sheet2（ループなし）に差し込みの欄を足す。これを元データにするキャッシュと、表名が元データのキャッシュ
+    let text = String::from_utf8(pkg.get("xl/worksheets/sheet2.xml").unwrap().to_vec()).unwrap();
+    pkg.set(
+        "xl/worksheets/sheet2.xml",
+        text.replace(
+            "<row r=\"3\">",
+            "<row r=\"2\"><c r=\"A2\" t=\"inlineStr\"><is><t>{{請求番号}}</t></is></c></row><row r=\"3\">",
+        )
+        .into_bytes(),
+    );
+    let cache = |source: &str| {
+        format!(
+            r#"<pivotCacheDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><cacheSource type="worksheet">{source}</cacheSource></pivotCacheDefinition>"#
+        )
+        .into_bytes()
+    };
+    pkg.set(
+        "xl/pivotCache/pivotCacheDefinition1.xml",
+        cache(r#"<worksheetSource ref="A1:A9" sheet="Sheet2"/>"#),
+    );
+    pkg.set(
+        "xl/pivotCache/pivotCacheDefinition2.xml",
+        cache(r#"<worksheetSource name="売上表"/>"#),
+    );
+    // 差し込みのないシートが元データ
+    pkg.set(
+        "xl/pivotCache/pivotCacheDefinition3.xml",
+        cache(r#"<worksheetSource ref="A1:A9" sheet="Sheet9"/>"#),
+    );
+    let out = render_with(Kind::Xlsx, &pkg.write().unwrap(), &mut Nest::sample())
+        .unwrap_or_else(|e| panic!("{e}"));
+    let refresh = |n: u32| {
+        part(&out, &format!("xl/pivotCache/pivotCacheDefinition{n}.xml"))
+            .attr("refreshOnLoad")
+            .map(String::from)
+    };
+    // 範囲は動かさず（Sheet2 は行がずれない）、開くときに更新させる
+    let c1 = part(&out, "xl/pivotCache/pivotCacheDefinition1.xml");
+    let mut w = vec![];
+    elements(&c1, "worksheetSource", &mut w);
+    assert_eq!(w[0].attr("ref"), Some("A1:A9"));
+    assert_eq!(refresh(1).as_deref(), Some("1"));
+    assert_eq!(refresh(2).as_deref(), Some("1")); // 表名が元データ（どこかを書き換えている）
+    assert_eq!(refresh(3), None); // 書き換えていないシートが元データ
+}
