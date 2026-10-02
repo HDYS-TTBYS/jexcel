@@ -365,11 +365,13 @@ pub fn excel_serial(s: &str, date1904: bool) -> Option<String> {
 
 fn sheet(root: &mut Element, ctx: &mut Ctx, moved: &mut Option<Moves>) -> Result<bool> {
     let mut changed = false;
-    let mut moves = Moves::default();
-    moves.default_height = child(root, "sheetFormatPr")
-        .and_then(|f| f.attr("defaultRowHeight"))
-        .and_then(|h| h.parse().ok())
-        .unwrap_or(15.0);
+    let mut moves = Moves {
+        default_height: child(root, "sheetFormatPr")
+            .and_then(|f| f.attr("defaultRowHeight"))
+            .and_then(|h| h.parse().ok())
+            .unwrap_or(15.0),
+        ..Default::default()
+    };
     if let Some(sd) = child_mut(root, "sheetData") {
         changed |= sheet_data(sd, ctx, &mut moves)?;
     }
