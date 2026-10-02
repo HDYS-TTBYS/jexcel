@@ -5,28 +5,24 @@
 //! 置換後の文字列は欄の最初のランに入れ（書式はそのランのものになる）、残りのランからは欄の部分を取り除く。
 //!
 //! 行ループ: 表の行（`<w:tr>`）のどこかに `{{#each 式}}` と書くと、その行が式の配列の要素の数だけ繰り返される
-//! （印は取り除かれ、行の中の欄は要素ごとに差し込まれる。要素が 0 件ならその行は消える）。ループの入れ子は使えない。
+//! （印は取り除かれ、行の中の欄は要素ごとに差し込まれる。要素が 0 件ならその行は消える）。
+//! 別の行に `{{/each}}` と書くと、その間の行（印の行を含む）がひとまとめに繰り返される。
+//! ループは入れ子にできる（`{{/each}}` を使う形の中に、さらに `{{#each}}`〜`{{/each}}` を書く。
+//! 繰り返す行の中の表の中のループも同じ）。内側の式では外側の要素のキーも使える。
 
 use serde_json::Value;
 
 use crate::package::Package;
 use crate::placeholder::{display, find};
 use crate::xml::{self, Element, Node};
-use crate::{loop_source, Error, Result, Source};
+use crate::{count_blocks, marker, number, parse_blocks, Block, Error, Marker, Result, Source};
 
 type Resolver<'a> = dyn FnMut(&str) -> std::result::Result<Value, String> + 'a;
 
-/// 差し込みの途中経過。ループは文書の出現順に番号を振る。
+/// 差し込みの途中経過。ループは文書の出現順（外側が先）に番号を振る。
 struct Ctx<'a> {
     src: &'a mut dyn Source,
     next_loop: usize,
-}
-
-/// いまの位置: ループの外か、`index` 番目のループの `item` 番目の要素の行の中か。
-#[derive(Clone, Copy)]
-enum Scope {
-    Top,
-    Item { index: usize, item: usize },
 }
 
 /// 差し込みを行う部品（本文・ヘッダー・フッター・脚注）。
@@ -49,7 +45,7 @@ pub fn process(pkg: &mut Package, src: &mut dyn Source) -> Result<()> {
     let mut ctx = Ctx { src, next_loop: 0 };
     for name in names {
         let mut doc = xml::parse(pkg.get(&name).expect("listed"))?;
-        if walk(&mut doc.root, &mut ctx, Scope::Top)? {
+        if walk(&mut doc.root, &mut ctx, &mut vec![])? {
             pkg.set(&name, xml::write(&doc)?);
         }
     }
@@ -63,96 +59,209 @@ fn expr_error(expr: &str, message: impl Into<String>) -> Error {
     }
 }
 
-fn walk(el: &mut Element, ctx: &mut Ctx, scope: Scope) -> Result<bool> {
+/// いまの位置: 外側から順に（ループの番号, 要素の位置）。ループの外なら空。
+type Scope = Vec<(usize, usize)>;
+
+fn path_of(scope: &Scope) -> Vec<usize> {
+    scope.iter().map(|f| f.1).collect()
+}
+
+fn walk(el: &mut Element, ctx: &mut Ctx, scope: &mut Scope) -> Result<bool> {
     let mut changed = false;
     if el.name == "w:p" {
         changed |= paragraph(el, &mut |expr| resolve(ctx, scope, expr))?;
     }
-    let children = std::mem::take(&mut el.children);
-    let mut out = Vec::with_capacity(children.len());
-    for child in children {
-        let Node::Element(mut c) = child else {
-            out.push(child);
-            continue;
-        };
-        let marker = if c.name == "w:tr" {
-            row_marker(&c)?
+    for child in &mut el.children {
+        let Node::Element(c) = child else { continue };
+        if c.name == "w:tbl" {
+            changed |= table(c, ctx, scope)?;
         } else {
-            None
-        };
-        match (marker, scope) {
-            (None, _) => {
-                changed |= walk(&mut c, ctx, scope)?;
-                out.push(Node::Element(c));
-            }
-            (Some(_), Scope::Item { .. }) => {
-                return Err(expr_error(
-                    "#each",
-                    "行ループの中に行ループは書けません（入れ子は未対応です）",
-                ));
-            }
-            (Some(source), Scope::Top) => {
-                let index = ctx.next_loop;
-                ctx.next_loop += 1;
-                let n = ctx
-                    .src
-                    .loop_len(index, &source)
-                    .map_err(|m| expr_error(&format!("#each {source}"), m))?;
-                changed = true;
-                for item in 0..n {
-                    let mut row = c.clone();
-                    walk(&mut row, ctx, Scope::Item { index, item })?;
-                    out.push(Node::Element(row));
-                }
-            }
+            changed |= walk(c, ctx, scope)?;
         }
     }
-    el.children = out;
     Ok(changed)
 }
 
+/// 表。行のループ（1 行ずつの `{{#each}}`、または `{{#each}}`〜`{{/each}}` で囲んだ複数の行）を展開する。
+fn table(tbl: &mut Element, ctx: &mut Ctx, scope: &mut Scope) -> Result<bool> {
+    let children = std::mem::take(&mut tbl.children);
+    // 行ごとに、直前の行以降に出てきた行以外の要素（`tblPr` など）をひとまとめにして持つ
+    let mut rows: Vec<TableRow> = vec![];
+    let mut pending: Vec<Node> = vec![];
+    for child in children {
+        match child {
+            Node::Element(e) if e.name == "w:tr" => rows.push(TableRow {
+                before: std::mem::take(&mut pending),
+                row: e,
+            }),
+            other => pending.push(other),
+        }
+    }
+    let trailing = pending;
+
+    let marks: Vec<Vec<Marker>> = rows
+        .iter()
+        .map(|r| {
+            let mut found = vec![];
+            collect_markers(&r.row, &mut found);
+            found
+        })
+        .collect();
+    let mut blocks = parse_blocks(&marks)?;
+    number(&mut blocks, &mut ctx.next_loop);
+    // この表の行の中にある入れ子の表のループの番号。行を繰り返しても同じ番号になるよう、行ごとに先に確保する
+    let mut cursor = ctx.next_loop;
+    let mut row_base = Vec::with_capacity(rows.len());
+    for r in &rows {
+        row_base.push(cursor);
+        cursor += static_loops(&r.row)?;
+    }
+
+    let mut out: Vec<Node> = vec![];
+    let mut changed = false;
+    if rows.is_empty() {
+        tbl.children = trailing;
+        ctx.next_loop = cursor;
+        return Ok(false);
+    }
+    emit(
+        &Emit {
+            rows: &rows,
+            row_base: &row_base,
+        },
+        (0, rows.len() - 1),
+        &blocks,
+        ctx,
+        scope,
+        &mut out,
+        &mut changed,
+    )?;
+    out.extend(trailing);
+    tbl.children = out;
+    ctx.next_loop = cursor;
+    Ok(changed)
+}
+
+struct TableRow {
+    before: Vec<Node>,
+    row: Element,
+}
+
+struct Emit<'a> {
+    rows: &'a [TableRow],
+    row_base: &'a [usize],
+}
+
+/// 行 `range`（両端を含む）を出力する。`blocks` の範囲は要素の数だけ繰り返し、それ以外の行はそのまま出す。
+fn emit(
+    e: &Emit,
+    range: (usize, usize),
+    blocks: &[Block],
+    ctx: &mut Ctx,
+    scope: &mut Scope,
+    out: &mut Vec<Node>,
+    changed: &mut bool,
+) -> Result<()> {
+    let mut i = range.0;
+    while i <= range.1 {
+        if let Some(b) = blocks.iter().find(|b| b.first == i) {
+            let parent = scope.last().map(|f| f.0);
+            let n = ctx
+                .src
+                .loop_len(b.index, parent, &path_of(scope), &b.source)
+                .map_err(|m| expr_error(&format!("#each {}", b.source), m))?;
+            *changed = true;
+            for item in 0..n {
+                scope.push((b.index, item));
+                let r = emit(e, (b.first, b.last), &b.children, ctx, scope, out, changed);
+                scope.pop();
+                r?;
+            }
+            i = b.last + 1;
+        } else {
+            let r = &e.rows[i];
+            out.extend(r.before.iter().cloned());
+            let mut row = r.row.clone();
+            // 行の中の入れ子の表のループは、何回繰り返しても同じ番号から始める
+            ctx.next_loop = e.row_base[i];
+            *changed |= walk(&mut row, ctx, scope)?;
+            out.push(Node::Element(row));
+            i += 1;
+        }
+    }
+    Ok(())
+}
+
+/// 表（入れ子の表を含む）の中のループの数。番号を静的に振るために使う。
+fn static_loops(el: &Element) -> Result<usize> {
+    let mut n = 0;
+    for c in &el.children {
+        let Node::Element(ce) = c else { continue };
+        if ce.name == "w:tbl" {
+            n += table_loops(ce)?;
+        } else {
+            n += static_loops(ce)?;
+        }
+    }
+    Ok(n)
+}
+
+fn table_loops(tbl: &Element) -> Result<usize> {
+    let rows: Vec<&Element> = tbl
+        .children
+        .iter()
+        .filter_map(|n| match n {
+            Node::Element(e) if e.name == "w:tr" => Some(e),
+            _ => None,
+        })
+        .collect();
+    let marks: Vec<Vec<Marker>> = rows
+        .iter()
+        .map(|r| {
+            let mut found = vec![];
+            collect_markers(r, &mut found);
+            found
+        })
+        .collect();
+    let mut n = count_blocks(&parse_blocks(&marks)?);
+    for r in rows {
+        n += static_loops(r)?;
+    }
+    Ok(n)
+}
+
 /// 欄の式を値にする。ループの印は、繰り返しの中では空文字（印を消す）、外ではエラー。
-fn resolve(ctx: &mut Ctx, scope: Scope, expr: &str) -> std::result::Result<Value, String> {
-    if loop_source(expr).is_some() {
-        return match scope {
-            Scope::Item { .. } => Ok(Value::String(String::new())),
-            Scope::Top => Err("{{#each}} は、表の行の中に書いてください".into()),
+fn resolve(ctx: &mut Ctx, scope: &Scope, expr: &str) -> std::result::Result<Value, String> {
+    if marker(expr).is_some() {
+        return if scope.is_empty() {
+            Err("{{#each}} と {{/each}} は、表の行の中に書いてください".into())
+        } else {
+            Ok(Value::String(String::new()))
         };
     }
-    match scope {
-        Scope::Top => ctx.src.value(expr),
-        Scope::Item { index, item } => ctx.src.item_value(index, item, expr),
+    match scope.last() {
+        None => ctx.src.value(expr),
+        Some(&(index, _)) => ctx.src.item_value(index, &path_of(scope), expr),
     }
 }
 
-/// 行（`<w:tr>`）の中にある `{{#each 式}}` の式。複数あればエラー。
-fn row_marker(tr: &Element) -> Result<Option<String>> {
-    let mut found: Vec<String> = vec![];
-    collect_markers(tr, &mut found);
-    match found.len() {
-        0 => Ok(None),
-        1 => Ok(Some(found.remove(0))),
-        _ => Err(expr_error(
-            "#each",
-            "1 つの行に {{#each}} は 1 つだけ書けます",
-        )),
-    }
-}
-
-fn collect_markers(el: &Element, found: &mut Vec<String>) {
+/// 行（`<w:tr>`）の中にあるループの印（入れ子の表の中は、その表の行として別に扱う）。
+fn collect_markers(el: &Element, found: &mut Vec<Marker>) {
     if el.name == "w:p" {
         let mut paths = vec![];
         collect_t(el, &mut vec![], &mut paths);
         let text: String = paths.iter().map(|p| element_ref(el, p).text()).collect();
         for m in find(&text) {
-            if let Some(src) = loop_source(&m.expr) {
-                found.push(src.to_string());
+            if let Some(mk) = marker(&m.expr) {
+                found.push(mk);
             }
         }
     }
     for c in &el.children {
         if let Node::Element(ce) = c {
-            collect_markers(ce, found);
+            if ce.name != "w:tbl" {
+                collect_markers(ce, found);
+            }
         }
     }
 }

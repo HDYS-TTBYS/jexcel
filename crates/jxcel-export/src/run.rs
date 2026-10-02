@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 
 use jxcel_core::JxcelFile;
-use jxcel_macro::{CellResult, LoopRequest, Options, RowEval};
+use jxcel_macro::{CellResult, ItemEval, LoopRequest, LoopResult, Options, RowEval};
 use serde_json::Value;
 
 use crate::placeholder::{find, replace_all};
@@ -105,6 +105,7 @@ fn evaluate(
         .map(|l| LoopRequest {
             source: l.source.clone(),
             exprs: l.exprs.clone(),
+            parent: l.parent,
         })
         .collect();
     jxcel_macro::evaluate_template(file, spec.sheet, spec.schema, &exprs.list, &loops, opts)
@@ -132,17 +133,22 @@ impl Source for RowSource<'_> {
         self.top(expr)
     }
 
-    fn loop_len(&mut self, index: usize, _: &str) -> std::result::Result<usize, String> {
-        match &self.eval.loops[index] {
-            Ok(items) => Ok(items.len()),
-            Err(e) => Err(e.clone()),
-        }
+    fn loop_len(
+        &mut self,
+        index: usize,
+        _: Option<usize>,
+        path: &[usize],
+        _: &str,
+    ) -> std::result::Result<usize, String> {
+        Ok(self
+            .items(index, &path[..self.plan.chain(index).len() - 1])?
+            .len())
     }
 
     fn item_value(
         &mut self,
         index: usize,
-        item: usize,
+        path: &[usize],
         expr: &str,
     ) -> std::result::Result<Value, String> {
         let pos = self.plan.loops[index]
@@ -150,11 +156,47 @@ impl Source for RowSource<'_> {
             .iter()
             .position(|e| e == expr)
             .ok_or_else(|| format!("評価していない欄です: {expr}"))?;
-        match &self.eval.loops[index] {
-            Ok(items) => cell_to_result(&items[item][pos]),
-            Err(e) => Err(e.clone()),
-        }
+        let depth = path.len() - 1;
+        let item = self
+            .items(index, &path[..depth])?
+            .get(path[depth])
+            .ok_or("要素の位置が範囲外です")?;
+        cell_to_result(&item.values[pos])
     }
+}
+
+impl RowSource<'_> {
+    /// `index` 番目のループの要素の一覧。`outer` は外側のループの要素の位置（外側から順）。
+    fn items(&self, index: usize, outer: &[usize]) -> std::result::Result<&[ItemEval], String> {
+        let chain = self.plan.chain(index);
+        let mut list: &LoopResult = &self.eval.loops[self.plan.sibling_pos(chain[0])];
+        for d in 0..chain.len() {
+            let items = list.as_ref().map_err(Clone::clone)?;
+            if d == chain.len() - 1 {
+                return Ok(items);
+            }
+            let item = items.get(outer[d]).ok_or("要素の位置が範囲外です")?;
+            list = &item.loops[self.plan.sibling_pos(chain[d + 1])];
+        }
+        unreachable!("chain は空でない")
+    }
+}
+
+/// `k` 番目のループの要素数（入れ子のループは、外側の要素すべての合計。どれかが失敗ならそのエラー）。
+fn total_len(eval: &RowEval, plan: &Plan, k: usize) -> std::result::Result<usize, String> {
+    fn walk(list: &LoopResult, chain: &[usize], plan: &Plan) -> std::result::Result<usize, String> {
+        let items = list.as_ref().map_err(Clone::clone)?;
+        if chain.len() == 1 {
+            return Ok(items.len());
+        }
+        let mut n = 0;
+        for it in items {
+            n += walk(&it.loops[plan.sibling_pos(chain[1])], &chain[1..], plan)?;
+        }
+        Ok(n)
+    }
+    let chain = plan.chain(k);
+    walk(&eval.loops[plan.sibling_pos(chain[0])], &chain, plan)
 }
 
 fn cell_to_result(c: &CellResult) -> std::result::Result<Value, String> {
@@ -317,9 +359,11 @@ pub struct PreviewRow {
 pub struct PreviewLoop {
     /// `{{#each 式}}` の式
     pub source: String,
+    /// 入れ子のループなら、外側のループの番号
+    pub parent: Option<usize>,
     /// ループの中の差し込み欄の式
     pub exprs: Vec<String>,
-    /// プレビューした行ごとの要素数（か、対象の式のエラー）
+    /// プレビューした行ごとの要素数（か、対象の式のエラー）。入れ子のループは、外側の要素すべての合計
     pub counts: Vec<std::result::Result<usize, String>>,
 }
 
@@ -365,11 +409,12 @@ pub fn preview(file: &JxcelFile, spec: &Spec, limit: usize, opts: &Options) -> R
         .enumerate()
         .map(|(k, l)| PreviewLoop {
             source: l.source.clone(),
+            parent: l.parent,
             exprs: l.exprs.clone(),
             counts: matrix
                 .iter()
                 .take(limit)
-                .map(|e| e.loops[k].as_ref().map(Vec::len).map_err(Clone::clone))
+                .map(|e| total_len(e, &plan, k))
                 .collect(),
         })
         .collect();

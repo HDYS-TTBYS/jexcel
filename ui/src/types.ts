@@ -120,9 +120,11 @@ export interface ExportPreviewRow {
 export interface ExportPreviewLoop {
   /** 繰り返す配列の式 */
   source: string;
+  /** 入れ子のループなら、外側のループの番号（`loops` の添字） */
+  parent?: number | null;
   /** ループの中の差し込み欄の式 */
   exprs: string[];
-  /** プレビューした行ごとの繰り返しの回数（要素数）か、対象の式のエラー */
+  /** プレビューした行ごとの繰り返しの回数（要素数）か、対象の式のエラー（入れ子のループは外側の要素すべての合計） */
   counts: CellResult[];
 }
 

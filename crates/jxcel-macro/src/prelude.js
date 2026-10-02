@@ -125,6 +125,7 @@
     // 行ごとに対象の式を評価して配列を得て、要素ごとにループの中の式を評価する。
     // 要素がオブジェクトならそのキーが変数になる（行の列より優先）。_item（要素）、_i（0 から）、_n（1 から）も使える。
     const MAX_LOOP_ITEMS = 10000;
+    const MAX_LOOP_TOTAL = 20000;
     let exprsOut = [];
     function evalExprs(spec) {
       const sheet = data.sheets.find((s) => s.id === spec.sheet);
@@ -149,30 +150,44 @@
         }
       };
       const fns = spec.exprs.map(compile);
-      const loops = (spec.loops || []).map((l) => ({ source: compile(l.source), body: l.exprs.map(compile) }));
+      const loops = (spec.loops || []).map((l) => ({ source: compile(l.source), body: l.exprs.map(compile), parent: l.parent === undefined ? null : l.parent }));
       const none = {};
+      // 入れ子のループ: 内側のループの対象と欄は、外側の要素のキーも変数として見える（内側が優先）。_parent は外側の要素。
+      const evalLoop = (k, row, outer, budget) => {
+        const l = loops[k];
+        const src = run(l.source, row, outer || none);
+        if ("e" in src) return { e: src.e };
+        const list = src.v === null ? [] : src.v;
+        if (!Array.isArray(list)) return { e: "ループの対象が配列ではありません" };
+        if (list.length > MAX_LOOP_ITEMS) return { e: "ループの対象が多すぎます（上限 " + MAX_LOOP_ITEMS + " 件）" };
+        budget.n += list.length;
+        if (budget.n > MAX_LOOP_TOTAL) return { e: "ループの要素の合計が多すぎます（上限 " + MAX_LOOP_TOTAL + " 件）" };
+        return {
+          items: list.map((it, i) => {
+            const item = Object.assign({}, outer || {});
+            if (outer) item._parent = outer._item;
+            if (it !== null && typeof it === "object" && !Array.isArray(it)) Object.assign(item, it);
+            item._item = it;
+            item._i = i;
+            item._n = i + 1;
+            const v = l.body.map((fn) => run(fn, row, item));
+            const sub = [];
+            loops.forEach((c, j) => {
+              if (c.parent === k) sub.push(evalLoop(j, row, item, budget));
+            });
+            return { v, l: sub };
+          }),
+        };
+      };
       exprsOut = schema.rows.map((r, i) => {
         const row = rowObject(schema, r);
         row._no = i + 1;
-        return {
-          top: fns.map((fn) => run(fn, row, none)),
-          loops: loops.map((l) => {
-            const src = run(l.source, row, none);
-            if ("e" in src) return { e: src.e };
-            const list = src.v === null ? [] : src.v;
-            if (!Array.isArray(list)) return { e: "ループの対象が配列ではありません" };
-            if (list.length > MAX_LOOP_ITEMS) return { e: "ループの対象が多すぎます（上限 " + MAX_LOOP_ITEMS + " 件）" };
-            return {
-              items: list.map((it, k) => {
-                const item = it !== null && typeof it === "object" && !Array.isArray(it) ? Object.assign({}, it) : {};
-                item._item = it;
-                item._i = k;
-                item._n = k + 1;
-                return l.body.map((fn) => run(fn, row, item));
-              }),
-            };
-          }),
-        };
+        const budget = { n: 0 };
+        const top = [];
+        loops.forEach((l, k) => {
+          if (l.parent === null) top.push(evalLoop(k, row, null, budget));
+        });
+        return { top: fns.map((fn) => run(fn, row, none)), loops: top };
       });
     }
 

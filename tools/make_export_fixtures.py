@@ -167,8 +167,64 @@ def make_loop_xlsx():
     wb.save(OUT / "loop-inline.xlsx")
 
 
+def make_nested_docx():
+    """入れ子の行ループ（{{/each}} で閉じる形）。明細ごとに、見出しの行・付属品の行（さらに内側のループ）・小計の行。"""
+    d = Document()
+    t = d.add_table(rows=5, cols=2)
+    t.style = "Table Grid"
+    t.cell(0, 0).text = "品名"
+    t.cell(0, 1).text = "付属品"
+    t.cell(1, 0).text = "{{#each 明細}}{{_n}}. {{品目}}"      # 外側の見出しの行（ここから繰り返し）
+    t.cell(2, 0).text = "{{#each 付属}}{{名}}{{/each}}"       # 内側のループ（1 行。同じ行で閉じる）
+    t.cell(2, 1).text = "{{品目}}の付属 {{_n}}"                 # 外側のキー（品目）も見える
+    t.cell(3, 0).text = "{{/each}}小計 {{数}}"                  # 外側を閉じる行（繰り返しの最後の行）
+    t.cell(4, 0).text = "合計"
+    d.save(OUT / "nested.docx")
+
+
+def make_nested_table_docx():
+    """繰り返す行の中の表（入れ子の表）の中のループ。印は {{#each}} だけ（従来の 1 行ループ）。"""
+    d = Document()
+    t = d.add_table(rows=2, cols=2)
+    t.style = "Table Grid"
+    t.cell(0, 0).text = "品名"
+    t.cell(0, 1).text = "付属品"
+    t.cell(1, 0).text = "{{#each 明細}}{{品目}}"
+    inner = t.cell(1, 1).add_table(rows=1, cols=1)
+    inner.cell(0, 0).text = "{{#each 付属}}{{品目}}:{{名}}"
+    d.save(OUT / "nested-table.docx")
+
+
+def make_nested_xlsx():
+    """入れ子の行ループ（{{/each}} で閉じる形）・同じ回の中の行を指す数式・繰り返しの中の結合セル。"""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "明細"
+    ws["A1"] = "請求書 {{請求番号}}"
+    ws["A2"] = "品目"
+    ws["B2"] = "数量"
+    ws["C2"] = "金額"
+    ws["A3"] = "{{#each 明細}}{{品目}}"           # 外側の見出しの行
+    ws["B3"] = "{{数}}"
+    ws["C3"] = "=B3*100"
+    ws["A4"] = "{{#each 付属}}{{名}}{{/each}}"    # 内側のループ（1 行。同じ行で閉じる）
+    ws["B4"] = "{{品目}}"                          # 外側のキー
+    ws["C4"] = "=C3"                               # 同じ回の見出しの行を指す
+    ws.merge_cells("C4:D4")                        # 内側の繰り返しごとに複製される
+    ws["A5"] = "{{/each}}小計"                     # 外側を閉じる行
+    ws["B5"] = "=SUM(B3:B4)"                       # 同じ回の行だけの範囲
+    ws["C5"] = "=SUM(C3:C4)"
+    ws["A6"] = "総合計"
+    ws["B6"] = "=SUM(B3:B5)"                       # ループを含む範囲 → 広がる
+    ws["C6"] = "=C5+1"                              # 後ろの行からの参照
+    wb.save(OUT / "nested.xlsx")
+
+
 make_docx()
 make_xlsx()
+make_nested_docx()
+make_nested_table_docx()
+make_nested_xlsx()
 make_loop_docx()
 make_loop_xlsx()
 make_shared_strings_xlsx()

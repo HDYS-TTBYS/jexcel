@@ -40,12 +40,20 @@ impl Source for Fake {
             .cloned()
             .ok_or_else(|| format!("未定義: {expr}"))
     }
-    fn loop_len(&mut self, index: usize, source: &str) -> Result<usize, String> {
-        assert_eq!((index, source), (0, "明細"));
+    fn loop_len(
+        &mut self,
+        index: usize,
+        parent: Option<usize>,
+        path: &[usize],
+        source: &str,
+    ) -> Result<usize, String> {
+        assert_eq!((index, parent, source), (0, None, "明細"));
+        assert!(path.is_empty());
         Ok(self.items.len())
     }
-    fn item_value(&mut self, index: usize, item: usize, expr: &str) -> Result<Value, String> {
+    fn item_value(&mut self, index: usize, path: &[usize], expr: &str) -> Result<Value, String> {
         assert_eq!(index, 0);
+        let item = path[0];
         let it = &self.items[item];
         match expr {
             "_n" => Ok(json!(item + 1)),
@@ -120,6 +128,7 @@ fn docx_plan_lists_loop_placeholders_separately() {
         p.loops,
         [LoopPlan {
             source: "明細".into(),
+            parent: None,
             exprs: vec![
                 "品目".into(),
                 "数 * 単価".into(),
@@ -160,10 +169,16 @@ fn docx_loop_errors_are_reported() {
         fn value(&mut self, _: &str) -> Result<Value, String> {
             Ok(Value::Null)
         }
-        fn loop_len(&mut self, _: usize, _: &str) -> Result<usize, String> {
+        fn loop_len(
+            &mut self,
+            _: usize,
+            _: Option<usize>,
+            _: &[usize],
+            _: &str,
+        ) -> Result<usize, String> {
             Err("明細 is not defined".into())
         }
-        fn item_value(&mut self, _: usize, _: usize, _: &str) -> Result<Value, String> {
+        fn item_value(&mut self, _: usize, _: &[usize], _: &str) -> Result<Value, String> {
             unreachable!()
         }
     }
@@ -401,4 +416,223 @@ fn rendering_with_loops_is_repeatable() {
     let a = render_with(Kind::Docx, DOCX, &mut Fake::new(items(3))).unwrap();
     let b = render_with(Kind::Docx, DOCX, &mut Fake::new(items(3))).unwrap();
     assert_eq!(a, b);
+}
+
+// ---------------------------------------------------------------- 入れ子のループ
+
+const NESTED_DOCX: &[u8] = include_bytes!("fixtures/nested.docx");
+const NESTED_TABLE_DOCX: &[u8] = include_bytes!("fixtures/nested-table.docx");
+const NESTED_XLSX: &[u8] = include_bytes!("fixtures/nested.xlsx");
+
+/// 明細（品目・数・付属品の名前）を 2 段のループで持つ取得元。外側 = 0（明細）、内側 = 1（付属。外側の要素ごと）。
+struct Nest {
+    items: Vec<(&'static str, i64, Vec<&'static str>)>,
+}
+
+impl Nest {
+    fn sample() -> Self {
+        Self {
+            items: vec![("ねじ", 3, vec!["a", "b"]), ("板", 1, vec![])],
+        }
+    }
+}
+
+impl Source for Nest {
+    fn value(&mut self, expr: &str) -> Result<Value, String> {
+        match expr {
+            "請求番号" => Ok(json!("INV-7")),
+            "合計" => Ok(json!(999)),
+            e => Err(format!("未定義: {e}")),
+        }
+    }
+    fn loop_len(
+        &mut self,
+        index: usize,
+        parent: Option<usize>,
+        path: &[usize],
+        source: &str,
+    ) -> Result<usize, String> {
+        match (index, parent, source) {
+            (0, None, "明細") => {
+                assert!(path.is_empty());
+                Ok(self.items.len())
+            }
+            (1, Some(0), "付属") => Ok(self.items[path[0]].2.len()),
+            other => panic!("想定外のループ: {other:?} {path:?}"),
+        }
+    }
+    fn item_value(&mut self, index: usize, path: &[usize], expr: &str) -> Result<Value, String> {
+        let item = &self.items[path[0]];
+        match (index, expr) {
+            (0, "_n") => Ok(json!(path[0] + 1)),
+            (0, "品目") | (1, "品目") => Ok(json!(item.0)),
+            (0, "数") => Ok(json!(item.1)),
+            (1, "_n") => Ok(json!(path[1] + 1)),
+            (1, "名") => Ok(json!(item.2[path[1]])),
+            (i, e) => Err(format!("未定義: {i} {e}")),
+        }
+    }
+}
+
+#[test]
+fn nested_loop_plan_records_the_parent() {
+    for (kind, tpl) in [(Kind::Docx, NESTED_DOCX), (Kind::Xlsx, NESTED_XLSX)] {
+        let p = plan(kind, tpl).unwrap();
+        assert_eq!(p.loops.len(), 2, "{kind:?}");
+        assert_eq!(
+            (p.loops[0].source.as_str(), p.loops[0].parent),
+            ("明細", None)
+        );
+        assert_eq!(
+            (p.loops[1].source.as_str(), p.loops[1].parent),
+            ("付属", Some(0))
+        );
+        assert!(p.loops[1].exprs.contains(&"名".to_string()));
+        assert_eq!(p.chain(1), [0, 1]);
+        assert_eq!((p.sibling_pos(0), p.sibling_pos(1)), (0, 0));
+    }
+}
+
+#[test]
+fn docx_nested_block_loops_repeat_groups_of_rows() {
+    let out =
+        render_with(Kind::Docx, NESTED_DOCX, &mut Nest::sample()).unwrap_or_else(|e| panic!("{e}"));
+    let rows = table_rows(&out);
+    let strs: Vec<Vec<&str>> = rows
+        .iter()
+        .map(|r| r.iter().map(String::as_str).collect())
+        .collect();
+    assert_eq!(
+        strs,
+        [
+            vec!["品名", "付属品"],
+            // 1 つ目の明細: 見出し・付属品 2 行・小計
+            vec!["1. ねじ", ""],
+            vec!["a", "ねじの付属 1"],
+            vec!["b", "ねじの付属 2"],
+            vec!["小計 3", ""],
+            // 2 つ目の明細: 付属品は 0 件なので行が消える
+            vec!["2. 板", ""],
+            vec!["小計 1", ""],
+            vec!["合計", ""],
+        ]
+    );
+    // 要素が 0 件なら、外側の行ごと消える
+    struct Empty;
+    impl Source for Empty {
+        fn value(&mut self, _: &str) -> Result<Value, String> {
+            Ok(Value::Null)
+        }
+        fn loop_len(
+            &mut self,
+            i: usize,
+            _: Option<usize>,
+            _: &[usize],
+            _: &str,
+        ) -> Result<usize, String> {
+            assert_eq!(i, 0, "外側が 0 件なら、内側のループは聞かれない");
+            Ok(0)
+        }
+        fn item_value(&mut self, _: usize, _: &[usize], _: &str) -> Result<Value, String> {
+            unreachable!()
+        }
+    }
+    let out = render_with(Kind::Docx, NESTED_DOCX, &mut Empty).unwrap();
+    assert_eq!(table_rows(&out).len(), 2); // 見出しの行と合計
+}
+
+#[test]
+fn docx_loops_inside_a_nested_table_are_numbered_once() {
+    let out = render_with(Kind::Docx, NESTED_TABLE_DOCX, &mut Nest::sample())
+        .unwrap_or_else(|e| panic!("{e}"));
+    let rows = table_rows(&out);
+    // 外側の行（ねじ・板）と、その中の表の行（付属品）。外側の行の文字には、中の表の文字も含まれる
+    let texts: Vec<String> = rows.iter().map(|r| r.concat()).collect();
+    assert_eq!(texts[0], "品名付属品");
+    assert!(
+        texts[1].starts_with("ねじ") && texts[1].ends_with("ねじ:aねじ:b"),
+        "{texts:?}"
+    );
+    assert_eq!(&texts[2..4], ["ねじ:a", "ねじ:b"]);
+    assert!(texts[4].starts_with("板"), "{texts:?}");
+    // 計画: 外側が 0、中の表のループが 1（外側の要素ごとに同じ番号）
+    let p = plan(Kind::Docx, NESTED_TABLE_DOCX).unwrap();
+    assert_eq!(
+        (p.loops[1].parent, p.loops[1].source.as_str()),
+        (Some(0), "付属")
+    );
+}
+
+#[test]
+fn nested_loop_markers_must_be_balanced() {
+    fn with_text(old: &str, new: &str) -> Vec<u8> {
+        let mut doc = Package::read(NESTED_DOCX).unwrap();
+        let x = String::from_utf8(doc.get("word/document.xml").unwrap().to_vec()).unwrap();
+        assert!(x.contains(old), "{old}");
+        doc.set("word/document.xml", x.replace(old, new).into_bytes());
+        doc.write().unwrap()
+    }
+    // 外側を閉じ忘れた
+    let e = render_with(
+        Kind::Docx,
+        &with_text("{{/each}}小計", "小計"),
+        &mut Nest::sample(),
+    )
+    .unwrap_err();
+    assert!(e.to_string().contains("閉じて"), "{e}");
+    // 余分な {{/each}}
+    let e = render_with(
+        Kind::Docx,
+        &with_text("合計", "{{/each}}合計"),
+        &mut Nest::sample(),
+    )
+    .unwrap_err();
+    assert!(e.to_string().contains("対応する"), "{e}");
+}
+
+#[test]
+fn xlsx_nested_loops_shift_rows_formulas_and_merges() {
+    let out =
+        render_with(Kind::Xlsx, NESTED_XLSX, &mut Nest::sample()).unwrap_or_else(|e| panic!("{e}"));
+    let (c, root) = sheet(&out);
+    // 1 つ目の明細（行 3〜6）: 見出し・付属品 2 行・小計
+    assert_eq!(text(&c, "A1"), "請求書 INV-7");
+    assert_eq!(
+        [text(&c, "A3"), text(&c, "B3"), formula(&c, "C3")],
+        ["ねじ", "3", "B3*100"]
+    );
+    assert_eq!(
+        [text(&c, "A4"), text(&c, "B4"), formula(&c, "C4")],
+        ["a", "ねじ", "C3"]
+    );
+    assert_eq!(
+        [text(&c, "A5"), text(&c, "B5"), formula(&c, "C5")],
+        ["b", "ねじ", "C3"]
+    ); // 同じ回の見出しの行を指す
+    assert_eq!(text(&c, "A6"), "小計");
+    assert_eq!(
+        (formula(&c, "B6"), formula(&c, "C6")),
+        ("SUM(B3:B5)".into(), "SUM(C3:C5)".into())
+    );
+    // 2 つ目の明細（行 7〜9）: 付属品は 0 件 → 空の行を 1 行残す
+    assert_eq!(
+        [text(&c, "A7"), text(&c, "B7"), formula(&c, "C7")],
+        ["板", "1", "B7*100"]
+    );
+    assert_eq!([text(&c, "A8"), text(&c, "B8")], ["", ""]);
+    assert_eq!(formula(&c, "C8"), "C7");
+    assert_eq!(text(&c, "A9"), "小計");
+    assert_eq!(
+        (formula(&c, "B9"), formula(&c, "C9")),
+        ("SUM(B7:B8)".into(), "SUM(C7:C8)".into())
+    );
+    // ループの後ろ: 範囲は最後のコピーまで広がり、1 つの参照は最初のコピーを指す
+    assert_eq!(text(&c, "A10"), "総合計");
+    assert_eq!(formula(&c, "B10"), "SUM(B3:B9)");
+    assert_eq!(formula(&c, "C10"), "C6+1");
+    // 内側の繰り返しごとに結合セルが作られる
+    let mut merges = vec![];
+    elements(&root, "mergeCell", &mut merges);
+    let refs: Vec<&str> = merges.iter().map(|m| m.attr("ref").unwrap()).collect();
+    assert_eq!(refs, ["C4:D4", "C5:D5", "C8:D8"]);
 }

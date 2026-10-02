@@ -156,6 +156,11 @@ export default function ExportPanel({ backend, file, onSnapshot, onError, onConf
             繰り返されます。行の中では要素のキー（<code>{"{{品目}}"}</code>）や <code>_item</code>・<code>_n</code>（1 から数える番号）が使えます。
             対象は、配列の列のほか、<code>{'jx.sheet("シート1").schema("明細").rows().filter(r => r.番号 === 番号)'}</code> のような式でもかまいません。
           </p>
+          <p className="muted">
+            複数の行をひとまとめに繰り返すには、最初の行に <code>{"{{#each 明細}}"}</code>、最後の行に <code>{"{{/each}}"}</code> と書きます（印の行も繰り返されます）。
+            この形はループを入れ子にでき、内側のループの対象と欄では外側の要素のキーも使えます（<code>_parent</code> が外側の要素）。
+            1 行だけの内側のループは、同じ行に <code>{"{{#each 付属}}…{{/each}}"}</code> と書きます。
+          </p>
         </div>
       ) : (
         <div className="export-body">
@@ -244,8 +249,9 @@ export default function ExportPanel({ backend, file, onSnapshot, onError, onConf
                 <div className="loops">
                   <h4>行ループ</h4>
                   {preview.loops.map((l, i) => (
-                    <div key={i} className="loop">
+                    <div key={i} className="loop" style={l.parent != null ? { marginLeft: "1.2em" } : undefined}>
                       <p>
+                        {l.parent != null && <span className="muted">（{`{{#each ${preview.loops[l.parent].source}}}`} の中）</span>}
                         <code>{`{{#each ${l.source}}}`}</code> の中の欄:{" "}
                         {l.exprs.length === 0 ? <span className="muted">なし</span> : l.exprs.map((x) => <code key={x}>{x}</code>)}
                       </p>

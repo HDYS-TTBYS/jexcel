@@ -126,9 +126,11 @@ pub struct ExportPreview {
 pub struct ExportPreviewLoop {
     /// 繰り返す配列の式
     pub source: String,
+    /// 入れ子のループなら、外側のループの番号（`loops` の添字）
+    pub parent: Option<usize>,
     /// ループの中の差し込み欄の式
     pub exprs: Vec<String>,
-    /// プレビューした行ごとの、繰り返しの回数（要素数）か、対象の式のエラー
+    /// プレビューした行ごとの、繰り返しの回数（要素数）か、対象の式のエラー（入れ子のループは外側の要素すべての合計）
     pub counts: Vec<jxcel_macro::CellResult>,
 }
 
@@ -782,6 +784,7 @@ impl Session {
                 .into_iter()
                 .map(|l| ExportPreviewLoop {
                     source: l.source,
+                    parent: l.parent,
                     exprs: l.exprs,
                     counts: l
                         .counts
@@ -1498,6 +1501,100 @@ mod tests {
             // 配列の列のフィールドが、ID ではなく名前で見える
             assert!(xml.contains("ねじ") && xml.contains("ナット"), "{ext}");
             assert!(!xml.contains("{{"), "{ext}: 差し込み欄が残っている");
+            s.delete_export(&id).unwrap();
+        }
+    }
+
+    #[test]
+    fn export_nested_row_loops_over_nested_array_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out");
+        // 明細（配列）の各要素が、付属（配列）を持つ
+        let parts = DataType::Array {
+            item: Box::new(DataType::Object {
+                fields: vec![Column::new("g1", "名", DataType::String)],
+            }),
+        };
+        let lines = DataType::Array {
+            item: Box::new(DataType::Object {
+                fields: vec![
+                    Column::new("f1", "品目", DataType::String),
+                    Column::new("f2", "数", DataType::Int),
+                    Column::new("f3", "付属", parts),
+                ],
+            }),
+        };
+        let mut schema = DataSchema::new(
+            "請求",
+            vec![
+                Column::new("c1", "請求番号", DataType::String),
+                Column::new("c6", "明細", lines),
+            ],
+        );
+        schema.rows.push(Row {
+            id: "r0".into(),
+            cells: [
+                ("c1", json!("INV-7")),
+                (
+                    "c6",
+                    json!([
+                        {"f1": "ねじ", "f2": 3, "f3": [{"g1": "a"}, {"g1": "b"}]},
+                        {"f1": "板", "f2": 1, "f3": []},
+                    ]),
+                ),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect(),
+        });
+        let f = JxcelFile {
+            name: "入れ子".into(),
+            sheets: vec![Sheet {
+                id: "sh".into(),
+                name: "請求書".into(),
+                schemas: vec![schema],
+            }],
+            ..Default::default()
+        };
+        let path = dir.path().join("n.jxcel");
+        std::fs::write(&path, f.to_zip().unwrap()).unwrap();
+
+        let mut s = Session::new();
+        let snap = s.open(path.to_str().unwrap()).unwrap();
+        let schema_id = snap.file.sheets[0].schemas[0].id.clone();
+        for (template, ext) in [("nested.docx", "docx"), ("nested.xlsx", "xlsx")] {
+            let snap = s.add_export(&fixture(template), None).unwrap();
+            let id = snap.file.exports.last().unwrap().id.clone();
+            s.update_export(&id, "入れ子", "sh", &schema_id, "{{請求番号}}", None)
+                .unwrap();
+            let p = s.export_preview(&id, 5).unwrap();
+            assert_eq!(p.loops.len(), 2, "{ext}");
+            assert_eq!((p.loops[0].parent, p.loops[1].parent), (None, Some(0)));
+            // 明細は 2 件、付属は（ねじの 2 件 + 板の 0 件）の合計 2 件
+            assert_eq!(
+                p.loops[0].counts,
+                [jxcel_macro::CellResult::Value(json!(2))]
+            );
+            assert_eq!(
+                p.loops[1].counts,
+                [jxcel_macro::CellResult::Value(json!(2))]
+            );
+
+            let r = s.run_export(&id, out.to_str().unwrap()).unwrap();
+            assert_eq!((r.written.len(), r.errors.len()), (1, 0), "{ext}: {r:?}");
+            let bytes = std::fs::read(out.join(format!("INV-7.{ext}"))).unwrap();
+            let pkg = jxcel_export::package::Package::read(&bytes).unwrap();
+            let part = if ext == "docx" {
+                "word/document.xml"
+            } else {
+                "xl/worksheets/sheet1.xml"
+            };
+            let xml = String::from_utf8(pkg.get(part).unwrap().to_vec()).unwrap();
+            assert!(!xml.contains("{{"), "{ext}: 差し込み欄が残っている");
+            // 内側のループが、外側の要素の付属を回る（ねじの a・b。板は付属なし）
+            for needle in ["ねじ", "板", ">a<", ">b<"] {
+                assert!(xml.contains(needle), "{ext}: {needle}");
+            }
             s.delete_export(&id).unwrap();
         }
     }

@@ -11,14 +11,16 @@
 //! （印は取り除かれ、行の中の欄は要素ごとに差し込まれる）。後ろの行は下へずれ、セルの番地・数式の参照・
 //! 結合セルなどもずらす。ループの行を含む範囲（`SUM(C5:C5)` など）は、繰り返した分だけ広がる。
 //! 要素が 0 件のときは、数式の参照が壊れないよう、値を空にした行を 1 行残す。
-//! ループの入れ子と、ほかのシートへの参照・共有数式・名前の定義のずらしは行わない。
+//! 別の行に `{{/each}}` と書くと、その間の行（印の行を含む）がひとまとめに繰り返される。ループは入れ子にできる
+//! （`{{/each}}` を使う形で書く）。数式は、同じ繰り返しの回の中の行を指す参照が、その回のコピーを指す。
+//! ほかのシートへの参照・共有数式・名前の定義のずらしは行わない。
 
 use serde_json::Value;
 
 use crate::package::Package;
 use crate::placeholder::{display, find, Match};
 use crate::xml::{self, Element, Node};
-use crate::{loop_source, Error, Result, Source};
+use crate::{marker, number, parse_blocks, Block, Error, Marker, Result, Source};
 
 /// 差し込みの途中経過。ループは文書（シート → 行）の出現順に番号を振る。
 struct Ctx<'a> {
@@ -32,16 +34,29 @@ struct Ctx<'a> {
 }
 
 /// いまの位置。
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum Scope {
     Top,
-    /// `index` 番目のループの `item` 番目の要素の行
-    Item {
-        index: usize,
-        item: usize,
-    },
+    /// 外側から順に（ループの番号, 要素の位置）。ループの中の行
+    Item(Vec<(usize, usize)>),
     /// 要素が 0 件のときに残す空の行（欄は空になる）
     Blank,
+}
+
+impl Scope {
+    /// 外側のループの要素の位置の並び。
+    fn path(&self) -> Vec<usize> {
+        match self {
+            Scope::Item(f) => f.iter().map(|x| x.1).collect(),
+            _ => vec![],
+        }
+    }
+    fn innermost(&self) -> Option<usize> {
+        match self {
+            Scope::Item(f) => f.last().map(|x| x.0),
+            _ => None,
+        }
+    }
 }
 
 pub fn process(pkg: &mut Package, src: &mut dyn Source) -> Result<()> {
@@ -301,7 +316,7 @@ fn sheet(root: &mut Element, ctx: &mut Ctx) -> Result<bool> {
     if let Some(sd) = child_mut(root, "sheetData") {
         changed |= sheet_data(sd, ctx, &mut moves)?;
     }
-    if !moves.loops.is_empty() {
+    if moves.active {
         fix_references(root, &moves);
     }
     if let Some(hf) = child_mut(root, "headerFooter") {
@@ -331,44 +346,192 @@ fn drop_cached_results(el: &mut Element) {
     }
 }
 
-/// 行ループで増減した行の記録。
+/// 行ループで行がずれたことの記録（元の行番号 → 新しい行番号）。
 #[derive(Default)]
 struct Moves {
-    loops: Vec<LoopRows>,
+    /// ループがあって行がずれたか
+    active: bool,
+    /// 元の行（1 から。添字は行番号 - 1）の、繰り返しの最初のコピーと最後のコピーの新しい行番号
+    first: Vec<u32>,
+    last: Vec<u32>,
+    /// 元のシートの最後の行番号と、新しい最後の行との差
+    delta: i64,
+    /// 繰り返し 1 回ごとの記録（数式・結合セルが、同じ回の別の行を指すために使う）
+    owns: Vec<Own>,
+    /// 繰り返しの範囲（ループの番号, 先頭の行, 末尾の行）
+    blocks: Vec<(usize, u32, u32)>,
 }
 
-struct LoopRows {
-    /// テンプレートの行番号（元のシートでの行）
-    row: u32,
-    /// 繰り返した行の数（要素が 0 件でも 1）
-    count: u32,
+/// 繰り返しの 1 回分。範囲の各行（元の行番号 `lo`〜`hi`）の、この回での新しい行番号（最初, 最後）。
+struct Own {
+    lo: u32,
+    hi: u32,
+    rows: Vec<(u32, u32)>,
+    /// 外側の繰り返しの回（`Moves::owns` の添字）
+    parent: Option<usize>,
+    /// この回のループの番号
+    block: usize,
 }
 
 impl Moves {
-    fn delta(l: &LoopRows) -> i64 {
-        i64::from(l.count) - 1
-    }
-
-    /// 元の行番号 `row` の新しい行番号（ループの行そのものは先頭の行）。
+    /// 元の行番号 `row` の新しい行番号（繰り返しの行は最初のコピー）。
     fn point(&self, row: u32) -> u32 {
-        let d: i64 = self
-            .loops
-            .iter()
-            .filter(|l| l.row < row)
-            .map(Self::delta)
-            .sum();
-        (i64::from(row) + d).max(1) as u32
+        match self.first.get((row as usize).wrapping_sub(1)) {
+            Some(&n) => n,
+            None => (i64::from(row) + self.delta).max(1) as u32,
+        }
     }
 
-    /// 範囲の終わりの行: ループの行を含むなら、繰り返した分だけ広げる。
+    /// 範囲の終わりの行: 繰り返しの行を含むなら、最後のコピーまで広げる。
     fn end(&self, row: u32) -> u32 {
-        let d: i64 = self
-            .loops
-            .iter()
-            .filter(|l| l.row <= row)
-            .map(Self::delta)
-            .sum();
-        (i64::from(row) + d).max(1) as u32
+        match self.last.get((row as usize).wrapping_sub(1)) {
+            Some(&n) => n,
+            None => (i64::from(row) + self.delta).max(1) as u32,
+        }
+    }
+
+    /// 繰り返しの回 `id` から外側へたどった、外側が先の並び。
+    fn chain(&self, id: Option<usize>) -> Vec<usize> {
+        let mut c = vec![];
+        let mut cur = id;
+        while let Some(i) = cur {
+            c.push(i);
+            cur = self.owns[i].parent;
+        }
+        c.reverse();
+        c
+    }
+
+    fn refs(&self, chain: &[usize]) -> Vec<&Own> {
+        chain.iter().map(|&i| &self.owns[i]).collect()
+    }
+}
+
+/// 1 行分の配置: 元の行を、新しい行番号・位置・繰り返しの回の並びで出力する。
+struct Placed {
+    orig: usize,
+    new: u32,
+    scope: Scope,
+    chain: Vec<usize>,
+}
+
+/// 繰り返しの範囲（行番号で表したもの）。
+struct RBlock {
+    source: String,
+    index: usize,
+    lo: u32,
+    hi: u32,
+    children: Vec<RBlock>,
+}
+
+fn to_rblocks(blocks: &[Block], nums: &[u32]) -> Vec<RBlock> {
+    blocks
+        .iter()
+        .map(|b| RBlock {
+            source: b.source.clone(),
+            index: b.index,
+            lo: nums[b.first],
+            hi: nums[b.last],
+            children: to_rblocks(&b.children, nums),
+        })
+        .collect()
+}
+
+fn flatten(blocks: &[RBlock], out: &mut Vec<(usize, u32, u32)>) {
+    for b in blocks {
+        out.push((b.index, b.lo, b.hi));
+        flatten(&b.children, out);
+    }
+}
+
+/// 行番号の順に、繰り返しを展開した行の並びを作る（要素数は `Source::loop_len` で聞く）。
+struct Layout<'a, 'b> {
+    ctx: &'a mut Ctx<'b>,
+    moves: &'a mut Moves,
+    placed: Vec<Placed>,
+    /// 元の行番号 → 行の添字（シートに実在する行）
+    exists: &'a std::collections::HashMap<u32, usize>,
+    cursor: u32,
+}
+
+impl Layout<'_, '_> {
+    fn record(&mut self, orig: u32, chain: &[usize]) {
+        let i = orig as usize - 1;
+        let new = self.cursor;
+        if self.moves.first[i] == 0 {
+            self.moves.first[i] = new;
+        }
+        self.moves.last[i] = new;
+        for &id in chain {
+            let o = &mut self.moves.owns[id];
+            if (o.lo..=o.hi).contains(&orig) {
+                let r = &mut o.rows[(orig - o.lo) as usize];
+                if r.0 == 0 {
+                    r.0 = new;
+                }
+                r.1 = new;
+            }
+        }
+    }
+
+    fn lay(
+        &mut self,
+        lo: u32,
+        hi: u32,
+        blocks: &[RBlock],
+        scope: &Scope,
+        chain: &mut Vec<usize>,
+    ) -> Result<()> {
+        let mut x = lo;
+        while x <= hi {
+            if let Some(b) = blocks.iter().find(|b| b.lo == x) {
+                let n = match scope {
+                    Scope::Blank => 0,
+                    _ => self
+                        .ctx
+                        .src
+                        .loop_len(b.index, scope.innermost(), &scope.path(), &b.source)
+                        .map_err(|m| expr_error(&format!("#each {}", b.source), m))?,
+                };
+                for item in 0..n.max(1) {
+                    let inner = match (n, scope) {
+                        (0, _) | (_, Scope::Blank) => Scope::Blank,
+                        (_, Scope::Item(f)) => {
+                            let mut f = f.clone();
+                            f.push((b.index, item));
+                            Scope::Item(f)
+                        }
+                        (_, Scope::Top) => Scope::Item(vec![(b.index, item)]),
+                    };
+                    let id = self.moves.owns.len();
+                    self.moves.owns.push(Own {
+                        lo: b.lo,
+                        hi: b.hi,
+                        rows: vec![(0, 0); (b.hi - b.lo + 1) as usize],
+                        parent: chain.last().copied(),
+                        block: b.index,
+                    });
+                    chain.push(id);
+                    let r = self.lay(b.lo, b.hi, &b.children, &inner, chain);
+                    chain.pop();
+                    r?;
+                }
+                x = b.hi + 1;
+            } else {
+                self.record(x, chain);
+                if let Some(&orig) = self.exists.get(&x) {
+                    self.placed.push(Placed {
+                        orig,
+                        new: self.cursor,
+                        scope: scope.clone(),
+                        chain: chain.clone(),
+                    });
+                }
+                self.cursor += 1;
+                x += 1;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -383,8 +546,8 @@ fn cell_text(c: &Element, shared: &[String]) -> Option<String> {
     }
 }
 
-/// 行の中にある `{{#each 式}}` の式。複数あればエラー。
-fn row_marker(row: &Element, shared: &[String]) -> Result<Option<String>> {
+/// 行の中にあるループの印（セルの出現順）。
+fn row_markers(row: &Element, shared: &[String]) -> Vec<Marker> {
     let mut found = vec![];
     for n in &row.children {
         let Node::Element(c) = n else { continue };
@@ -393,20 +556,13 @@ fn row_marker(row: &Element, shared: &[String]) -> Result<Option<String>> {
         }
         if let Some(text) = cell_text(c, shared) {
             for m in find(&text) {
-                if let Some(src) = loop_source(&m.expr) {
-                    found.push(src.to_string());
+                if let Some(mk) = marker(&m.expr) {
+                    found.push(mk);
                 }
             }
         }
     }
-    match found.len() {
-        0 => Ok(None),
-        1 => Ok(Some(found.remove(0))),
-        _ => Err(expr_error(
-            "#each",
-            "1 つの行に {{#each}} は 1 つだけ書けます",
-        )),
-    }
+    found
 }
 
 fn row_number(row: &Element, prev: u32) -> u32 {
@@ -417,75 +573,81 @@ fn row_number(row: &Element, prev: u32) -> u32 {
 
 fn sheet_data(sd: &mut Element, ctx: &mut Ctx, moves: &mut Moves) -> Result<bool> {
     let nodes = std::mem::take(&mut sd.children);
-
-    // 1 回目: ループの行と、その要素数を（文書の順に）調べる
+    let mut others: Vec<Node> = vec![];
+    let mut rows: Vec<Element> = vec![];
+    let mut nums: Vec<u32> = vec![];
     let mut prev = 0;
-    let mut plans: Vec<Option<(usize, usize)>> = vec![]; // 行ごとに (ループ番号, 要素数)
-    for n in &nodes {
-        let Node::Element(row) = n else {
-            plans.push(None);
-            continue;
-        };
-        let r = row_number(row, prev);
-        prev = r;
-        match row_marker(row, &ctx.shared)? {
-            None => plans.push(None),
-            Some(source) => {
-                let index = ctx.next_loop;
-                ctx.next_loop += 1;
-                let len = ctx
-                    .src
-                    .loop_len(index, &source)
-                    .map_err(|m| expr_error(&format!("#each {source}"), m))?;
-                moves.loops.push(LoopRows {
-                    row: r,
-                    count: len.max(1) as u32,
-                });
-                plans.push(Some((index, len)));
+    for n in nodes {
+        match n {
+            Node::Element(row) => {
+                let r = row_number(&row, prev);
+                prev = r;
+                nums.push(r);
+                rows.push(row);
             }
+            other => others.push(other),
         }
     }
+
+    let marks: Vec<Vec<Marker>> = rows.iter().map(|r| row_markers(r, &ctx.shared)).collect();
+    let mut blocks = parse_blocks(&marks)?;
+    let mut changed = false;
+
+    // ループがなければ、行はそのまま（欄だけ差し込む）
+    if blocks.is_empty() {
+        let mut out = others;
+        for mut row in rows {
+            changed |= cells(&mut row, ctx, &Scope::Top)?;
+            out.push(Node::Element(row));
+        }
+        sd.children = out;
+        return Ok(changed);
+    }
+
+    number(&mut blocks, &mut ctx.next_loop);
+    let rblocks = to_rblocks(&blocks, &nums);
+    if nums.windows(2).any(|w| w[1] <= w[0]) {
+        return Err(expr_error(
+            "#each",
+            "行番号が昇順でないシートでは、行ループを使えません",
+        ));
+    }
+    let max = *nums.last().expect("ループがあれば行がある");
+    moves.first = vec![0; max as usize];
+    moves.last = vec![0; max as usize];
+    flatten(&rblocks, &mut moves.blocks);
+    let exists: std::collections::HashMap<u32, usize> =
+        nums.iter().enumerate().map(|(i, &r)| (r, i)).collect();
+
+    // 1 回目: 繰り返しを展開した行の並びと、元の行 → 新しい行の対応を作る
+    let mut layout = Layout {
+        ctx,
+        moves,
+        placed: vec![],
+        exists: &exists,
+        cursor: 1,
+    };
+    layout.lay(1, max, &rblocks, &Scope::Top, &mut vec![])?;
+    let placed = std::mem::take(&mut layout.placed);
+    let new_max = layout.cursor - 1;
+    moves.delta = i64::from(new_max) - i64::from(max);
+    moves.active = true;
 
     // 2 回目: 行番号をずらしながら差し込む
-    let mut changed = !moves.loops.is_empty();
-    let mut out = Vec::with_capacity(nodes.len());
-    let mut prev = 0;
-    for (n, plan) in nodes.into_iter().zip(plans) {
-        let Node::Element(mut row) = n else {
-            out.push(n);
-            continue;
-        };
-        let r = row_number(&row, prev);
-        prev = r;
-        let new_row = moves.point(r);
-        match plan {
-            None => {
-                place_row(&mut row, new_row, None, moves);
-                changed |= cells(&mut row, ctx, Scope::Top)?;
-                out.push(Node::Element(row));
-            }
-            Some((index, len)) => {
-                for k in 0..len.max(1) {
-                    let mut copy = row.clone();
-                    let at = new_row + k as u32;
-                    place_row(&mut copy, at, Some((r, at)), moves);
-                    let scope = if len == 0 {
-                        Scope::Blank
-                    } else {
-                        Scope::Item { index, item: k }
-                    };
-                    cells(&mut copy, ctx, scope)?;
-                    out.push(Node::Element(copy));
-                }
-            }
-        }
+    let mut out = others;
+    for p in placed {
+        let mut row = rows[p.orig].clone();
+        let refs = moves.refs(&p.chain);
+        place_row(&mut row, p.new, &refs, moves);
+        cells(&mut row, ctx, &p.scope)?;
+        out.push(Node::Element(row));
     }
     sd.children = out;
-    Ok(changed)
+    Ok(true)
 }
 
-/// 行の番号とセルの番地を `row` に付け替え、数式の参照をずらす。`own` は繰り返しの行の（元の行番号, 新しい行番号）。
-fn place_row(row: &mut Element, new_row: u32, own: Option<(u32, u32)>, moves: &Moves) {
+/// 行の番号とセルの番地を `row` に付け替え、数式の参照をずらす。`own` は、この行が属する繰り返しの回（外側が先）。
+fn place_row(row: &mut Element, new_row: u32, own: &[&Own], moves: &Moves) {
     row.set_attr("r", &new_row.to_string());
     for n in &mut row.children {
         let Node::Element(c) = n else { continue };
@@ -510,7 +672,7 @@ fn place_row(row: &mut Element, new_row: u32, own: Option<(u32, u32)>, moves: &M
 }
 
 /// 行の中のセルに差し込む。
-fn cells(row: &mut Element, ctx: &mut Ctx, scope: Scope) -> Result<bool> {
+fn cells(row: &mut Element, ctx: &mut Ctx, scope: &Scope) -> Result<bool> {
     let mut changed = false;
     for n in &mut row.children {
         if let Node::Element(c) = n {
@@ -522,25 +684,28 @@ fn cells(row: &mut Element, ctx: &mut Ctx, scope: Scope) -> Result<bool> {
     Ok(changed)
 }
 
-fn resolve(ctx: &mut Ctx, scope: Scope, expr: &str) -> std::result::Result<Value, String> {
+fn resolve(ctx: &mut Ctx, scope: &Scope, expr: &str) -> std::result::Result<Value, String> {
     match scope {
         Scope::Top => ctx.src.value(expr),
-        Scope::Item { index, item } => ctx.src.item_value(index, item, expr),
+        Scope::Item(f) => {
+            let index = f.last().expect("ループの中").0;
+            ctx.src.item_value(index, &scope.path(), expr)
+        }
         Scope::Blank => Ok(Value::Null),
     }
 }
 
-fn resolve_match(ctx: &mut Ctx, scope: Scope, m: &Match) -> Result<Value> {
+fn resolve_match(ctx: &mut Ctx, scope: &Scope, m: &Match) -> Result<Value> {
     resolve(ctx, scope, &m.expr).map_err(|message| expr_error(&m.expr, message))
 }
 
-/// 文字列から、ループの印 `{{#each …}}` を取り除く（繰り返しの行の中だけで呼ぶ）。
+/// 文字列から、ループの印 `{{#each …}}` `{{/each}}` を取り除く（繰り返しの行の中だけで呼ぶ）。
 fn without_markers(text: &str) -> (String, bool) {
     let mut out = String::new();
     let mut last = 0;
     let mut any = false;
     for m in find(text) {
-        if loop_source(&m.expr).is_some() {
+        if marker(&m.expr).is_some() {
             out.push_str(&text[last..m.start]);
             last = m.end;
             any = true;
@@ -550,12 +715,12 @@ fn without_markers(text: &str) -> (String, bool) {
     (out, any)
 }
 
-fn cell(c: &mut Element, ctx: &mut Ctx, scope: Scope) -> Result<bool> {
+fn cell(c: &mut Element, ctx: &mut Ctx, scope: &Scope) -> Result<bool> {
     let Some(mut text) = cell_text(c, &ctx.shared) else {
         return Ok(false);
     };
     let p = prefix(&c.name).to_string();
-    if matches!(scope, Scope::Item { .. } | Scope::Blank) {
+    if matches!(scope, Scope::Item(_) | Scope::Blank) {
         let (cleaned, had_marker) = without_markers(&text);
         if had_marker {
             text = cleaned;
@@ -575,11 +740,10 @@ fn cell(c: &mut Element, ctx: &mut Ctx, scope: Scope) -> Result<bool> {
     if matches.is_empty() {
         return Ok(false);
     }
-    if let Some(m) = matches.iter().find(|m| loop_source(&m.expr).is_some()) {
-        let _ = m;
+    if matches.iter().any(|m| marker(&m.expr).is_some()) {
         return Err(expr_error(
             "#each",
-            "{{#each}} は、シートの行の中のセルに書いてください",
+            "{{#each}} と {{/each}} は、シートの行の中のセルに書いてください",
         ));
     }
 
@@ -674,13 +838,13 @@ fn header_footer(hf: &mut Element, ctx: &mut Ctx) -> Result<bool> {
         let mut last = 0;
         for m in &matches {
             out.push_str(&text[last..m.start]);
-            if loop_source(&m.expr).is_some() {
+            if marker(&m.expr).is_some() {
                 return Err(expr_error(
                     "#each",
-                    "{{#each}} は、シートの行の中のセルに書いてください",
+                    "{{#each}} と {{/each}} は、シートの行の中のセルに書いてください",
                 ));
             }
-            let v = resolve_match(ctx, Scope::Top, m)?;
+            let v = resolve_match(ctx, &Scope::Top, m)?;
             out.push_str(&display(&v).replace('&', "&&"));
             last = m.end;
         }
@@ -721,10 +885,15 @@ enum Pos {
     End,
 }
 
-fn map_row(row: u32, pos: Pos, moves: &Moves, own: Option<(u32, u32)>) -> u32 {
-    if let Some((orig, new)) = own {
-        if row == orig {
-            return new;
+fn map_row(row: u32, pos: Pos, moves: &Moves, own: &[&Own]) -> u32 {
+    // 同じ繰り返しの回の中の行は、その回のコピーを指す（内側の回が優先）
+    for o in own.iter().rev() {
+        if (o.lo..=o.hi).contains(&row) {
+            let (first, last) = o.rows[(row - o.lo) as usize];
+            return match pos {
+                Pos::Start => first,
+                Pos::End => last,
+            };
         }
     }
     match pos {
@@ -733,13 +902,13 @@ fn map_row(row: u32, pos: Pos, moves: &Moves, own: Option<(u32, u32)>) -> u32 {
     }
 }
 
-fn map_cell(s: &str, pos: Pos, moves: &Moves, own: Option<(u32, u32)>) -> Option<String> {
+fn map_cell(s: &str, pos: Pos, moves: &Moves, own: &[&Own]) -> Option<String> {
     let (col, abs_row, row) = parse_ref(s)?;
     Some(format!("{col}{abs_row}{}", map_row(row, pos, moves, own)))
 }
 
 /// 範囲（`A1:B2`）または単独の参照（`A1`）の文字列をずらす。解釈できなければそのまま返す。
-fn map_range(text: &str, moves: &Moves, own: Option<(u32, u32)>) -> String {
+fn map_range(text: &str, moves: &Moves, own: &[&Own]) -> String {
     match text.split_once(':') {
         Some((a, b)) => {
             let (Some(x), Some(y)) = (
@@ -759,7 +928,7 @@ fn map_range(text: &str, moves: &Moves, own: Option<(u32, u32)>) -> String {
 }
 
 /// 数式の中のこのシートのセル参照をずらす。文字列リテラルと、シート名つきの参照（`Sheet2!A1`）は触らない。
-fn shift_formula(f: &str, moves: &Moves, own: Option<(u32, u32)>) -> String {
+fn shift_formula(f: &str, moves: &Moves, own: &[&Own]) -> String {
     let chars: Vec<char> = f.chars().collect();
     let mut out = String::with_capacity(f.len());
     let mut i = 0;
@@ -865,13 +1034,13 @@ fn remap_attr(e: &mut Element, attr: &str, moves: &Moves) {
     if let Some(v) = e.attr(attr) {
         let mapped: Vec<String> = v
             .split_whitespace()
-            .map(|r| map_range(r, moves, None))
+            .map(|r| map_range(r, moves, &[]))
             .collect();
         e.set_attr(attr, &mapped.join(" "));
     }
 }
 
-/// 結合セル。ループの行 1 行に収まるものは、繰り返した行ごとに作る。
+/// 結合セル。繰り返しの範囲に収まるものは、繰り返した回ごとに作る。
 fn merge_cells(mc: &mut Element, moves: &Moves) {
     let old = std::mem::take(&mut mc.children);
     let mut out = vec![];
@@ -884,23 +1053,35 @@ fn merge_cells(mc: &mut Element, moves: &Moves) {
             out.push(Node::Element(m));
             continue;
         };
-        let single_row = r.split_once(':').and_then(|(a, b)| {
+        let rows = r.split_once(':').and_then(|(a, b)| {
             let (_, _, ra) = parse_ref(a)?;
             let (_, _, rb) = parse_ref(b)?;
-            (ra == rb).then_some(ra)
+            Some((ra.min(rb), ra.max(rb)))
         });
-        match single_row.and_then(|row| moves.loops.iter().find(|l| l.row == row)) {
-            Some(l) => {
-                for k in 0..l.count {
+        // 範囲を含む一番内側の繰り返し
+        let block = rows.and_then(|(ra, rb)| {
+            moves
+                .blocks
+                .iter()
+                .filter(|(_, lo, hi)| *lo <= ra && rb <= *hi)
+                .min_by_key(|(i, lo, hi)| (hi - lo, std::cmp::Reverse(*i)))
+                .map(|b| b.0)
+        });
+        match block {
+            Some(block) => {
+                for (id, o) in moves.owns.iter().enumerate() {
+                    if o.block != block {
+                        continue;
+                    }
+                    let chain = moves.chain(Some(id));
                     let mut copy = m.clone();
-                    let at = moves.point(l.row) + k;
-                    copy.set_attr("ref", &map_range(&r, moves, Some((l.row, at))));
+                    copy.set_attr("ref", &map_range(&r, moves, &moves.refs(&chain)));
                     out.push(Node::Element(copy));
                 }
             }
             None => {
                 let mut copy = m;
-                copy.set_attr("ref", &map_range(&r, moves, None));
+                copy.set_attr("ref", &map_range(&r, moves, &[]));
                 out.push(Node::Element(copy));
             }
         }
@@ -943,13 +1124,41 @@ fn force_recalculation(workbook: &mut Element) {
 mod tests {
     use super::*;
 
-    fn moves(loops: &[(u32, u32)]) -> Moves {
-        Moves {
-            loops: loops
-                .iter()
-                .map(|&(row, count)| LoopRows { row, count })
-                .collect(),
+    /// 行 `row` が `count` 回に繰り返されたシート（最後の行は `max`）。繰り返しの行の位置は `Own` で返す。
+    fn moves(loops: &[(u32, u32)], max: u32) -> (Moves, Vec<Own>) {
+        let mut m = Moves {
+            active: true,
+            first: vec![0; max as usize],
+            last: vec![0; max as usize],
+            ..Default::default()
+        };
+        let mut owns = vec![];
+        let mut cursor = 1;
+        for x in 1..=max {
+            match loops.iter().find(|l| l.0 == x) {
+                Some(&(_, count)) => {
+                    m.first[x as usize - 1] = cursor;
+                    for k in 0..count {
+                        owns.push(Own {
+                            lo: x,
+                            hi: x,
+                            rows: vec![(cursor + k, cursor + k)],
+                            parent: None,
+                            block: 0,
+                        });
+                    }
+                    cursor += count;
+                    m.last[x as usize - 1] = cursor - 1;
+                }
+                None => {
+                    m.first[x as usize - 1] = cursor;
+                    m.last[x as usize - 1] = cursor;
+                    cursor += 1;
+                }
+            }
         }
+        m.delta = i64::from(cursor - 1) - i64::from(max);
+        (m, owns)
     }
 
     #[test]
@@ -1002,8 +1211,8 @@ mod tests {
     #[test]
     fn references_shift_around_loop_rows() {
         // 5 行目が 3 行に繰り返される（+2）
-        let m = moves(&[(5, 3)]);
-        let s = |f: &str| shift_formula(f, &m, None);
+        let (m, owns) = moves(&[(5, 3)], 12);
+        let s = |f: &str| shift_formula(f, &m, &[]);
         assert_eq!(s("SUM(C5:C5)"), "SUM(C5:C7)"); // 範囲が広がる
         assert_eq!(s("SUM(C4:C5)"), "SUM(C4:C7)");
         assert_eq!(s("SUM(C6:C9)"), "SUM(C8:C11)"); // 後ろは下へ
@@ -1014,29 +1223,29 @@ mod tests {
         assert_eq!(s("'Sheet 2'!A6"), "'Sheet 2'!A6");
         assert_eq!(s("SUM(A:A)+SUM(6:6)"), "SUM(A:A)+SUM(6:6)"); // 列・行全体は対象外
                                                                  // 繰り返しの行の中の数式は、自分の行を参照する
-        let own = Some((5, 6)); // 5 行目のテンプレートの 2 つ目（6 行目）
-        assert_eq!(shift_formula("B5*C5", &m, own), "B6*C6");
-        assert_eq!(shift_formula("SUM(C$4:C5)", &m, own), "SUM(C$4:C6)");
-        assert_eq!(shift_formula("D9", &m, own), "D11");
+        let own = [&owns[1]]; // 5 行目のテンプレートの 2 つ目（6 行目）
+        assert_eq!(shift_formula("B5*C5", &m, &own), "B6*C6");
+        assert_eq!(shift_formula("SUM(C$4:C5)", &m, &own), "SUM(C$4:C6)");
+        assert_eq!(shift_formula("D9", &m, &own), "D11");
     }
 
     #[test]
     fn two_loops_accumulate_and_zero_items_keep_one_row() {
-        let m = moves(&[(3, 2), (6, 1)]);
+        let (m, _) = moves(&[(3, 2), (6, 1)], 9);
         assert_eq!(
             (m.point(2), m.point(3), m.point(4), m.point(6), m.point(7)),
             (2, 3, 5, 7, 8)
         );
         assert_eq!((m.end(3), m.end(6), m.end(7)), (4, 7, 8));
         // 0 件でも 1 行は残る（count は 1）ので、行を消す方向のずれはない
-        assert_eq!(map_range("A1:B3", &m, None), "A1:B4");
+        assert_eq!(map_range("A1:B3", &m, &[]), "A1:B4");
     }
 
     #[test]
     fn ranges_in_attributes_are_remapped() {
-        let m = moves(&[(2, 3)]);
-        assert_eq!(map_range("A1:C3", &m, None), "A1:C5");
-        assert_eq!(map_range("A4", &m, None), "A6");
-        assert_eq!(map_range("A5:B6", &m, None), "A7:B8");
+        let (m, _) = moves(&[(2, 3)], 8);
+        assert_eq!(map_range("A1:C3", &m, &[]), "A1:C5");
+        assert_eq!(map_range("A4", &m, &[]), "A6");
+        assert_eq!(map_range("A5:B6", &m, &[]), "A7:B8");
     }
 }
