@@ -109,3 +109,5 @@ input, select { font: inherit; padding: 4px 6px; border: 1px solid var(--bd); bo
 .field-row .mv { display: inline-flex; gap: 2px; }
 .field-row .mv button { padding: 0 6px; }
 .forms .req { color: var(--err); margin-left: 2px; }
+.loops code { margin-right: 4px; }
+.loops .loop p { margin: 2px 0; }

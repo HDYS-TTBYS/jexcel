@@ -114,9 +114,21 @@ struct Output {
     result: Value,
     #[serde(default)]
     computed: Vec<RawCell>,
-    /// `evaluate_exprs` の結果（行 × 式）
+    /// `evaluate_exprs` の結果（行ごと）
     #[serde(default)]
-    exprs: Vec<Vec<RawExpr>>,
+    exprs: Vec<RawRowExprs>,
+}
+
+#[derive(Deserialize)]
+struct RawRowExprs {
+    top: Vec<RawExpr>,
+    loops: Vec<RawLoop>,
+}
+
+#[derive(Deserialize)]
+struct RawLoop {
+    e: Option<String>,
+    items: Option<Vec<Vec<RawExpr>>>,
 }
 
 #[derive(Deserialize)]
@@ -280,6 +292,33 @@ struct ExprRequest<'a> {
     sheet: &'a str,
     schema: &'a str,
     exprs: &'a [String],
+    loops: &'a [LoopRequest],
+}
+
+/// 行ループ `{{#each 式}}` の依頼。`source` が配列になる式、`exprs` がループの中の式。
+#[derive(Debug, Clone, PartialEq)]
+pub struct LoopRequest {
+    pub source: String,
+    pub exprs: Vec<String>,
+}
+
+/// 1 つの行ループの評価結果。要素ごとに、`LoopRequest::exprs` と同じ順の結果が並ぶ。
+pub type LoopResult = std::result::Result<Vec<Vec<CellResult>>, String>;
+
+/// 表の 1 行分の評価結果。
+#[derive(Debug, Clone, PartialEq)]
+pub struct RowEval {
+    /// 通常の式（`evaluate_exprs` の 1 行と同じ）
+    pub top: Vec<CellResult>,
+    /// 行ループごとの結果（`loops` と同じ順）
+    pub loops: Vec<LoopResult>,
+}
+
+fn cell_of(c: RawExpr) -> CellResult {
+    match (c.e, c.v) {
+        (Some(e), _) => CellResult::Error(e),
+        (None, v) => CellResult::Value(v.unwrap_or(Value::Null)),
+    }
 }
 
 /// テンプレートの差し込み欄 `{{ 式 }}` を、表の全行について評価する（行の並び順 × 式の順）。
@@ -294,22 +333,51 @@ pub fn evaluate_exprs(
     exprs: &[String],
     opts: &Options,
 ) -> Result<Vec<Vec<CellResult>>> {
+    Ok(
+        evaluate_template(file, sheet_id, schema_id, exprs, &[], opts)?
+            .into_iter()
+            .map(|r| r.top)
+            .collect(),
+    )
+}
+
+/// `evaluate_exprs` に、行ループ（配列を評価し、要素ごとに式を評価する）を加えたもの。
+///
+/// ループの中の式では、要素がオブジェクトならそのキーが変数になり（行の列より優先）、
+/// `_item`（要素）・`_i`（0 から）・`_n`（1 から）も使える。対象の式が `null` なら要素なし、
+/// 配列以外はその行・そのループのエラー。
+pub fn evaluate_template(
+    file: &JxcelFile,
+    sheet_id: &str,
+    schema_id: &str,
+    exprs: &[String],
+    loops: &[LoopRequest],
+    opts: &Options,
+) -> Result<Vec<RowEval>> {
     let req = ExprRequest {
         sheet: sheet_id,
         schema: schema_id,
         exprs,
+        loops,
     };
     let output = execute(file, None, Some(&req), opts)?;
     Ok(output
         .exprs
         .into_iter()
-        .map(|row| {
-            row.into_iter()
-                .map(|c| match (c.e, c.v) {
-                    (Some(e), _) => CellResult::Error(e),
-                    (None, v) => CellResult::Value(v.unwrap_or(Value::Null)),
+        .map(|row| RowEval {
+            top: row.top.into_iter().map(cell_of).collect(),
+            loops: row
+                .loops
+                .into_iter()
+                .map(|l| match (l.e, l.items) {
+                    (Some(e), _) => Err(e),
+                    (None, items) => Ok(items
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|it| it.into_iter().map(cell_of).collect())
+                        .collect()),
                 })
-                .collect()
+                .collect(),
         })
         .collect())
 }
@@ -390,7 +458,12 @@ fn execute(
 
         // 差し込み欄の式（計算列の後に評価するので、計算列の値も使える）
         if let Some(req) = exprs {
-            let spec = serde_json::json!({ "sheet": req.sheet, "schemaId": req.schema, "exprs": req.exprs });
+            let loops: Vec<Value> = req
+                .loops
+                .iter()
+                .map(|l| serde_json::json!({ "source": l.source, "exprs": l.exprs }))
+                .collect();
+            let spec = serde_json::json!({ "sheet": req.sheet, "schemaId": req.schema, "exprs": req.exprs, "loops": loops });
             globals
                 .set("__exprspec", serde_json::to_string(&spec).expect("serialize"))
                 .map_err(|e| e.to_string())?;
@@ -1501,5 +1574,147 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(e, Error::Timeout(_)), "{e}");
+    }
+
+    #[test]
+    fn template_loops_evaluate_per_row_and_per_item() {
+        let mut f = sample();
+        // 明細（配列）を持つ列と、別の表（明細表）を引く式の両方をループの対象にできる
+        f.sheets[0].schemas[0]
+            .columns
+            .push(Column::new("lines", "明細", DataType::Any));
+        f.sheets[0].schemas[0].rows[0].cells.insert(
+            "lines".into(),
+            json!([{"品目": "A", "数": 2}, {"品目": "B", "数": 3}]),
+        );
+        let loops = vec![
+            LoopRequest {
+                source: "明細".into(),
+                exprs: vec![
+                    "品目 + ':' + 数".into(),
+                    "品名 + _n".into(), // 行の列も見える
+                    "_i".into(),
+                    "_item.数 * 数量".into(), // _item と、行の列の両方
+                    "存在しない".into(),
+                ],
+            },
+            LoopRequest {
+                source: "[1, 2].map(x => x * 数量)".into(), // 要素がオブジェクトでない
+                exprs: vec!["_item".into(), "_n".into()],
+            },
+            LoopRequest {
+                source: "品名".into(), // 配列ではない
+                exprs: vec![],
+            },
+        ];
+        let got = evaluate_template(
+            &f,
+            "sh1",
+            "s1",
+            &["_no".to_string()],
+            &loops,
+            &Options::default(),
+        )
+        .unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].top, [v(json!(1))]);
+        let l0 = got[0].loops[0].as_ref().unwrap();
+        assert_eq!(l0.len(), 2);
+        assert_eq!(
+            l0[0][..4],
+            [
+                v(json!("A:2")),
+                v(json!("ねじ1")),
+                v(json!(0)),
+                v(json!(20))
+            ]
+        );
+        assert!(matches!(&l0[0][4], CellResult::Error(_))); // 失敗はその式だけ
+        assert_eq!(
+            l0[1][..4],
+            [
+                v(json!("B:3")),
+                v(json!("ねじ2")),
+                v(json!(1)),
+                v(json!(30))
+            ]
+        );
+        let l1 = got[0].loops[1].as_ref().unwrap();
+        assert_eq!(
+            l1,
+            &[
+                vec![v(json!(10)), v(json!(1))],
+                vec![v(json!(20)), v(json!(2))]
+            ]
+        );
+        assert!(got[0].loops[2]
+            .as_ref()
+            .unwrap_err()
+            .contains("配列ではありません"));
+        // 明細が無い行（null）は、要素なし
+        assert_eq!(got[1].loops[0].as_ref().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn template_loop_source_errors_are_isolated() {
+        let loops = vec![
+            LoopRequest {
+                source: "1 +".into(),
+                exprs: vec![],
+            },
+            LoopRequest {
+                source: "存在しない".into(),
+                exprs: vec![],
+            },
+            LoopRequest {
+                source: "[1]".into(),
+                exprs: vec!["_n".into()],
+            },
+        ];
+        let got =
+            evaluate_template(&sample(), "sh1", "s1", &[], &loops, &Options::default()).unwrap();
+        assert!(got[0].loops[0].is_err() && got[0].loops[1].is_err());
+        assert_eq!(got[0].loops[2].as_ref().unwrap(), &[vec![v(json!(1))]]);
+        let big = vec![LoopRequest {
+            source: "Array(10001).fill(0)".into(),
+            exprs: vec![],
+        }];
+        let got =
+            evaluate_template(&sample(), "sh1", "s1", &[], &big, &Options::default()).unwrap();
+        assert!(got[0].loops[0].as_ref().unwrap_err().contains("多すぎます"));
+    }
+
+    #[test]
+    fn template_exprs_see_nested_fields_by_name() {
+        let mut f = sample();
+        let lines = DataType::Array {
+            item: Box::new(DataType::Object {
+                fields: vec![
+                    Column::new("f_item", "品目", DataType::String),
+                    Column::new("f_n", "数", DataType::Int),
+                ],
+            }),
+        };
+        f.sheets[0].schemas[0]
+            .columns
+            .push(Column::new("lines", "明細", lines));
+        f.sheets[0].schemas[0].rows[0]
+            .cells
+            .insert("lines".into(), json!([{"f_item": "A", "f_n": 2}]));
+        let loops = vec![LoopRequest {
+            source: "明細".into(),
+            exprs: vec!["品目 + 数".into()],
+        }];
+        let got = evaluate_template(
+            &f,
+            "sh1",
+            "s1",
+            &["明細[0].品目".to_string()],
+            &loops,
+            &Options::default(),
+        )
+        .unwrap();
+        assert_eq!(got[0].top, [v(json!("A"))]);
+        assert_eq!(got[0].loops[0].as_ref().unwrap(), &[vec![v(json!("A2"))]]);
     }
 }

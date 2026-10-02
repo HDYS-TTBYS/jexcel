@@ -97,41 +97,82 @@
     // 後ろの計算列や、同じ実行内のマクロ・他の表の計算式からも値が読める。
     // 失敗は行（セル）ごとに記録し、他のセルは計算を続ける。
     // 行オブジェクト（列名 → 値。_id は行 ID、計算列の値も入る）
+    // ネストした値（オブジェクト・配列）は、フィールドの ID ではなく名前をキーにして渡す（テンプレートの {{#each 明細}} で
+    // {{品目}} のように書けるように）。型に合わない値や未知のキーはそのまま残す。
+    const named = (type, v) => {
+      if (v === null || v === undefined) return v;
+      if (type.kind === "array" && Array.isArray(v)) return v.map((x) => named(type.item, x));
+      if (type.kind === "object" && typeof v === "object" && !Array.isArray(v)) {
+        const o = {};
+        for (const k of Object.keys(v)) {
+          const f = type.fields.find((x) => x.id === k);
+          o[f ? f.name : k] = f ? named(f.type, v[k]) : v[k];
+        }
+        return o;
+      }
+      return v;
+    };
     const rowObject = (schema, r) => {
       const o = { _id: r.id };
-      for (const c of schema.columns) o[c.name] = r.cells[c.id] === undefined ? null : r.cells[c.id];
+      for (const c of schema.columns) o[c.name] = r.cells[c.id] === undefined ? null : named(c.type, r.cells[c.id]);
       return o;
     };
 
     // テンプレートの差し込み欄 `{{ 式 }}` を、表の全行について評価する。
     // 式は列名をそのまま変数として使える（with(row)）。row・jx（読み取り専用）・std も使える。
     // _no は 1 から始まる行番号。失敗は行・式ごとに隔離する。
+    // 表の行ループ（{{#each 式}}）は spec.loops に「対象の式」と「ループの中の式」で渡され、
+    // 行ごとに対象の式を評価して配列を得て、要素ごとにループの中の式を評価する。
+    // 要素がオブジェクトならそのキーが変数になる（行の列より優先）。_item（要素）、_i（0 から）、_n（1 から）も使える。
+    const MAX_LOOP_ITEMS = 10000;
     let exprsOut = [];
     function evalExprs(spec) {
       const sheet = data.sheets.find((s) => s.id === spec.sheet);
       const schema = sheet && sheet.schemas.find((s) => s.id === spec.schemaId);
       if (!schema) throw new Error("書き出し対象の表が見つかりません");
       const ro = makeJx(true);
-      const fns = spec.exprs.map((src) => {
+      const compile = (src) => {
         try {
           // 間接 eval なので、モジュールの厳格モードではなく通常のスクリプトとして評価される（with が使える）
-          return { f: (0, eval)("(function (row, jx, std) { with (row) { return (" + src + "\n); } })") };
+          return { f: (0, eval)("(function (row, item, jx, std) { with (row) { with (item) { return (" + src + "\n); } } })") };
         } catch (e) {
           return { e: String((e && e.message) || e) };
         }
-      });
+      };
+      const run = (fn, row, item) => {
+        if (fn.e) return { e: fn.e };
+        try {
+          const v = fn.f(row, item, ro, globalThis.std);
+          return { v: v === undefined ? null : v };
+        } catch (e) {
+          return { e: String((e && e.message) || e) };
+        }
+      };
+      const fns = spec.exprs.map(compile);
+      const loops = (spec.loops || []).map((l) => ({ source: compile(l.source), body: l.exprs.map(compile) }));
+      const none = {};
       exprsOut = schema.rows.map((r, i) => {
         const row = rowObject(schema, r);
         row._no = i + 1;
-        return fns.map((fn) => {
-          if (fn.e) return { e: fn.e };
-          try {
-            const v = fn.f(row, ro, globalThis.std);
-            return { v: v === undefined ? null : v };
-          } catch (e) {
-            return { e: String((e && e.message) || e) };
-          }
-        });
+        return {
+          top: fns.map((fn) => run(fn, row, none)),
+          loops: loops.map((l) => {
+            const src = run(l.source, row, none);
+            if ("e" in src) return { e: src.e };
+            const list = src.v === null ? [] : src.v;
+            if (!Array.isArray(list)) return { e: "ループの対象が配列ではありません" };
+            if (list.length > MAX_LOOP_ITEMS) return { e: "ループの対象が多すぎます（上限 " + MAX_LOOP_ITEMS + " 件）" };
+            return {
+              items: list.map((it, k) => {
+                const item = it !== null && typeof it === "object" && !Array.isArray(it) ? Object.assign({}, it) : {};
+                item._item = it;
+                item._i = k;
+                item._n = k + 1;
+                return l.body.map((fn) => run(fn, row, item));
+              }),
+            };
+          }),
+        };
       });
     }
 

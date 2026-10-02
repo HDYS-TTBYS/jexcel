@@ -151,6 +151,11 @@ export default function ExportPanel({ backend, file, onSnapshot, onError, onConf
             テンプレートの中に <code>{"{{品名}}"}</code> や <code>{"{{数量 * 単価}}"}</code> のように書きます。列名はそのまま変数として使え、
             <code>std</code>（標準ライブラリ）も使えます。
           </p>
+          <p className="muted">
+            表の行（Word は表の行、Excel はシートの行）のどこかに <code>{"{{#each 明細}}"}</code> と書くと、その行が <code>明細</code> の配列の要素の数だけ
+            繰り返されます。行の中では要素のキー（<code>{"{{品目}}"}</code>）や <code>_item</code>・<code>_n</code>（1 から数える番号）が使えます。
+            対象は、配列の列のほか、<code>{'jx.sheet("シート1").schema("明細").rows().filter(r => r.番号 === 番号)'}</code> のような式でもかまいません。
+          </p>
         </div>
       ) : (
         <div className="export-body">
@@ -235,6 +240,28 @@ export default function ExportPanel({ backend, file, onSnapshot, onError, onConf
                 </table>
               </div>
               {preview.totalRows > preview.rows.length && <p className="muted">先頭 {preview.rows.length} 行を表示しています。</p>}
+              {preview.loops.length > 0 && (
+                <div className="loops">
+                  <h4>行ループ</h4>
+                  {preview.loops.map((l, i) => (
+                    <div key={i} className="loop">
+                      <p>
+                        <code>{`{{#each ${l.source}}}`}</code> の中の欄:{" "}
+                        {l.exprs.length === 0 ? <span className="muted">なし</span> : l.exprs.map((x) => <code key={x}>{x}</code>)}
+                      </p>
+                      <p className="muted">
+                        繰り返しの回数（行ごと）:{" "}
+                        {l.counts.map((c, k) => (
+                          <span key={k} className={"e" in c ? "cell-error" : ""} title={"e" in c ? c.e : undefined}>
+                            {k + 1} 行目 {"e" in c ? "エラー" : `${String(c.v)} 件`}
+                            {k < l.counts.length - 1 ? " / " : ""}
+                          </span>
+                        ))}
+                      </p>
+                    </div>
+                  ))}
+                </div>
+              )}
             </>
           )}
 

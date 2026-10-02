@@ -100,8 +100,21 @@ pub struct ExportRowError {
 pub struct ExportPreview {
     /// テンプレートに含まれる差し込み欄の式
     pub placeholders: Vec<String>,
+    /// テンプレートの行ループ（`{{#each 式}}`）
+    pub loops: Vec<ExportPreviewLoop>,
     pub total_rows: usize,
     pub rows: Vec<ExportPreviewRow>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportPreviewLoop {
+    /// 繰り返す配列の式
+    pub source: String,
+    /// ループの中の差し込み欄の式
+    pub exprs: Vec<String>,
+    /// プレビューした行ごとの、繰り返しの回数（要素数）か、対象の式のエラー
+    pub counts: Vec<jxcel_macro::CellResult>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -690,6 +703,19 @@ impl Session {
         };
         Ok(ExportPreview {
             placeholders: p.placeholders,
+            loops: p
+                .loops
+                .into_iter()
+                .map(|l| ExportPreviewLoop {
+                    source: l.source,
+                    exprs: l.exprs,
+                    counts: l
+                        .counts
+                        .into_iter()
+                        .map(|c| cell(c.map(|n| Value::from(n as u64))))
+                        .collect(),
+                })
+                .collect(),
             total_rows: p.total_rows,
             rows: p
                 .rows
@@ -1210,6 +1236,110 @@ mod tests {
         let path = dir.join("invoices.jxcel");
         std::fs::write(&path, file.to_zip().unwrap()).unwrap();
         path.to_str().unwrap().to_string()
+    }
+
+    /// 明細（配列の列）を持つ「請求」表のファイルを、ディスクに書いて返す。
+    fn loop_file(dir: &std::path::Path) -> String {
+        let lines = DataType::Array {
+            item: Box::new(DataType::Object {
+                fields: vec![
+                    Column::new("f1", "品目", DataType::String),
+                    Column::new("f2", "数", DataType::Int),
+                ],
+            }),
+        };
+        let mut schema = DataSchema::new(
+            "請求",
+            vec![
+                Column::new("c1", "取引先", DataType::String),
+                Column::new("c2", "合計", DataType::Int),
+                Column::new("c3", "単価", DataType::Int),
+                Column::new("c4", "請求番号", DataType::String),
+                Column::new("c5", "発行日", DataType::Date),
+                Column::new("c6", "明細", lines),
+            ],
+        );
+        for (i, (client, lines)) in [
+            (
+                "A社",
+                json!([{"f1": "ねじ", "f2": 2}, {"f1": "ナット", "f2": 3}]),
+            ),
+            ("B社", json!([])),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            schema.rows.push(Row {
+                id: format!("r{i}"),
+                cells: [
+                    ("c1", json!(client)),
+                    ("c2", json!(500)),
+                    ("c3", json!(100)),
+                    ("c4", json!(format!("INV-{i}"))),
+                    ("c5", json!("2026-10-02")),
+                    ("c6", lines),
+                ]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect(),
+            });
+        }
+        let file = JxcelFile {
+            name: "請求".into(),
+            sheets: vec![Sheet {
+                id: "sh".into(),
+                name: "請求".into(),
+                schemas: vec![schema],
+            }],
+            ..Default::default()
+        };
+        let path = dir.join("loops.jxcel");
+        std::fs::write(&path, file.to_zip().unwrap()).unwrap();
+        path.to_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn export_row_loops_repeat_rows_over_a_nested_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out");
+        let mut s = Session::new();
+        let snap = s.open(&loop_file(dir.path())).unwrap();
+        let schema = snap.file.sheets[0].schemas[0].id.clone();
+
+        for (template, ext) in [("loop.docx", "docx"), ("loop.xlsx", "xlsx")] {
+            let snap = s.add_export(&fixture(template), None).unwrap();
+            let id = snap.file.exports.last().unwrap().id.clone();
+            s.update_export(&id, "請求書", "sh", &schema, "{{取引先}}", None)
+                .unwrap();
+
+            // プレビュー: ループの対象・中の欄・行ごとの件数が分かる
+            let p = s.export_preview(&id, 5).unwrap();
+            assert_eq!(p.loops.len(), 1, "{ext}");
+            assert_eq!(p.loops[0].source, "明細");
+            assert!(p.loops[0].exprs.iter().any(|e| e == "品目"));
+            assert_eq!(
+                p.loops[0].counts,
+                [
+                    jxcel_macro::CellResult::Value(json!(2)),
+                    jxcel_macro::CellResult::Value(json!(0))
+                ]
+            );
+
+            let r = s.run_export(&id, out.to_str().unwrap()).unwrap();
+            assert_eq!((r.written.len(), r.errors.len()), (2, 0), "{ext}: {r:?}");
+            let bytes = std::fs::read(out.join(format!("A社.{ext}"))).unwrap();
+            let pkg = jxcel_export::package::Package::read(&bytes).unwrap();
+            let part = if ext == "docx" {
+                "word/document.xml"
+            } else {
+                "xl/worksheets/sheet1.xml"
+            };
+            let xml = String::from_utf8(pkg.get(part).unwrap().to_vec()).unwrap();
+            // 配列の列のフィールドが、ID ではなく名前で見える
+            assert!(xml.contains("ねじ") && xml.contains("ナット"), "{ext}");
+            assert!(!xml.contains("{{"), "{ext}: 差し込み欄が残っている");
+            s.delete_export(&id).unwrap();
+        }
     }
 
     #[test]

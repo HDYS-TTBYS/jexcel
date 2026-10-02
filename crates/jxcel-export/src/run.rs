@@ -3,11 +3,11 @@
 use std::collections::{HashMap, HashSet};
 
 use jxcel_core::JxcelFile;
-use jxcel_macro::{CellResult, Options};
+use jxcel_macro::{CellResult, LoopRequest, Options, RowEval};
 use serde_json::Value;
 
 use crate::placeholder::{find, replace_all};
-use crate::{render, scan, Error, Kind, Result};
+use crate::{plan, render_with, Error, Kind, Plan, Result, Source};
 
 /// 書き出しの指定。
 pub struct Spec<'a> {
@@ -77,10 +77,10 @@ fn pattern_of(spec: &Spec) -> String {
     }
 }
 
-fn collect(spec: &Spec) -> Result<(Exprs, Vec<String>)> {
-    let placeholders = scan(spec.kind, spec.template)?;
+fn collect(spec: &Spec) -> Result<(Exprs, Plan)> {
+    let plan = plan(spec.kind, spec.template)?;
     let mut exprs = Exprs::new();
-    for p in &placeholders {
+    for p in &plan.placeholders {
         exprs.add(p);
     }
     for m in find(&pattern_of(spec)) {
@@ -89,21 +89,72 @@ fn collect(spec: &Spec) -> Result<(Exprs, Vec<String>)> {
     if let Some(f) = spec.filter.map(str::trim).filter(|f| !f.is_empty()) {
         exprs.add(f);
     }
-    Ok((exprs, placeholders))
+    Ok((exprs, plan))
 }
 
 fn evaluate(
     file: &JxcelFile,
     spec: &Spec,
     exprs: &Exprs,
+    plan: &Plan,
     opts: &Options,
-) -> Result<Vec<Vec<CellResult>>> {
-    jxcel_macro::evaluate_exprs(file, spec.sheet, spec.schema, &exprs.list, opts).map_err(|e| {
-        Error::Expr {
+) -> Result<Vec<RowEval>> {
+    let loops: Vec<LoopRequest> = plan
+        .loops
+        .iter()
+        .map(|l| LoopRequest {
+            source: l.source.clone(),
+            exprs: l.exprs.clone(),
+        })
+        .collect();
+    jxcel_macro::evaluate_template(file, spec.sheet, spec.schema, &exprs.list, &loops, opts)
+        .map_err(|e| Error::Expr {
             expr: "（式の評価）".into(),
             message: e.to_string(),
+        })
+}
+
+/// 1 行分の評価結果から値を引く（テンプレートの差し込み先）。
+struct RowSource<'a> {
+    exprs: &'a Exprs,
+    plan: &'a Plan,
+    eval: &'a RowEval,
+}
+
+impl RowSource<'_> {
+    fn top(&self, expr: &str) -> std::result::Result<Value, String> {
+        cell_to_result(&self.eval.top[self.exprs.index[expr]])
+    }
+}
+
+impl Source for RowSource<'_> {
+    fn value(&mut self, expr: &str) -> std::result::Result<Value, String> {
+        self.top(expr)
+    }
+
+    fn loop_len(&mut self, index: usize, _: &str) -> std::result::Result<usize, String> {
+        match &self.eval.loops[index] {
+            Ok(items) => Ok(items.len()),
+            Err(e) => Err(e.clone()),
         }
-    })
+    }
+
+    fn item_value(
+        &mut self,
+        index: usize,
+        item: usize,
+        expr: &str,
+    ) -> std::result::Result<Value, String> {
+        let pos = self.plan.loops[index]
+            .exprs
+            .iter()
+            .position(|e| e == expr)
+            .ok_or_else(|| format!("評価していない欄です: {expr}"))?;
+        match &self.eval.loops[index] {
+            Ok(items) => cell_to_result(&items[item][pos]),
+            Err(e) => Err(e.clone()),
+        }
+    }
 }
 
 fn cell_to_result(c: &CellResult) -> std::result::Result<Value, String> {
@@ -175,22 +226,27 @@ fn finish_filename(stem: &str, row_no: usize, ext: &str, used: &mut HashSet<Stri
 
 /// 全行を書き出す。行ごとの失敗は `errors` に集め、他の行は続ける。
 pub fn export(file: &JxcelFile, spec: &Spec, opts: &Options) -> Result<Report> {
-    let (exprs, _) = collect(spec)?;
-    let matrix = evaluate(file, spec, &exprs, opts)?;
+    let (exprs, plan) = collect(spec)?;
+    let matrix = evaluate(file, spec, &exprs, &plan, opts)?;
     let rows = row_ids(file, spec);
     let pattern = pattern_of(spec);
     let filter = spec.filter.map(str::trim).filter(|f| !f.is_empty());
 
     let mut report = Report::default();
     let mut used = HashSet::new();
-    for (i, (row_id, cells)) in rows.iter().zip(&matrix).enumerate() {
+    for (i, (row_id, eval)) in rows.iter().zip(&matrix).enumerate() {
         let row_no = i + 1;
         let fail = |message: String| RowError {
             row_id: row_id.clone(),
             row_no,
             message,
         };
-        let lookup = |expr: &str| cell_to_result(&cells[exprs.index[expr]]);
+        let source = RowSource {
+            exprs: &exprs,
+            plan: &plan,
+            eval,
+        };
+        let lookup = |expr: &str| source.top(expr);
 
         if let Some(f) = filter {
             match lookup(f) {
@@ -215,7 +271,12 @@ pub fn export(file: &JxcelFile, spec: &Spec, opts: &Options) -> Result<Report> {
                 continue;
             }
         };
-        match render(spec.kind, spec.template, &mut |e| lookup(e)) {
+        let mut source = RowSource {
+            exprs: &exprs,
+            plan: &plan,
+            eval,
+        };
+        match render_with(spec.kind, spec.template, &mut source) {
             Ok(bytes) => {
                 let filename = finish_filename(&stem, row_no, spec.kind.extension(), &mut used);
                 report.files.push(GeneratedFile {
@@ -251,10 +312,23 @@ pub struct PreviewRow {
     pub values: Vec<std::result::Result<Value, String>>,
 }
 
+/// テンプレートの行ループ 1 つ分のプレビュー。
+#[derive(Debug)]
+pub struct PreviewLoop {
+    /// `{{#each 式}}` の式
+    pub source: String,
+    /// ループの中の差し込み欄の式
+    pub exprs: Vec<String>,
+    /// プレビューした行ごとの要素数（か、対象の式のエラー）
+    pub counts: Vec<std::result::Result<usize, String>>,
+}
+
 #[derive(Debug)]
 pub struct Preview {
-    /// テンプレートに含まれる差し込み欄の式
+    /// テンプレートに含まれる差し込み欄の式（ループの外）
     pub placeholders: Vec<String>,
+    /// 行ループ
+    pub loops: Vec<PreviewLoop>,
     pub rows: Vec<PreviewRow>,
     /// 対象の行の総数
     pub total_rows: usize,
@@ -262,8 +336,8 @@ pub struct Preview {
 
 /// 書き出す前の確認用。テンプレートの欄と、先頭 `limit` 行の値・ファイル名を返す。
 pub fn preview(file: &JxcelFile, spec: &Spec, limit: usize, opts: &Options) -> Result<Preview> {
-    let (exprs, placeholders) = collect(spec)?;
-    let matrix = evaluate(file, spec, &exprs, opts)?;
+    let (exprs, plan) = collect(spec)?;
+    let matrix = evaluate(file, spec, &exprs, &plan, opts)?;
     let pattern = pattern_of(spec);
     let filter = spec.filter.map(str::trim).filter(|f| !f.is_empty());
     let mut used = HashSet::new();
@@ -271,8 +345,8 @@ pub fn preview(file: &JxcelFile, spec: &Spec, limit: usize, opts: &Options) -> R
         .iter()
         .take(limit)
         .enumerate()
-        .map(|(i, cells)| {
-            let lookup = |expr: &str| cell_to_result(&cells[exprs.index[expr]]);
+        .map(|(i, eval)| {
+            let lookup = |expr: &str| cell_to_result(&eval.top[exprs.index[expr]]);
             let excluded = filter.is_some_and(|f| lookup(f).is_ok_and(|v| !truthy(&v)));
             let filename = replace_all(&pattern, &mut |e| lookup(e))
                 .map(|stem| finish_filename(&stem, i + 1, spec.kind.extension(), &mut used))
@@ -281,12 +355,27 @@ pub fn preview(file: &JxcelFile, spec: &Spec, limit: usize, opts: &Options) -> R
                 row_no: i + 1,
                 excluded,
                 filename,
-                values: placeholders.iter().map(|p| lookup(p)).collect(),
+                values: plan.placeholders.iter().map(|p| lookup(p)).collect(),
             }
         })
         .collect();
+    let loops = plan
+        .loops
+        .iter()
+        .enumerate()
+        .map(|(k, l)| PreviewLoop {
+            source: l.source.clone(),
+            exprs: l.exprs.clone(),
+            counts: matrix
+                .iter()
+                .take(limit)
+                .map(|e| e.loops[k].as_ref().map(Vec::len).map_err(Clone::clone))
+                .collect(),
+        })
+        .collect();
     Ok(Preview {
-        placeholders,
+        placeholders: plan.placeholders,
+        loops,
         rows,
         total_rows: matrix.len(),
     })

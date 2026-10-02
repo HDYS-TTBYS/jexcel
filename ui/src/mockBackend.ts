@@ -230,7 +230,8 @@ function evalExprsInBrowser(file: JxcelFile, sheet: string, schemaId: string, ex
   const fake = loadRuntime();
   const state = (fake.__makeState as (d: JxcelFile) => { evalExprs: (s: unknown) => void; finish: (r: unknown) => string })(structuredClone(file));
   state.evalExprs({ sheet, schemaId, exprs });
-  return JSON.parse(state.finish(null)).exprs;
+  // 行ごとに { top: 通常の式の結果, loops: 行ループの結果 }。モックは行ループを使わない
+  return (JSON.parse(state.finish(null)).exprs as { top: { v?: unknown; e?: string }[] }[]).map((r) => r.top);
 }
 
 export function createMockBackend(): Backend {
@@ -523,6 +524,7 @@ export function createMockBackend(): Backend {
       const used = new Set<string>();
       return {
         placeholders,
+        loops: [], // ブラウザ単体ではテンプレートの中身を読めないので、行ループは分からない
         totalRows: matrix.length,
         rows: matrix.slice(0, limit).map((row, i) => {
           const at = (x: string) => row[exprs.indexOf(x)];

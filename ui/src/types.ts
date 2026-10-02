@@ -116,8 +116,19 @@ export interface ExportPreviewRow {
   values: CellResult[];
 }
 
+/** テンプレートの行ループ（`{{#each 式}}`） */
+export interface ExportPreviewLoop {
+  /** 繰り返す配列の式 */
+  source: string;
+  /** ループの中の差し込み欄の式 */
+  exprs: string[];
+  /** プレビューした行ごとの繰り返しの回数（要素数）か、対象の式のエラー */
+  counts: CellResult[];
+}
+
 export interface ExportPreview {
   placeholders: string[];
+  loops: ExportPreviewLoop[];
   totalRows: number;
   rows: ExportPreviewRow[];
 }

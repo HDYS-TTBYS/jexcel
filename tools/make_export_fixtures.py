@@ -106,9 +106,70 @@ def make_shared_strings_xlsx():
             check=True, capture_output=True, timeout=180,
         )
         shutil.copy(pathlib.Path(tmp) / "invoice-inline.xlsx", OUT / "invoice.xlsx")
+        subprocess.run(
+            ["soffice", "--headless", "--convert-to", "xlsx", "--outdir", tmp, str(OUT / "loop-inline.xlsx")],
+            check=True, capture_output=True, timeout=180,
+        )
+        shutil.copy(pathlib.Path(tmp) / "loop-inline.xlsx", OUT / "loop.xlsx")
+
+
+def make_loop_docx():
+    """行ループ（表の行の繰り返し）を使う docx。印は欄と同じく複数のランに分割される。"""
+    d = Document()
+    d.add_paragraph("宛先: {{取引先}}")
+    t = d.add_table(rows=4, cols=3)
+    t.style = "Table Grid"
+    for i, h in enumerate(["品名", "数量", "金額"]):
+        t.cell(0, i).text = h
+    # 2 行目: ループの行。印が品名のセルの先頭にあり、Word のように複数のランに分かれている
+    p = t.cell(1, 0).paragraphs[0]
+    p.add_run("{{#ea")
+    p.add_run("ch 明細}}")
+    p.add_run("{{品目}}").bold = True
+    t.cell(1, 1).text = "{{数 * 単価}}"
+    t.cell(1, 2).text = "{{_n}}/{{取引先}}"
+    t.cell(2, 0).text = "合計"
+    t.cell(2, 2).text = "{{合計}}"
+    t.cell(3, 0).text = "ループの外の行"
+    d.add_paragraph("末尾")
+    d.save(OUT / "loop.docx")
+
+
+def make_loop_xlsx():
+    """行ループ・日付・ヘッダー/フッター・数式・結合セルを使う xlsx（インライン文字列。共有文字列版は別に作る）。"""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "請求書"
+    ws["A1"] = "請求書 {{請求番号}}"
+    ws["A2"] = "発行日"
+    ws["B2"] = "{{発行日}}"
+    ws["B2"].number_format = "yyyy/mm/dd"          # 日付の表示形式 → Excel の日付になる
+    ws["A3"] = "文字列の日付"
+    ws["B3"] = "{{発行日}}"                          # 標準の書式 → 文字列のまま
+    ws["C3"] = "{{発行日}} 発行"                      # 文字列に埋め込み → 文字列のまま
+    ws["A4"] = "品目"
+    ws["B4"] = "数量"
+    ws["C4"] = "金額"
+    ws["A5"] = "{{#each 明細}}{{品目}}"              # ループの行
+    ws["B5"] = "{{数}}"
+    ws["C5"] = "=B5*単価"                            # 自分の行を参照する数式（単価は名前なので触らない）
+    ws["C5"] = "=B5*100"
+    ws["D5"] = "{{_n}}"
+    ws["A6"] = "合計"
+    ws["B6"] = "=SUM(B5:B5)"                         # ループの行を含む範囲 → 広がる
+    ws["C6"] = "=SUM(C5:C5)"
+    ws["A7"] = "ループの外"
+    ws["B7"] = "=B6+1"                               # 後ろの行への参照 → ずれる
+    ws.merge_cells("A8:B8")
+    ws["A8"] = "結合セル（ループの外）"
+    ws.oddHeader.center.text = "請求書 {{請求番号}} & 御中"
+    ws.oddFooter.right.text = "{{取引先}}"
+    wb.save(OUT / "loop-inline.xlsx")
 
 
 make_docx()
 make_xlsx()
+make_loop_docx()
+make_loop_xlsx()
 make_shared_strings_xlsx()
 print("generated:", sorted(p.name for p in OUT.iterdir()))
