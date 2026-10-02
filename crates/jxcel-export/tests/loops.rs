@@ -668,3 +668,133 @@ fn xlsx_defined_names_follow_the_shifted_rows() {
         b.iter().map(|n| n.text()).collect::<Vec<_>>()
     );
 }
+
+/// 入れ子のテンプレートに、手を入れたもの: 明細シートに自分を名前つきで指す参照と共有数式、
+/// 別のシート（集計）に、明細を指す数式（共有数式を含む）を足す。
+fn nested_xlsx_with_other_references() -> Vec<u8> {
+    let mut pkg = Package::read(NESTED_XLSX).unwrap();
+    let edit = |pkg: &mut Package, name: &str, f: &dyn Fn(String) -> String| {
+        let text = String::from_utf8(pkg.get(name).unwrap().to_vec()).unwrap();
+        pkg.set(name, f(text).into_bytes());
+    };
+    edit(&mut pkg, "xl/worksheets/sheet1.xml", &|t| {
+        t
+            // 自分を名前つきで指す参照（3 行目 = 見出しの行。同じ回の見出しを指す）と、ループの外の行を指す参照
+            .replace(
+                "<f>B3*100</f><v></v></c></row>",
+                "<f>B3*100</f><v></v></c><c r=\"D3\"><f>明細!B3+1</f></c><c r=\"E3\"><f t=\"shared\" ref=\"E3:E4\" si=\"0\">B3+1</f></c></row>",
+            )
+            .replace(
+                "<f>C3</f><v></v></c></row>",
+                "<f>C3</f><v></v></c><c r=\"E4\"><f t=\"shared\" si=\"0\"/></c></row>",
+            )
+            // ループの外の共有数式
+            .replace(
+                "<f>C5+1</f><v></v></c></row>",
+                "<f>C5+1</f><v></v></c><c r=\"D6\"><f t=\"shared\" ref=\"D6:E6\" si=\"1\">B6*2</f></c><c r=\"E6\"><f t=\"shared\" si=\"1\"/></c><c r=\"F6\"><f>'明細'!$B$6+Sheet2!A1</f></c></row>",
+            )
+    });
+    pkg.set(
+        "xl/worksheets/sheet2.xml",
+        concat!(
+            "<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><sheetData>",
+            "<row r=\"1\"><c r=\"A1\"><f>明細!B6</f></c><c r=\"B1\"><f>SUM(明細!C3:C5)</f></c><c r=\"C1\"><f>'明細'!$A$1&amp;\"明細!B6\"</f></c></row>",
+            "<row r=\"3\"><c r=\"A3\"><f t=\"shared\" ref=\"A3:A4\" si=\"0\">明細!B5</f></c></row>",
+            "<row r=\"4\"><c r=\"A4\"><f t=\"shared\" si=\"0\"/></c></row>",
+            "</sheetData></worksheet>"
+        )
+        .as_bytes()
+        .to_vec(),
+    );
+    edit(&mut pkg, "xl/workbook.xml", &|t| {
+        t.replace(
+            "</sheets>",
+            "<sheet xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" name=\"Sheet2\" sheetId=\"2\" state=\"visible\" r:id=\"rId9\"/></sheets>",
+        )
+    });
+    edit(&mut pkg, "xl/_rels/workbook.xml.rels", &|t| {
+        t.replace(
+            "</Relationships>",
+            "<Relationship Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"/xl/worksheets/sheet2.xml\" Id=\"rId9\"/></Relationships>",
+        )
+    });
+    edit(&mut pkg, "[Content_Types].xml", &|t| {
+        t.replace(
+            "</Types>",
+            "<Override PartName=\"/xl/worksheets/sheet2.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/></Types>",
+        )
+    });
+    pkg.write().unwrap()
+}
+
+fn formulas_of(zip: &[u8], name: &str) -> BTreeMap<String, String> {
+    let root = part(zip, name);
+    let mut cs = vec![];
+    elements(&root, "c", &mut cs);
+    cs.iter()
+        .filter_map(|c| {
+            let mut f = vec![];
+            elements(c, "f", &mut f);
+            let f = f.first()?;
+            assert!(
+                f.attr("t").is_none(),
+                "共有数式が残っている: {:?}",
+                c.attr("r")
+            );
+            Some((c.attr("r").unwrap().to_string(), f.text()))
+        })
+        .collect()
+}
+
+#[test]
+fn xlsx_formulas_follow_rows_through_qualified_references_other_sheets_and_shared_formulas() {
+    let template = nested_xlsx_with_other_references();
+    let out =
+        render_with(Kind::Xlsx, &template, &mut Nest::sample()).unwrap_or_else(|e| panic!("{e}"));
+
+    // 明細シート。1 つ目の明細（行 3〜6）・2 つ目（行 7〜9）・総合計（行 10）
+    let f = formulas_of(&out, "xl/worksheets/sheet1.xml");
+    // 自分を名前つきで指す参照も、同じ回の見出しの行を指す
+    assert_eq!(f["D3"], "明細!B3+1");
+    assert_eq!(f["D7"], "明細!B7+1");
+    // 共有数式は 1 つずつの数式になり、それぞれの回の行を指す（E4 は元の `B4+1`）
+    assert_eq!(f["E3"], "B3+1");
+    assert_eq!(f["E4"], "B4+1");
+    assert_eq!(f["E5"], "B5+1");
+    assert_eq!(f["E7"], "B7+1");
+    assert_eq!(f["E8"], "B8+1");
+    // ループの外の共有数式は、ずれた行に合わせる（D6:E6 → D10:E10。E は元の `C6*2`）
+    assert_eq!(f["D10"], "B10*2");
+    assert_eq!(f["E10"], "C10*2");
+    // 名前つき（引用符あり）でループの外の行を指す参照と、ほかのシートへの参照
+    assert_eq!(f["F10"], "'明細'!$B$10+Sheet2!A1");
+
+    // 別のシート: 明細への名前つきの参照がずれる（1 つの参照は最初のコピー、範囲は最後のコピーまで）
+    let g = formulas_of(&out, "xl/worksheets/sheet2.xml");
+    assert_eq!(g["A1"], "明細!B10");
+    assert_eq!(g["B1"], "SUM(明細!C3:C9)");
+    assert_eq!(g["C1"], "'明細'!$A$1&\"明細!B6\""); // 文字列リテラルの中は触らない
+                                                    // 共有数式: 元は A3 = 明細!B5、A4 = 明細!B6。それぞれの行へ
+    assert_eq!(g["A3"], "明細!B6");
+    assert_eq!(g["A4"], "明細!B10");
+}
+
+#[test]
+fn xlsx_references_in_sheets_without_loops_are_left_alone() {
+    // ずれたシートを指さない数式しかないシートは、バイト列も変わらない
+    let template = nested_xlsx_with_other_references();
+    let mut pkg = Package::read(&template).unwrap();
+    pkg.set(
+        "xl/worksheets/sheet2.xml",
+        br#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1"><f t="shared" ref="A1:A2" si="0">B1+Sheet9!A1</f></c></row><row r="2"><c r="A2"><f t="shared" si="0"/></c></row></sheetData></worksheet>"#.to_vec(),
+    );
+    let before = pkg.get("xl/worksheets/sheet2.xml").unwrap().to_vec();
+    let out = render_with(Kind::Xlsx, &pkg.write().unwrap(), &mut Nest::sample()).unwrap();
+    assert_eq!(
+        Package::read(&out)
+            .unwrap()
+            .get("xl/worksheets/sheet2.xml")
+            .unwrap(),
+        &before[..]
+    );
+}

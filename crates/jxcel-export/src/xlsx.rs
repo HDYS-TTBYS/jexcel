@@ -32,6 +32,8 @@ struct Ctx<'a> {
     date_styles: Vec<bool>,
     /// 1904 年始まりの日付システムか
     date1904: bool,
+    /// いま処理しているシートの名前
+    sheet_name: Option<String>,
 }
 
 /// いまの位置。
@@ -93,20 +95,31 @@ pub fn process(pkg: &mut Package, src: &mut dyn Source) -> Result<()> {
         shared,
         date_styles,
         date1904,
+        sheet_name: None,
     };
     let names = sheet_names(pkg)?;
     // 行がずれたシートの記録（シート名 → 記録）。定義名の参照をずらすのに使う
     let mut moved: std::collections::HashMap<String, Moves> = Default::default();
     let mut any = false;
-    for name in sheets {
-        let mut doc = xml::parse(pkg.get(&name).expect("listed"))?;
+    for name in &sheets {
+        let mut doc = xml::parse(pkg.get(name).expect("listed"))?;
         let mut moves = None;
+        ctx.sheet_name = names.get(name).cloned();
         if sheet(&mut doc.root, &mut ctx, &mut moves)? {
-            pkg.set(&name, xml::write(&doc)?);
+            pkg.set(name, xml::write(&doc)?);
             any = true;
         }
-        if let (Some(m), Some(sheet_name)) = (moves, names.get(&name)) {
+        if let (Some(m), Some(sheet_name)) = (moves, names.get(name)) {
             moved.insert(sheet_name.clone(), m);
+        }
+    }
+    // 行がずれたシートを、ほかのシートの数式が名前つきで指している参照をずらす
+    if !moved.is_empty() {
+        for name in &sheets {
+            let mut doc = xml::parse(pkg.get(name).expect("listed"))?;
+            if shift_other_sheet_refs(&mut doc.root, names.get(name).map(String::as_str), &moved) {
+                pkg.set(name, xml::write(&doc)?);
+            }
         }
     }
     if any {
@@ -342,6 +355,65 @@ fn sheet(root: &mut Element, ctx: &mut Ctx, moved: &mut Option<Moves>) -> Result
     Ok(changed)
 }
 
+/// このシートの数式の中の、ほかの（行がずれた）シートへの参照をずらす。変えたら true。
+/// 共有数式は、先に 1 つずつの数式に展開する（参照先が動くと、共有の相対位置が崩れるため）。
+fn shift_other_sheet_refs(
+    root: &mut Element,
+    own_name: Option<&str>,
+    moved: &std::collections::HashMap<String, Moves>,
+) -> bool {
+    let Some(sd) = child_mut(root, "sheetData") else {
+        return false;
+    };
+    let formulas = |sd: &Element| -> Vec<String> {
+        let mut v = vec![];
+        for r in &sd.children {
+            let Node::Element(r) = r else { continue };
+            for c in &r.children {
+                if let Node::Element(c) = c {
+                    if let Some(f) = child(c, "f") {
+                        v.push(f.text());
+                    }
+                }
+            }
+        }
+        v
+    };
+    if !formulas(sd)
+        .iter()
+        .any(|t| !t.is_empty() && shift_sheet_refs(t, moved, own_name) != *t)
+    {
+        return false;
+    }
+    let nodes = std::mem::take(&mut sd.children);
+    let (mut rows, others): (Vec<_>, Vec<_>) = nodes
+        .into_iter()
+        .partition(|n| matches!(n, Node::Element(_)));
+    let mut rows: Vec<Element> = rows
+        .drain(..)
+        .filter_map(|n| match n {
+            Node::Element(e) => Some(e),
+            _ => None,
+        })
+        .collect();
+    expand_shared(&mut rows);
+    for row in &mut rows {
+        for n in &mut row.children {
+            let Node::Element(c) = n else { continue };
+            if let Some(f) = child_mut(c, "f") {
+                let text = f.text();
+                if !text.is_empty() {
+                    f.set_text(&shift_sheet_refs(&text, moved, own_name));
+                }
+            }
+        }
+    }
+    sd.children = others;
+    sd.children.extend(rows.into_iter().map(Node::Element));
+    drop_cached_results(root);
+    true
+}
+
 /// 部品のパス（`xl/worksheets/sheet1.xml`）→ シート名。`workbook.xml` と、その関係の定義から引く。
 fn sheet_names(pkg: &Package) -> Result<std::collections::HashMap<String, String>> {
     let mut out = std::collections::HashMap::new();
@@ -392,7 +464,7 @@ fn shift_defined_names(workbook: &mut Element, moved: &std::collections::HashMap
             continue;
         }
         let text = e.text();
-        let shifted = shift_sheet_refs(&text, moved);
+        let shifted = shift_sheet_refs(&text, moved, None);
         if shifted != text {
             e.set_text(&shifted);
         }
@@ -401,7 +473,11 @@ fn shift_defined_names(workbook: &mut Element, moved: &std::collections::HashMap
 
 /// `Sheet1!$A$1:$C$8` のような、シート名つきの参照（範囲・行だけの範囲 `Sheet1!$1:$3`）をずらす。
 /// 対象は `moved` にあるシートだけ。文字列リテラルの中は触らない。
-fn shift_sheet_refs(f: &str, moved: &std::collections::HashMap<String, Moves>) -> String {
+fn shift_sheet_refs(
+    f: &str,
+    moved: &std::collections::HashMap<String, Moves>,
+    skip: Option<&str>,
+) -> String {
     let chars: Vec<char> = f.chars().collect();
     let mut out = String::with_capacity(f.len());
     let mut i = 0;
@@ -480,7 +556,10 @@ fn shift_sheet_refs(f: &str, moved: &std::collections::HashMap<String, Moves>) -
         } else {
             (None, a_end)
         };
-        match moved.get(&sheet) {
+        match moved
+            .get(&sheet)
+            .filter(|_| skip.is_none_or(|k| !same_sheet(k, &sheet)))
+        {
             Some(m) => out.push_str(&map_sheet_ref(&a, b.as_deref(), m)),
             None => out.extend(&chars[i..end]),
         }
@@ -787,6 +866,7 @@ fn sheet_data(sd: &mut Element, ctx: &mut Ctx, moves: &mut Moves) -> Result<bool
         return Ok(changed);
     }
 
+    expand_shared(&mut rows);
     number(&mut blocks, &mut ctx.next_loop);
     let rblocks = to_rblocks(&blocks, &nums);
     if nums.windows(2).any(|w| w[1] <= w[0]) {
@@ -821,7 +901,7 @@ fn sheet_data(sd: &mut Element, ctx: &mut Ctx, moves: &mut Moves) -> Result<bool
     for p in placed {
         let mut row = rows[p.orig].clone();
         let refs = moves.refs(&p.chain);
-        place_row(&mut row, p.new, &refs, moves);
+        place_row(&mut row, p.new, &refs, moves, ctx.sheet_name.as_deref());
         cells(&mut row, ctx, &p.scope)?;
         out.push(Node::Element(row));
     }
@@ -830,7 +910,7 @@ fn sheet_data(sd: &mut Element, ctx: &mut Ctx, moves: &mut Moves) -> Result<bool
 }
 
 /// 行の番号とセルの番地を `row` に付け替え、数式の参照をずらす。`own` は、この行が属する繰り返しの回（外側が先）。
-fn place_row(row: &mut Element, new_row: u32, own: &[&Own], moves: &Moves) {
+fn place_row(row: &mut Element, new_row: u32, own: &[&Own], moves: &Moves, name: Option<&str>) {
     row.set_attr("r", &new_row.to_string());
     for n in &mut row.children {
         let Node::Element(c) = n else { continue };
@@ -844,10 +924,10 @@ fn place_row(row: &mut Element, new_row: u32, own: &[&Own], moves: &Moves) {
         }
         for f in &mut c.children {
             let Node::Element(fe) = f else { continue };
-            if fe.local() == "f" && fe.attr("t") != Some("shared") {
+            if fe.local() == "f" {
                 let text = fe.text();
                 if !text.is_empty() {
-                    fe.set_text(&shift_formula(&text, moves, own));
+                    fe.set_text(&shift_formula(&text, name, moves, own));
                 }
             }
         }
@@ -1110,17 +1190,21 @@ fn map_range(text: &str, moves: &Moves, own: &[&Own]) -> String {
     }
 }
 
-/// 数式の中のこのシートのセル参照をずらす。文字列リテラルと、シート名つきの参照（`Sheet2!A1`）は触らない。
-fn shift_formula(f: &str, moves: &Moves, own: &[&Own]) -> String {
+/// 数式の中のセル参照（`A1`・`A1:B2`、`Sheet2!A1`）を順に書き換える。`rewrite(シート名, 参照)` が `Some` を
+/// 返せば置き換え、`None` ならそのまま。文字列リテラル・関数名・名前・シート名そのものは参照ではない。
+fn rewrite_refs(f: &str, mut rewrite: impl FnMut(Option<&str>, &str) -> Option<String>) -> String {
     let chars: Vec<char> = f.chars().collect();
     let mut out = String::with_capacity(f.len());
     let mut i = 0;
+    // 直前にあった `シート名!`
+    let mut sheet: Option<String> = None;
     while i < chars.len() {
         let c = chars[i];
         match c {
             '"' | '\'' => {
                 // 文字列リテラル（"" は引用符の文字）または引用符つきのシート名
                 let q = c;
+                let mut name = String::new();
                 out.push(c);
                 i += 1;
                 while i < chars.len() {
@@ -1128,32 +1212,48 @@ fn shift_formula(f: &str, moves: &Moves, own: &[&Own]) -> String {
                     if chars[i] == q {
                         if chars.get(i + 1) == Some(&q) {
                             out.push(q);
+                            name.push(q);
                             i += 2;
                             continue;
                         }
                         i += 1;
                         break;
                     }
+                    name.push(chars[i]);
                     i += 1;
+                }
+                sheet = None;
+                if q == '\'' && chars.get(i) == Some(&'!') {
+                    out.push('!');
+                    i += 1;
+                    sheet = Some(name);
                 }
                 continue;
             }
-            '$' | 'A'..='Z' | 'a'..='z' => {
+            c if c == '$' || c.is_alphabetic() => {
                 let prev = out.chars().last();
-                let boundary_ok = !prev.is_some_and(|p| p.is_alphanumeric() || "_.!".contains(p));
+                let boundary_ok = !prev.is_some_and(|p| {
+                    p.is_alphanumeric() || "_.".contains(p) || (p == '!' && sheet.is_none())
+                });
                 let start = i;
                 let mut j = i;
                 while j < chars.len() && (chars[j].is_alphanumeric() || "$_.".contains(chars[j])) {
                     j += 1;
                 }
                 let token: String = chars[start..j].iter().collect();
-                // 関数名・名前・シート名（直後が `(` や `!`）は参照ではない
                 let next = chars.get(j).copied();
-                if boundary_ok
-                    && parse_ref(&token).is_some()
-                    && next != Some('(')
-                    && next != Some('!')
-                {
+                // シート名（直後が `!`）
+                if next == Some('!') && boundary_ok {
+                    out.push_str(&token);
+                    out.push('!');
+                    i = j + 1;
+                    sheet = Some(token);
+                    continue;
+                }
+                // 関数名・名前（直後が `(`）は参照ではない
+                if boundary_ok && parse_ref(&token).is_some() && next != Some('(') {
+                    let mut text = token.clone();
+                    let mut end = j;
                     // 範囲の後半（`:` の後ろ）があれば一緒に扱う
                     if next == Some(':') {
                         let mut k = j + 1;
@@ -1164,25 +1264,143 @@ fn shift_formula(f: &str, moves: &Moves, own: &[&Own]) -> String {
                         }
                         let second: String = chars[j + 1..k].iter().collect();
                         if parse_ref(&second).is_some() && chars.get(k) != Some(&'(') {
-                            out.push_str(&map_range(&format!("{token}:{second}"), moves, own));
-                            i = k;
-                            continue;
+                            text = format!("{token}:{second}");
+                            end = k;
                         }
                     }
-                    out.push_str(&map_range(&token, moves, own));
-                    i = j;
+                    match rewrite(sheet.as_deref(), &text) {
+                        Some(r) => out.push_str(&r),
+                        None => out.extend(&chars[start..end]),
+                    }
+                    sheet = None;
+                    i = end;
                     continue;
                 }
                 out.push_str(&token);
+                sheet = None;
                 i = j;
                 continue;
             }
             _ => {}
         }
+        sheet = None;
         out.push(c);
         i += 1;
     }
     out
+}
+
+fn same_sheet(a: &str, b: &str) -> bool {
+    a.to_lowercase() == b.to_lowercase()
+}
+
+/// 数式の中のこのシートのセル参照をずらす。このシート自身を名前つきで指す参照（`Sheet1!B6`）も同じ。
+/// ほかのシートへの参照は触らない（`shift_sheet_refs` が、全シートの処理のあとでずらす）。
+fn shift_formula(f: &str, own_name: Option<&str>, moves: &Moves, own: &[&Own]) -> String {
+    rewrite_refs(f, |sheet, text| match (sheet, own_name) {
+        (None, _) => Some(map_range(text, moves, own)),
+        (Some(s), Some(me)) if same_sheet(s, me) => Some(map_range(text, moves, own)),
+        _ => None,
+    })
+}
+
+/// 列の文字 → 0 から数えた列番号（`A` → 0）。
+fn col_index(col: &str) -> Option<i64> {
+    let letters = col.trim_start_matches('$');
+    if letters.is_empty() {
+        return None;
+    }
+    letters
+        .bytes()
+        .try_fold(0i64, |n, b| {
+            b.is_ascii_alphabetic()
+                .then(|| n * 26 + i64::from(b.to_ascii_uppercase() - b'A' + 1))
+        })
+        .map(|n| n - 1)
+}
+
+fn col_letters(mut n: i64) -> String {
+    let mut s = vec![];
+    n += 1;
+    while n > 0 {
+        s.push(b'A' + ((n - 1) % 26) as u8);
+        n = (n - 1) / 26;
+    }
+    s.reverse();
+    String::from_utf8(s).expect("ascii")
+}
+
+/// 共有数式の元の式を `drow` 行・`dcol` 列だけ離れたセルに写したもの（`$` のない側だけ動く）。
+fn translate_formula(f: &str, drow: i64, dcol: i64) -> String {
+    let one = |r: &str| -> Option<String> {
+        let (col, abs_row, row) = parse_ref(r)?;
+        let col = if col.starts_with('$') {
+            col.to_string()
+        } else {
+            col_letters((col_index(col)? + dcol).clamp(0, 16383))
+        };
+        let row = if abs_row == "$" {
+            i64::from(row)
+        } else {
+            (i64::from(row) + drow).max(1)
+        };
+        Some(format!("{col}{abs_row}{row}"))
+    };
+    rewrite_refs(f, |_, text| match text.split_once(':') {
+        Some((a, b)) => Some(format!("{}:{}", one(a)?, one(b)?)),
+        None => one(text),
+    })
+}
+
+/// 共有数式（`<f t="shared" si="…">`）を、セルごとの通常の数式に展開する。行をずらすと、
+/// 共有の範囲の相対位置が崩れるため。`rows` は元の座標の行。
+fn expand_shared(rows: &mut [Element]) {
+    let pos = |c: &Element| -> Option<(i64, i64)> {
+        let r = c.attr("r")?;
+        let (col, _, row) = parse_ref(r)?;
+        Some((i64::from(row), col_index(col)?))
+    };
+    let mut masters: std::collections::HashMap<String, (i64, i64, String)> = Default::default();
+    for row in rows.iter() {
+        for n in &row.children {
+            let Node::Element(c) = n else { continue };
+            let Some((r, col)) = pos(c) else { continue };
+            if let Some(f) = child(c, "f") {
+                if let (Some("shared"), Some(si)) = (f.attr("t"), f.attr("si")) {
+                    let text = f.text();
+                    if !text.is_empty() {
+                        masters.insert(si.to_string(), (r, col, text));
+                    }
+                }
+            }
+        }
+    }
+    for row in rows.iter_mut() {
+        for n in &mut row.children {
+            let Node::Element(c) = n else { continue };
+            let at = pos(c);
+            let Some(f) = child_mut(c, "f") else { continue };
+            if f.attr("t") != Some("shared") {
+                continue;
+            }
+            let Some(si) = f.attr("si").map(String::from) else {
+                continue;
+            };
+            let Some((mr, mc, text)) = masters.get(&si) else {
+                continue;
+            };
+            let formula = if f.text().is_empty() {
+                let Some((r, col)) = at else { continue };
+                translate_formula(text, r - mr, col - mc)
+            } else {
+                text.clone()
+            };
+            f.set_text(&formula);
+            for a in ["t", "si", "ref"] {
+                f.remove_attr(a);
+            }
+        }
+    }
 }
 
 /// 行ループで行がずれたことに合わせ、シートの結合セル・条件付き書式・入力規則などの範囲をずらす。
@@ -1395,7 +1613,7 @@ mod tests {
     fn references_shift_around_loop_rows() {
         // 5 行目が 3 行に繰り返される（+2）
         let (m, owns) = moves(&[(5, 3)], 12);
-        let s = |f: &str| shift_formula(f, &m, &[]);
+        let s = |f: &str| shift_formula(f, None, &m, &[]);
         assert_eq!(s("SUM(C5:C5)"), "SUM(C5:C7)"); // 範囲が広がる
         assert_eq!(s("SUM(C4:C5)"), "SUM(C4:C7)");
         assert_eq!(s("SUM(C6:C9)"), "SUM(C8:C11)"); // 後ろは下へ
@@ -1407,9 +1625,9 @@ mod tests {
         assert_eq!(s("SUM(A:A)+SUM(6:6)"), "SUM(A:A)+SUM(6:6)"); // 列・行全体は対象外
                                                                  // 繰り返しの行の中の数式は、自分の行を参照する
         let own = [&owns[1]]; // 5 行目のテンプレートの 2 つ目（6 行目）
-        assert_eq!(shift_formula("B5*C5", &m, &own), "B6*C6");
-        assert_eq!(shift_formula("SUM(C$4:C5)", &m, &own), "SUM(C$4:C6)");
-        assert_eq!(shift_formula("D9", &m, &own), "D11");
+        assert_eq!(shift_formula("B5*C5", None, &m, &own), "B6*C6");
+        assert_eq!(shift_formula("SUM(C$4:C5)", None, &m, &own), "SUM(C$4:C6)");
+        assert_eq!(shift_formula("D9", None, &m, &own), "D11");
     }
 
     #[test]
@@ -1432,7 +1650,7 @@ mod tests {
             ("Sheet 2".to_string(), moves(&[(2, 2)], 4).0),
         ]
         .into();
-        let s = |f: &str| shift_sheet_refs(f, &moved);
+        let s = |f: &str| shift_sheet_refs(f, &moved, None);
         assert_eq!(s("請求書!$A$1:$C$8"), "請求書!$A$1:$C$10");
         assert_eq!(s("'請求書'!$B$6"), "'請求書'!$B$8");
         assert_eq!(s("'Sheet 2'!$1:$3"), "'Sheet 2'!$1:$4"); // 行だけの範囲
@@ -1449,5 +1667,28 @@ mod tests {
         assert_eq!(map_range("A1:C3", &m, &[]), "A1:C5");
         assert_eq!(map_range("A4", &m, &[]), "A6");
         assert_eq!(map_range("A5:B6", &m, &[]), "A7:B8");
+    }
+
+    #[test]
+    fn shared_formulas_are_translated_relative_to_the_master() {
+        assert_eq!(translate_formula("B2*2", 1, 0), "B3*2");
+        assert_eq!(translate_formula("$A2+B$1", 3, 1), "$A5+C$1");
+        assert_eq!(translate_formula("SUM(A1:B2)", 2, 2), "SUM(C3:D4)");
+        assert_eq!(
+            translate_formula("Sheet2!A1+\"A1\"", 1, 0),
+            "Sheet2!A2+\"A1\""
+        );
+        assert_eq!(translate_formula("LOG10(Z9)", 0, 1), "LOG10(AA9)");
+        assert_eq!(col_letters(col_index("AZ").unwrap()), "AZ");
+    }
+
+    #[test]
+    fn own_sheet_qualified_references_are_shifted_but_other_sheets_are_not() {
+        let (m, _) = moves(&[(5, 3)], 12);
+        let s = |f: &str| shift_formula(f, Some("請求書"), &m, &[]);
+        assert_eq!(s("請求書!B6+B6"), "請求書!B8+B8");
+        assert_eq!(s("'請求書'!$B$6"), "'請求書'!$B$8");
+        assert_eq!(s("他!B6+B6"), "他!B6+B8");
+        assert_eq!(s("'It''s'!B6"), "'It''s'!B6");
     }
 }
