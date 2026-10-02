@@ -3,7 +3,7 @@
 
 import type { Backend } from "./backend";
 import { canBeField } from "./forms";
-import { datetimeToOffset, parseOffset } from "./datetime";
+import { convertValue, hasDatetime, parseOffset } from "./datetime";
 // Rust 側（crates/jxcel-macro）と同じ実行ライブラリを再利用する。
 import prelude from "../../crates/jxcel-macro/src/prelude.js?raw";
 import stdLib from "../../crates/jxcel-macro/src/std.js?raw";
@@ -399,28 +399,19 @@ export function createMockBackend(): Backend {
       const minutes = parseOffset(offset);
       if (minutes === null) throw `オフセットは「+09:00」「-05:30」「Z」の形で指定してください: ${offset}`;
       const zulu = /^z$/i.test(offset.trim());
-      let converted = 0;
-      let unchanged = 0;
-      let skipped = 0;
+      const counts = { converted: 0, unchanged: 0, skipped: 0 };
       const wasDirty = dirty;
       const prev = file;
       const snapshot = edit((f) => {
         const s = schemaOf(f, sheet, schema);
         const col = s.columns.find((c) => c.id === column);
         if (!col) throw "列 が見つかりません";
-        if (col.type.kind !== "dateTime" || col.computed) throw `「${col.name}」は日時型の列ではありません（計算列は変換できません）`;
+        if (!hasDatetime(col.type) || col.computed) throw `「${col.name}」は日時を含む列ではありません（計算列は変換できません）`;
         for (const r of s.rows) {
-          const v = r.cells[column];
-          if (typeof v !== "string") continue;
-          const n = datetimeToOffset(v, minutes, zulu);
-          if (n === null) skipped++;
-          else if (n === v) unchanged++;
-          else {
-            r.cells[column] = n;
-            converted++;
-          }
+          if (column in r.cells) r.cells[column] = convertValue(col.type, r.cells[column], minutes, zulu, counts);
         }
       });
+      const { converted, unchanged, skipped } = counts;
       if (converted === 0) {
         // 何も変わらなかったときは、未保存の状態にしない
         file = prev;

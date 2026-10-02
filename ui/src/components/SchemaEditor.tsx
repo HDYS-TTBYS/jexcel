@@ -1,5 +1,6 @@
 import { lazy, Suspense, useState } from "react";
 import { FORMULA_TEMPLATE, newId, type Column, type DataSchema } from "../types";
+import { hasDatetime } from "../datetime";
 import { Modal } from "./Modal";
 import { TypeEditor } from "./TypeEditor";
 
@@ -78,8 +79,8 @@ function ColumnRow({
         <button className="primary" disabled={!changed} onClick={() => onUpdate(draft)}>
           適用
         </button>
-        {column.type.kind === "dateTime" && !column.computed && (
-          <button title="この列の日時を、同じ時刻のまま別のタイムゾーンのオフセットの表記に直します" onClick={() => onConvert(column)}>
+        {hasDatetime(column.type) && !column.computed && (
+          <button title="この列（ネストした列ではその中のすべて）の日時を、同じ時刻のまま別のタイムゾーンのオフセットの表記に直します" onClick={() => onConvert(column)}>
             タイムゾーンを変換…
           </button>
         )}

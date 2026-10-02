@@ -1,3 +1,5 @@
+import type { DataType } from "./types";
+
 /** RFC 3339 の日時を、同じ時刻のまま別のオフセットの表記に直す（Rust の `jxcel_core::types::datetime_to_offset` と同じ規則）。
  *  変換できない文字列（日時でない・うるう秒・範囲外）は null。 */
 export function parseOffset(s: string): number | null {
@@ -45,6 +47,47 @@ export function datetimeToOffset(s: string, offsetMin: number, zulu: boolean): s
   const a = Math.abs(offsetMin);
   const off = offsetMin === 0 && zulu ? "Z" : `${offsetMin < 0 ? "-" : "+"}${p2(Math.floor(a / 60))}:${p2(a % 60)}`;
   return `${String(ny).padStart(4, "0")}-${p2(nm)}-${p2(nd)}T${p2(Math.floor(r / 3600))}:${p2(Math.floor((r % 3600) / 60))}:${p2(r % 60)}${m[7] ?? ""}${off}`;
+}
+
+/** 型の中に日時型があるか（オブジェクトのフィールド・配列の要素の中も見る。Rust の `has_datetime` と同じ）。 */
+export function hasDatetime(ty: DataType): boolean {
+  switch (ty.kind) {
+    case "dateTime":
+      return true;
+    case "object":
+      return ty.fields.some((f) => hasDatetime(f.type));
+    case "array":
+      return hasDatetime(ty.item);
+    default:
+      return false;
+  }
+}
+
+export interface ConvertCounts {
+  converted: number;
+  unchanged: number;
+  skipped: number;
+}
+
+/** 型に沿って値をたどり、日時の文字列を別のオフセットの表記に直した値を返す（型に合わない値は触らない。Rust の `convert_value` と同じ）。 */
+export function convertValue(ty: DataType, v: unknown, offsetMin: number, zulu: boolean, c: ConvertCounts): unknown {
+  if (ty.kind === "dateTime" && typeof v === "string") {
+    const n = datetimeToOffset(v, offsetMin, zulu);
+    if (n === null) c.skipped++;
+    else if (n === v) c.unchanged++;
+    else {
+      c.converted++;
+      return n;
+    }
+    return v;
+  }
+  if (ty.kind === "object" && v !== null && typeof v === "object" && !Array.isArray(v)) {
+    const o = { ...(v as Record<string, unknown>) };
+    for (const f of ty.fields) if (f.id in o) o[f.id] = convertValue(f.type, o[f.id], offsetMin, zulu, c);
+    return o;
+  }
+  if (ty.kind === "array" && Array.isArray(v)) return v.map((x) => convertValue(ty.item, x, offsetMin, zulu, c));
+  return v;
 }
 
 /** オフセットを考慮した「瞬間」（UTC の秒と、小数秒の 9 桁）。日時として読めない文字列は null。 */

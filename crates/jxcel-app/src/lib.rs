@@ -96,16 +96,63 @@ pub struct ExportRowError {
     pub message: String,
 }
 
+/// 日時の変換の件数（日時の値 1 つにつき 1 件）。
+#[derive(Default)]
+struct ConvertCounts {
+    converted: usize,
+    unchanged: usize,
+    skipped: usize,
+}
+
+/// 型の中に日時型があるか（オブジェクトのフィールド・配列の要素の中も見る）。
+fn has_datetime(ty: &DataType) -> bool {
+    match ty {
+        DataType::DateTime => true,
+        DataType::Object { fields } => fields.iter().any(|f| has_datetime(&f.ty)),
+        DataType::Array { item } => has_datetime(item),
+        _ => false,
+    }
+}
+
+/// 型に沿って値をたどり、日時の文字列を別のオフセットの表記に直す（型に合わない値は触らない）。
+fn convert_value(ty: &DataType, v: &mut Value, minutes: i32, zulu: bool, c: &mut ConvertCounts) {
+    match (ty, v) {
+        (DataType::DateTime, Value::String(s)) => {
+            match jxcel_core::types::datetime_to_offset(s, minutes, zulu) {
+                Some(n) if n == *s => c.unchanged += 1,
+                Some(n) => {
+                    *s = n;
+                    c.converted += 1;
+                }
+                None => c.skipped += 1,
+            }
+        }
+        (DataType::Object { fields }, Value::Object(m)) => {
+            for f in fields {
+                if let Some(x) = m.get_mut(&f.id) {
+                    convert_value(&f.ty, x, minutes, zulu, c);
+                }
+            }
+        }
+        (DataType::Array { item }, Value::Array(a)) => {
+            for x in a {
+                convert_value(item, x, minutes, zulu, c);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// 日時列のオフセット一括変換の結果。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConvertResult {
     pub snapshot: Snapshot,
-    /// 値が変わったセルの数
+    /// 値が変わった日時の数（ネストした列では、その中の日時 1 つずつ）
     pub converted: usize,
-    /// すでにそのオフセットで、変わらなかったセルの数
+    /// すでにそのオフセットで、変わらなかった日時の数
     pub unchanged: usize,
-    /// 変換できず、そのままにしたセルの数（うるう秒・範囲外など。変換の対象になった値だけを数える）
+    /// 変換できず、そのままにした日時の数（うるう秒・範囲外など。変換の対象になった値だけを数える）
     pub skipped: usize,
 }
 
@@ -459,8 +506,9 @@ impl Session {
         })
     }
 
-    /// 日時型の列の値を、同じ時刻のまま別のオフセット（`+09:00`・`Z` など）の表記に直す。
-    /// 値の入っているセルだけが対象で、変換できない値はそのまま残す。変更はまとめて 1 回の編集になる。
+    /// 日時型の列（日時を含むオブジェクト・配列の列も）の値を、同じ時刻のまま別のオフセット（`+09:00`・`Z` など）の
+    /// 表記に直す。値の入っているセルだけが対象で、ネストした列ではその中のすべての日時が対象。
+    /// 変換できない値はそのまま残す。件数は日時の値の数。変更はまとめて 1 回の編集になる。
     pub fn convert_datetime_offset(
         &mut self,
         sheet: &str,
@@ -475,7 +523,7 @@ impl Session {
         })?;
         let zulu = offset.trim().eq_ignore_ascii_case("z");
         let (sheet, schema, column) = (sheet.to_string(), schema.to_string(), column.to_string());
-        let (mut converted, mut unchanged, mut skipped) = (0, 0, 0);
+        let mut counts = ConvertCounts::default();
         let was_dirty = self.doc()?.dirty;
         let mut snapshot = self.edit(|f, _| {
             let s = find_schema(f, &sheet, &schema)?;
@@ -484,27 +532,25 @@ impl Session {
                 .iter()
                 .find(|c| c.id == column)
                 .ok_or(Error::NotFound("列"))?;
-            if !matches!(col.ty, DataType::DateTime) || col.computed.is_some() {
+            if !has_datetime(&col.ty) || col.computed.is_some() {
                 return Err(Error::Invalid(format!(
-                    "「{}」は日時型の列ではありません（計算列は変換できません）",
+                    "「{}」は日時を含む列ではありません（計算列は変換できません）",
                     col.name
                 )));
             }
+            let ty = col.ty.clone();
             for r in &mut s.rows {
-                let Some(Value::String(v)) = r.cells.get(&column) else {
-                    continue;
-                };
-                match jxcel_core::types::datetime_to_offset(v, minutes, zulu) {
-                    Some(n) if &n == v => unchanged += 1,
-                    Some(n) => {
-                        r.cells.insert(column.clone(), Value::String(n));
-                        converted += 1;
-                    }
-                    None => skipped += 1,
+                if let Some(v) = r.cells.get_mut(&column) {
+                    convert_value(&ty, v, minutes, zulu, &mut counts);
                 }
             }
             Ok(())
         })?;
+        let ConvertCounts {
+            converted,
+            unchanged,
+            skipped,
+        } = counts;
         if converted == 0 {
             // 何も変わらなかったときは、未保存の状態にしない
             self.doc()?.dirty = was_dirty;
@@ -1373,6 +1419,102 @@ mod tests {
         let path = dir.join("loops.jxcel");
         std::fs::write(&path, file.to_zip().unwrap()).unwrap();
         path.to_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn convert_datetime_offsets_inside_nested_columns() {
+        let mut s = Session::new();
+        let snap = s.new_file("t").unwrap();
+        let sheet = snap.file.sheets[0].id.clone();
+        let event = DataType::Object {
+            fields: vec![
+                Column::new("f_at", "日時", DataType::DateTime),
+                Column::new("f_memo", "メモ", DataType::String),
+            ],
+        };
+        let log = DataType::Array {
+            item: Box::new(DataType::Object {
+                fields: vec![Column::new("f_t", "時刻", DataType::DateTime)],
+            }),
+        };
+        let times = DataType::Array {
+            item: Box::new(DataType::DateTime),
+        };
+        let snap = s
+            .add_schema(
+                &sheet,
+                "記録",
+                vec![
+                    Column::new("ev", "事象", event),
+                    Column::new("log", "経過", log),
+                    Column::new("times", "時刻の一覧", times),
+                    Column::new("memo", "メモ", DataType::String),
+                ],
+            )
+            .unwrap();
+        let schema = snap.file.sheets[0].schemas.last().unwrap().id.clone();
+        let snap = s.add_row(&sheet, &schema).unwrap();
+        let row = snap.file.sheets[0].schemas.last().unwrap().rows[0]
+            .id
+            .clone();
+        s.set_cell(
+            &sheet,
+            &schema,
+            &row,
+            "ev",
+            json!({"f_at": "2026-10-02T01:30:00Z", "f_memo": "2026-10-02T01:30:00Z"}),
+        )
+        .unwrap();
+        s.set_cell(
+            &sheet,
+            &schema,
+            &row,
+            "log",
+            json!([{"f_t": "2026-10-02T23:00:00Z"}, {"f_t": "2026-10-03T08:00:00+09:00"}, {}]),
+        )
+        .unwrap();
+        s.set_cell(
+            &sheet,
+            &schema,
+            &row,
+            "times",
+            json!(["2026-10-02T23:59:60Z", "2026-12-31T15:00:00Z"]),
+        )
+        .unwrap();
+
+        // 3 つのネストした列の日時がまとめて変わる（メモの文字列は触らない）
+        let mut total = (0, 0, 0);
+        for col in ["ev", "log", "times"] {
+            let r = s
+                .convert_datetime_offset(&sheet, &schema, col, "+09:00")
+                .unwrap();
+            total = (
+                total.0 + r.converted,
+                total.1 + r.unchanged,
+                total.2 + r.skipped,
+            );
+        }
+        // 変換: 事象 1 + 経過 1 + 一覧 1 / すでに +09:00: 経過 1 / うるう秒: 一覧 1
+        assert_eq!(total, (3, 1, 1));
+        let snap = s.current().unwrap();
+        let cells = &snap.file.sheets[0].schemas.last().unwrap().rows[0].cells;
+        assert_eq!(
+            cells["ev"],
+            json!({"f_at": "2026-10-02T10:30:00+09:00", "f_memo": "2026-10-02T01:30:00Z"})
+        );
+        assert_eq!(
+            cells["log"],
+            json!([{"f_t": "2026-10-03T08:00:00+09:00"}, {"f_t": "2026-10-03T08:00:00+09:00"}, {}])
+        );
+        assert_eq!(
+            cells["times"],
+            json!(["2026-10-02T23:59:60Z", "2027-01-01T00:00:00+09:00"])
+        );
+        // 日時を含まない列は拒否される
+        let e = s
+            .convert_datetime_offset(&sheet, &schema, "memo", "+09:00")
+            .unwrap_err();
+        assert!(e.to_string().contains("日時を含む列ではありません"), "{e}");
     }
 
     #[test]

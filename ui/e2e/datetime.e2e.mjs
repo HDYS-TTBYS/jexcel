@@ -47,7 +47,7 @@ test("日時列のタイムゾーンを一括変換する", async ({ page: p }) 
   await p.getByRole("button", { name: /タイムゾーンを変換/ }).click();
   await p.getByRole("dialog").last().locator("input").fill("+09:00");
   await p.getByRole("dialog").last().getByRole("button", { name: "OK" }).click();
-  await expect(p.getByRole("dialog").last()).toContainText("2 件を変換しました");
+  await expect(p.getByRole("dialog").last()).toContainText("2 件の日時を変換しました");
   await p.getByRole("dialog").last().getByRole("button", { name: "OK" }).click();
   await p.getByRole("button", { name: "閉じる" }).click();
   check("日付をまたいで +09:00 になる", (await cells())[0] === "2026-10-03T05:00:00+09:00", JSON.stringify(await cells()));
@@ -58,7 +58,7 @@ test("日時列のタイムゾーンを一括変換する", async ({ page: p }) 
   await p.getByRole("button", { name: "列の定義" }).click();
   await p.getByRole("button", { name: /タイムゾーンを変換/ }).click();
   await p.getByRole("dialog").last().getByRole("button", { name: "OK" }).click();
-  await expect(p.getByRole("dialog").last()).toContainText("0 件を変換しました");
+  await expect(p.getByRole("dialog").last()).toContainText("0 件の日時を変換しました");
   check("すでに同じオフセットの件数が出る", (await p.getByRole("dialog").last().innerText()).includes("2 件はすでに"));
   await p.getByRole("dialog").last().getByRole("button", { name: "OK" }).click();
 

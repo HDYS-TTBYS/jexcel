@@ -352,14 +352,14 @@ export function App({ backend }: { backend: Backend }) {
               kind: "prompt",
               title: `「${c.name}」のタイムゾーンを変換`,
               message:
-                "同じ時刻のまま、別のオフセットの表記に直します（例: +09:00、-05:30、Z）。UTC（Z）で保存された日時を日本時間にするときは +09:00。値の入っているセルすべてが対象で、元に戻すには逆の変換をします。",
+                "同じ時刻のまま、別のオフセットの表記に直します（例: +09:00、-05:30、Z）。UTC（Z）で保存された日時を日本時間にするときは +09:00。値の入っているセルすべてが対象で（オブジェクトや配列の列では、その中のすべての日時）、元に戻すには逆の変換をします。",
               initial: "+09:00",
               onOk: (offset) =>
                 void backend
                   .convertDatetimeOffset(sheet.id, schema.id, c.id, offset)
                   .then((r) => {
                     setSnap(r.snapshot);
-                    const lines = [`${r.converted} 件を変換しました。`];
+                    const lines = [`${r.converted} 件の日時を変換しました。`];
                     if (r.unchanged > 0) lines.push(`${r.unchanged} 件はすでにそのオフセットでした。`);
                     if (r.skipped > 0) lines.push(`${r.skipped} 件は変換できず、そのままにしました（うるう秒など）。`);
                     setDialog({ kind: "notice", title: "タイムゾーンの変換", message: lines.join("\n") });
