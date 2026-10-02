@@ -122,6 +122,28 @@ pub fn process(pkg: &mut Package, src: &mut dyn Source) -> Result<()> {
             }
         }
     }
+    // 図形・画像・グラフの置き場所（行）。行がずれたシートの、描画の部品のアンカーを動かす
+    for (part, sheet_name) in &names {
+        if let Some(m) = moved.get(sheet_name) {
+            shift_drawing_anchors(pkg, part, m)?;
+        }
+    }
+    // グラフの系列の参照（`<c:f>Sheet1!$B$2:$B$9</c:f>`）
+    if !moved.is_empty() {
+        let charts: Vec<String> = pkg
+            .names()
+            .filter(|n| {
+                n.starts_with("xl/charts/") && n.ends_with(".xml") && !n.contains("/_rels/")
+            })
+            .map(String::from)
+            .collect();
+        for name in charts {
+            let mut doc = xml::parse(pkg.get(&name).expect("listed"))?;
+            if shift_other_sheet_refs(&mut doc.root, None, &moved) {
+                pkg.set(&name, xml::write(&doc)?);
+            }
+        }
+    }
     if any {
         if let Some(b) = pkg.get("xl/workbook.xml") {
             let mut doc = xml::parse(b)?;
@@ -341,7 +363,7 @@ fn sheet(root: &mut Element, ctx: &mut Ctx, moved: &mut Option<Moves>) -> Result
         changed |= sheet_data(sd, ctx, &mut moves)?;
     }
     if moves.active {
-        fix_references(root, &moves);
+        fix_references(root, &moves, ctx.sheet_name.as_deref());
     }
     if let Some(hf) = child_mut(root, "headerFooter") {
         changed |= header_footer(hf, ctx)?;
@@ -355,61 +377,155 @@ fn sheet(root: &mut Element, ctx: &mut Ctx, moved: &mut Option<Moves>) -> Result
     Ok(changed)
 }
 
-/// このシートの数式の中の、ほかの（行がずれた）シートへの参照をずらす。変えたら true。
+/// シートの関係の定義（`xl/worksheets/_rels/sheet1.xml.rels`）から、描画の部品（`xl/drawings/drawing1.xml`）を探し、
+/// アンカーの行（0 から数える）を、行ループでずれたことに合わせて動かす。
+/// 始まりは最初のコピー、終わりは最後のコピーの位置にするので、ループを含む範囲に掛かる図は伸びる。
+fn shift_drawing_anchors(pkg: &mut Package, sheet_part: &str, moves: &Moves) -> Result<()> {
+    let (dir, file) = sheet_part.rsplit_once('/').unwrap_or(("", sheet_part));
+    let rels_name = format!("{dir}/_rels/{file}.rels");
+    let Some(bytes) = pkg.get(&rels_name) else {
+        return Ok(());
+    };
+    let rels = xml::parse(bytes)?;
+    let mut drawings = vec![];
+    for n in &rels.root.children {
+        let Node::Element(e) = n else { continue };
+        if e.attr("Type").is_some_and(|t| t.ends_with("/drawing")) {
+            if let Some(t) = e.attr("Target") {
+                drawings.push(resolve_part_path(dir, t));
+            }
+        }
+    }
+    for name in drawings {
+        let Some(bytes) = pkg.get(&name) else {
+            continue;
+        };
+        let mut doc = xml::parse(bytes)?;
+        if shift_anchor_rows(&mut doc.root, moves) {
+            pkg.set(&name, xml::write(&doc)?);
+        }
+    }
+    Ok(())
+}
+
+/// 部品 `dir` からの相対パス（`../drawings/drawing1.xml`）か、絶対パス（`/xl/drawings/…`）を、部品名にする。
+fn resolve_part_path(dir: &str, target: &str) -> String {
+    if let Some(abs) = target.strip_prefix('/') {
+        return abs.to_string();
+    }
+    let mut parts: Vec<&str> = dir.split('/').filter(|p| !p.is_empty()).collect();
+    for seg in target.split('/') {
+        match seg {
+            ".." => {
+                parts.pop();
+            }
+            "." | "" => {}
+            other => parts.push(other),
+        }
+    }
+    parts.join("/")
+}
+
+/// `<xdr:from><xdr:row>`・`<xdr:to><xdr:row>`（0 から数える行）を動かす。変えたら true。
+fn shift_anchor_rows(el: &mut Element, moves: &Moves) -> bool {
+    let mut changed = false;
+    for n in &mut el.children {
+        let Node::Element(e) = n else { continue };
+        if matches!(e.local(), "from" | "to") {
+            let is_to = e.local() == "to";
+            for m in &mut e.children {
+                let Node::Element(r) = m else { continue };
+                if r.local() != "row" {
+                    continue;
+                }
+                let Ok(row) = r.text().trim().parse::<u32>() else {
+                    continue;
+                };
+                // アンカーは 0 から、参照は 1 から数える
+                let orig = row + 1;
+                let new = if is_to {
+                    moves.end(orig)
+                } else {
+                    moves.point(orig)
+                } - 1;
+                if new != row {
+                    r.set_text(&new.to_string());
+                    changed = true;
+                }
+            }
+        } else {
+            changed |= shift_anchor_rows(e, moves);
+        }
+    }
+    changed
+}
+
+/// 数式の文字列を持つ要素（セルの `<f>`、条件付き書式・入力規則の `<formula>`・`<formula1>`・`<formula2>`、
+/// グラフの `<c:f>`）か。
+fn is_formula_element(e: &Element) -> bool {
+    matches!(e.local(), "f" | "formula" | "formula1" | "formula2")
+}
+
+fn formula_texts(el: &Element, out: &mut Vec<String>) {
+    for n in &el.children {
+        let Node::Element(e) = n else { continue };
+        if is_formula_element(e) {
+            out.push(e.text());
+        } else {
+            formula_texts(e, out);
+        }
+    }
+}
+
+fn map_formula_elements(el: &mut Element, f: &mut dyn FnMut(&str) -> String) {
+    for n in &mut el.children {
+        let Node::Element(e) = n else { continue };
+        if is_formula_element(e) {
+            let text = e.text();
+            if !text.is_empty() {
+                let shifted = f(&text);
+                if shifted != text {
+                    e.set_text(&shifted);
+                }
+            }
+        } else {
+            map_formula_elements(e, f);
+        }
+    }
+}
+
+/// このシート（またはグラフ）の数式の中の、ほかの（行がずれた）シートへの参照をずらす。変えたら true。
 /// 共有数式は、先に 1 つずつの数式に展開する（参照先が動くと、共有の相対位置が崩れるため）。
 fn shift_other_sheet_refs(
     root: &mut Element,
     own_name: Option<&str>,
     moved: &std::collections::HashMap<String, Moves>,
 ) -> bool {
-    let Some(sd) = child_mut(root, "sheetData") else {
-        return false;
-    };
-    let formulas = |sd: &Element| -> Vec<String> {
-        let mut v = vec![];
-        for r in &sd.children {
-            let Node::Element(r) = r else { continue };
-            for c in &r.children {
-                if let Node::Element(c) = c {
-                    if let Some(f) = child(c, "f") {
-                        v.push(f.text());
-                    }
-                }
-            }
-        }
-        v
-    };
-    if !formulas(sd)
+    let mut texts = vec![];
+    formula_texts(root, &mut texts);
+    if !texts
         .iter()
         .any(|t| !t.is_empty() && shift_sheet_refs(t, moved, own_name) != *t)
     {
         return false;
     }
-    let nodes = std::mem::take(&mut sd.children);
-    let (mut rows, others): (Vec<_>, Vec<_>) = nodes
-        .into_iter()
-        .partition(|n| matches!(n, Node::Element(_)));
-    let mut rows: Vec<Element> = rows
-        .drain(..)
-        .filter_map(|n| match n {
-            Node::Element(e) => Some(e),
-            _ => None,
-        })
-        .collect();
-    expand_shared(&mut rows);
-    for row in &mut rows {
-        for n in &mut row.children {
-            let Node::Element(c) = n else { continue };
-            if let Some(f) = child_mut(c, "f") {
-                let text = f.text();
-                if !text.is_empty() {
-                    f.set_text(&shift_sheet_refs(&text, moved, own_name));
-                }
-            }
-        }
+    if let Some(sd) = child_mut(root, "sheetData") {
+        let nodes = std::mem::take(&mut sd.children);
+        let (rows, others): (Vec<_>, Vec<_>) = nodes
+            .into_iter()
+            .partition(|n| matches!(n, Node::Element(_)));
+        let mut rows: Vec<Element> = rows
+            .into_iter()
+            .filter_map(|n| match n {
+                Node::Element(e) => Some(e),
+                _ => None,
+            })
+            .collect();
+        expand_shared(&mut rows);
+        sd.children = others;
+        sd.children.extend(rows.into_iter().map(Node::Element));
     }
-    sd.children = others;
-    sd.children.extend(rows.into_iter().map(Node::Element));
+    map_formula_elements(root, &mut |t| shift_sheet_refs(t, moved, own_name));
     drop_cached_results(root);
     true
 }
@@ -530,6 +646,20 @@ fn shift_sheet_refs(
             i += 1;
             continue;
         };
+        // 3D 参照（`Sheet1:Sheet3!A1`）は、間のシートの行がそろってずれるとは限らないのでずらさない
+        if chars.get(next) == Some(&':') {
+            if let Some(bang) = three_d_end(&chars, next + 1) {
+                out.extend(&chars[i..=bang]);
+                i = bang + 1;
+                while i < chars.len()
+                    && (chars[i].is_ascii_alphanumeric() || "$:".contains(chars[i]))
+                {
+                    out.push(chars[i]);
+                    i += 1;
+                }
+                continue;
+            }
+        }
         if chars.get(next) != Some(&'!') {
             out.extend(&chars[i..next.min(chars.len())]);
             i = next.min(chars.len());
@@ -566,6 +696,30 @@ fn shift_sheet_refs(
         i = end;
     }
     out
+}
+
+/// 3D 参照の 2 つ目のシート名（`from` から）のあとの `!` の位置。
+fn three_d_end(chars: &[char], from: usize) -> Option<usize> {
+    let mut j = from;
+    if chars.get(j) == Some(&'\'') {
+        j += 1;
+        while j < chars.len() {
+            if chars[j] == '\'' {
+                if chars.get(j + 1) == Some(&'\'') {
+                    j += 2;
+                    continue;
+                }
+                j += 1;
+                break;
+            }
+            j += 1;
+        }
+    } else {
+        while j < chars.len() && (chars[j].is_alphanumeric() || "_.".contains(chars[j])) {
+            j += 1;
+        }
+    }
+    (j > from && chars.get(j) == Some(&'!')).then_some(j)
 }
 
 /// 行だけの参照（`$3`）の行番号。
@@ -1178,7 +1332,15 @@ fn map_range(text: &str, moves: &Moves, own: &[&Own]) -> String {
                 map_cell(a, Pos::Start, moves, own),
                 map_cell(b, Pos::End, moves, own),
             ) else {
-                return text.to_string();
+                // 行だけの範囲（`$3:$5`）。列だけの範囲は行がないので動かない
+                return match (parse_row_only(a), parse_row_only(b)) {
+                    (Some((xa, ra)), Some((xb, rb))) => {
+                        let r1 = map_row(ra, Pos::Start, moves, own);
+                        let r2 = map_row(rb, Pos::End, moves, own).max(r1);
+                        format!("{xa}{r1}:{xb}{r2}")
+                    }
+                    _ => text.to_string(),
+                };
             };
             // 行を消す方向のずれで逆転しないように
             match (parse_ref(&x), parse_ref(&y)) {
@@ -1250,6 +1412,34 @@ fn rewrite_refs(f: &str, mut rewrite: impl FnMut(Option<&str>, &str) -> Option<S
                     sheet = Some(token);
                     continue;
                 }
+                // 列だけ・行だけの範囲（`A:C`・`$3:$5`）。`Sheet1:Sheet3!A1`（3D 参照）や関数名は除く
+                if boundary_ok
+                    && next == Some(':')
+                    && (is_col_token(&token) || is_row_token(&token))
+                {
+                    let mut k = j + 1;
+                    while k < chars.len()
+                        && (chars[k].is_alphanumeric() || "$_.".contains(chars[k]))
+                    {
+                        k += 1;
+                    }
+                    let second: String = chars[j + 1..k].iter().collect();
+                    let same_kind = if is_col_token(&token) {
+                        is_col_token(&second)
+                    } else {
+                        is_row_token(&second)
+                    };
+                    if same_kind && !matches!(chars.get(k), Some('(') | Some('!')) {
+                        let text = format!("{token}:{second}");
+                        match rewrite(sheet.as_deref(), &text) {
+                            Some(r) => out.push_str(&r),
+                            None => out.extend(&chars[start..k]),
+                        }
+                        sheet = None;
+                        i = k;
+                        continue;
+                    }
+                }
                 // 関数名・名前（直後が `(`）は参照ではない
                 if boundary_ok && parse_ref(&token).is_some() && next != Some('(') {
                     let mut text = token.clone();
@@ -1281,6 +1471,42 @@ fn rewrite_refs(f: &str, mut rewrite: impl FnMut(Option<&str>, &str) -> Option<S
                 i = j;
                 continue;
             }
+            c if c.is_ascii_digit() => {
+                // 行だけの範囲（`3:5`）。数値の一部（`1.5`・`2E3`）は参照ではない
+                let prev = out.chars().last();
+                let boundary_ok = !prev.is_some_and(|p| p.is_alphanumeric() || "_.$".contains(p));
+                let mut j = i;
+                while j < chars.len() && chars[j].is_ascii_digit() {
+                    j += 1;
+                }
+                if boundary_ok && chars.get(j) == Some(&':') {
+                    let mut k = j + 1;
+                    if chars.get(k) == Some(&'$') {
+                        k += 1;
+                    }
+                    let digits_from = k;
+                    while k < chars.len() && chars[k].is_ascii_digit() {
+                        k += 1;
+                    }
+                    let tail = chars.get(k).copied();
+                    if k > digits_from
+                        && !tail.is_some_and(|t| t.is_alphanumeric() || "_.(!".contains(t))
+                    {
+                        let text: String = chars[i..k].iter().collect();
+                        match rewrite(sheet.as_deref(), &text) {
+                            Some(r) => out.push_str(&r),
+                            None => out.push_str(&text),
+                        }
+                        sheet = None;
+                        i = k;
+                        continue;
+                    }
+                }
+                sheet = None;
+                out.extend(&chars[i..j]);
+                i = j;
+                continue;
+            }
             _ => {}
         }
         sheet = None;
@@ -1288,6 +1514,18 @@ fn rewrite_refs(f: &str, mut rewrite: impl FnMut(Option<&str>, &str) -> Option<S
         i += 1;
     }
     out
+}
+
+/// 列だけの参照（`A`・`$AB`）の列の文字。
+fn is_col_token(t: &str) -> bool {
+    let b = t.strip_prefix('$').unwrap_or(t);
+    (1..=3).contains(&b.len()) && b.bytes().all(|c| c.is_ascii_alphabetic())
+}
+
+/// 行だけの参照（`3`・`$3`）の行番号。
+fn is_row_token(t: &str) -> bool {
+    let b = t.strip_prefix('$').unwrap_or(t);
+    !b.is_empty() && b.bytes().all(|c| c.is_ascii_digit())
 }
 
 fn same_sheet(a: &str, b: &str) -> bool {
@@ -1346,9 +1584,31 @@ fn translate_formula(f: &str, drow: i64, dcol: i64) -> String {
         };
         Some(format!("{col}{abs_row}{row}"))
     };
+    // セル・行だけ・列だけの、どれか
+    let part = |r: &str| -> Option<String> {
+        if let Some(x) = one(r) {
+            return Some(x);
+        }
+        if let Some((abs, row)) = parse_row_only(r) {
+            let row = if abs == "$" {
+                i64::from(row)
+            } else {
+                (i64::from(row) + drow).max(1)
+            };
+            return Some(format!("{abs}{row}"));
+        }
+        if is_col_token(r) {
+            return Some(if r.starts_with('$') {
+                r.to_string()
+            } else {
+                col_letters((col_index(r)? + dcol).clamp(0, 16383))
+            });
+        }
+        None
+    };
     rewrite_refs(f, |_, text| match text.split_once(':') {
-        Some((a, b)) => Some(format!("{}:{}", one(a)?, one(b)?)),
-        None => one(text),
+        Some((a, b)) => Some(format!("{}:{}", part(a)?, part(b)?)),
+        None => part(text),
     })
 }
 
@@ -1404,15 +1664,19 @@ fn expand_shared(rows: &mut [Element]) {
 }
 
 /// 行ループで行がずれたことに合わせ、シートの結合セル・条件付き書式・入力規則などの範囲をずらす。
-fn fix_references(root: &mut Element, moves: &Moves) {
+fn fix_references(root: &mut Element, moves: &Moves, name: Option<&str>) {
     for n in &mut root.children {
         let Node::Element(e) = n else { continue };
         match e.local() {
             "dimension" | "autoFilter" => remap_attr(e, "ref", moves),
-            "conditionalFormatting" => remap_attr(e, "sqref", moves),
+            "conditionalFormatting" => {
+                remap_attr(e, "sqref", moves);
+                shift_rule_formulas(e, name, moves);
+            }
             "dataValidations" | "hyperlinks" => {
                 for m in &mut e.children {
                     if let Node::Element(x) = m {
+                        shift_rule_formulas(x, name, moves);
                         remap_attr(
                             x,
                             if x.local() == "hyperlink" {
@@ -1427,6 +1691,21 @@ fn fix_references(root: &mut Element, moves: &Moves) {
             }
             "mergeCells" => merge_cells(e, moves),
             _ => {}
+        }
+    }
+}
+
+/// 条件付き書式・入力規則の式（`<formula>`・`<formula1>`・`<formula2>`）の中の参照をずらす。
+fn shift_rule_formulas(e: &mut Element, name: Option<&str>, moves: &Moves) {
+    for n in &mut e.children {
+        let Node::Element(c) = n else { continue };
+        if matches!(c.local(), "formula" | "formula1" | "formula2") {
+            let text = c.text();
+            if !text.is_empty() {
+                c.set_text(&shift_formula(&text, name, moves, &[]));
+            }
+        } else {
+            shift_rule_formulas(c, name, moves);
         }
     }
 }
@@ -1622,7 +1901,7 @@ mod tests {
         assert_eq!(s("IF(A1=\"A6\",B6,0)"), "IF(A1=\"A6\",B8,0)"); // 文字列は触らない
         assert_eq!(s("Sheet2!A6+LOG10(2)+A6"), "Sheet2!A6+LOG10(2)+A8"); // 他のシートと関数名は触らない
         assert_eq!(s("'Sheet 2'!A6"), "'Sheet 2'!A6");
-        assert_eq!(s("SUM(A:A)+SUM(6:6)"), "SUM(A:A)+SUM(6:6)"); // 列・行全体は対象外
+        assert_eq!(s("SUM(A:A)+SUM(6:6)"), "SUM(A:A)+SUM(8:8)"); // 行全体は行がずれ、列全体は動かない
                                                                  // 繰り返しの行の中の数式は、自分の行を参照する
         let own = [&owns[1]]; // 5 行目のテンプレートの 2 つ目（6 行目）
         assert_eq!(shift_formula("B5*C5", None, &m, &own), "B6*C6");
@@ -1690,5 +1969,39 @@ mod tests {
         assert_eq!(s("'請求書'!$B$6"), "'請求書'!$B$8");
         assert_eq!(s("他!B6+B6"), "他!B6+B8");
         assert_eq!(s("'It''s'!B6"), "'It''s'!B6");
+    }
+
+    #[test]
+    fn row_only_and_column_only_ranges_in_formulas() {
+        let (m, _) = moves(&[(5, 3)], 12);
+        let s = |f: &str| shift_formula(f, None, &m, &[]);
+        assert_eq!(s("SUM(3:6)"), "SUM(3:8)"); // 行だけの範囲は、ループを含めば最後のコピーまで
+        assert_eq!(s("SUM($6:$7)"), "SUM($8:$9)");
+        assert_eq!(s("SUM(A:C)+B6"), "SUM(A:C)+B8"); // 列だけの範囲は動かない
+        assert_eq!(s("1.5+2E3+IF(A1,1:2)"), "1.5+2E3+IF(A1,1:2)"); // 数値・関数の引数の中は読み違えない
+        assert_eq!(s("Jan:Dec!A6"), "Jan:Dec!A6"); // 3D 参照は参照として読まない
+    }
+
+    #[test]
+    fn shared_formulas_translate_row_and_column_ranges() {
+        assert_eq!(translate_formula("SUM(A:A)", 3, 1), "SUM(B:B)");
+        assert_eq!(translate_formula("SUM(2:3)", 2, 1), "SUM(4:5)");
+        assert_eq!(
+            translate_formula("SUM($A:$B,$2:$3)", 2, 1),
+            "SUM($A:$B,$2:$3)"
+        );
+    }
+
+    #[test]
+    fn three_d_references_are_not_shifted() {
+        let (m, _) = moves(&[(5, 3)], 12);
+        let moved: std::collections::HashMap<String, Moves> = [("Sheet3".to_string(), m)].into();
+        let s = |f: &str| shift_sheet_refs(f, &moved, None);
+        assert_eq!(s("SUM(Sheet1:Sheet3!A6)"), "SUM(Sheet1:Sheet3!A6)");
+        assert_eq!(
+            s("SUM('Sheet 1':'Sheet 3'!A6:B7)"),
+            "SUM('Sheet 1':'Sheet 3'!A6:B7)"
+        );
+        assert_eq!(s("Sheet3!A6"), "Sheet3!A8");
     }
 }

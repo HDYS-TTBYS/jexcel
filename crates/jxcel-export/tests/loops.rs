@@ -981,3 +981,99 @@ fn docx_cell_paragraph_loops_are_planned_and_row_markers_inside_are_rejected() {
     let e = render_with(Kind::Docx, &pkg.write().unwrap(), &mut Nest::sample()).unwrap_err();
     assert!(e.to_string().contains("セルの段落のループの中"), "{e}");
 }
+
+#[test]
+fn xlsx_rules_charts_and_row_ranges_follow_the_shifted_rows() {
+    let mut pkg = Package::read(&nested_xlsx_with_other_references()).unwrap();
+    let edit = |pkg: &mut Package, name: &str, f: &dyn Fn(String) -> String| {
+        let text = String::from_utf8(pkg.get(name).unwrap().to_vec()).unwrap();
+        pkg.set(name, f(text).into_bytes());
+    };
+    edit(&mut pkg, "xl/worksheets/sheet1.xml", &|t| {
+        t.replace(
+            "<mergeCells",
+            concat!(
+                // 条件付き書式・入力規則の式（このシートの行 6 = 総合計の行を指す）
+                "<conditionalFormatting sqref=\"B3:B6\"><cfRule type=\"expression\" priority=\"1\"><formula>$B$6&gt;5</formula></cfRule></conditionalFormatting>",
+                "<dataValidations count=\"1\"><dataValidation type=\"custom\" sqref=\"A1\"><formula1>B6&gt;0</formula1></dataValidation></dataValidations>",
+                "<mergeCells"
+            ),
+        )
+        // 行だけの範囲を使う数式
+        .replace("<f>C5+1</f>", "<f>SUM(3:5)+C5+1</f>")
+    });
+    // 別シート: 条件付き書式の式と、行だけの範囲
+    edit(&mut pkg, "xl/worksheets/sheet2.xml", &|t| {
+        t.replace(
+            "</sheetData>",
+            "</sheetData><conditionalFormatting sqref=\"A1\"><cfRule type=\"expression\" priority=\"1\"><formula>明細!$B$6&gt;1</formula></cfRule></conditionalFormatting>",
+        )
+        .replace("<row r=\"3\">", "<row r=\"2\"><c r=\"A2\"><f>SUM(明細!3:5)</f></c></row><row r=\"3\">")
+    });
+    // グラフの系列
+    pkg.set(
+        "xl/charts/chart1.xml",
+        concat!(
+            "<c:chartSpace xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\"><c:chart><c:plotArea><c:barChart><c:ser>",
+            "<c:cat><c:strRef><c:f>明細!$A$3:$A$5</c:f></c:strRef></c:cat>",
+            "<c:val><c:numRef><c:f>'明細'!$B$6</c:f></c:numRef></c:val>",
+            "</c:ser></c:barChart></c:plotArea></c:chart></c:chartSpace>"
+        )
+        .as_bytes()
+        .to_vec(),
+    );
+    // 図形・グラフの置き場所（行は 0 から数える）
+    pkg.set(
+        "xl/worksheets/_rels/sheet1.xml.rels",
+        concat!(
+            "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">",
+            "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing\" Target=\"../drawings/drawing1.xml\"/>",
+            "</Relationships>"
+        )
+        .as_bytes()
+        .to_vec(),
+    );
+    pkg.set(
+        "xl/drawings/drawing1.xml",
+        concat!(
+            "<xdr:wsDr xmlns:xdr=\"http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing\">",
+            // 総合計の行（6 行目 = 0 から数えて 5）の下の図: 最初のコピーの位置へ
+            "<xdr:oneCellAnchor><xdr:from><xdr:col>0</xdr:col><xdr:row>5</xdr:row></xdr:from></xdr:oneCellAnchor>",
+            // ループの範囲（3〜5 行目）に掛かる図: 終わりは最後のコピーまで伸びる
+            "<xdr:twoCellAnchor><xdr:from><xdr:col>0</xdr:col><xdr:row>2</xdr:row></xdr:from><xdr:to><xdr:col>2</xdr:col><xdr:row>4</xdr:row></xdr:to></xdr:twoCellAnchor>",
+            // ループより前（1 行目）は動かない
+            "<xdr:oneCellAnchor><xdr:from><xdr:col>0</xdr:col><xdr:row>0</xdr:row></xdr:from></xdr:oneCellAnchor>",
+            "</xdr:wsDr>"
+        )
+        .as_bytes()
+        .to_vec(),
+    );
+    let out = render_with(Kind::Xlsx, &pkg.write().unwrap(), &mut Nest::sample())
+        .unwrap_or_else(|e| panic!("{e}"));
+
+    let texts = |name: &str, local: &str| -> Vec<String> {
+        let root = part(&out, name);
+        let mut els = vec![];
+        elements(&root, local, &mut els);
+        els.iter().map(|e| e.text()).collect()
+    };
+    // このシート: 範囲は最後のコピーまで、1 つの参照は最初のコピー
+    assert_eq!(texts("xl/worksheets/sheet1.xml", "formula"), ["$B$10>5"]);
+    assert_eq!(texts("xl/worksheets/sheet1.xml", "formula1"), ["B10>0"]);
+    let f = formulas_of(&out, "xl/worksheets/sheet1.xml");
+    assert_eq!(f["C10"], "SUM(3:9)+C6+1"); // 行だけの範囲も最後のコピーまで
+                                           // 別シート
+    assert_eq!(
+        texts("xl/worksheets/sheet2.xml", "formula"),
+        ["明細!$B$10>1"]
+    );
+    assert_eq!(
+        formulas_of(&out, "xl/worksheets/sheet2.xml")["A2"],
+        "SUM(明細!3:9)"
+    );
+    // グラフ
+    assert_eq!(
+        texts("xl/charts/chart1.xml", "f"),
+        ["明細!$A$3:$A$9", "'明細'!$B$10"]
+    );
+}
