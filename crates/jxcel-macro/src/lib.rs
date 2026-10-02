@@ -561,6 +561,7 @@ mod tests {
             }],
             macros: Default::default(),
             exports: Default::default(),
+            forms: Default::default(),
             templates: Default::default(),
         }
     }

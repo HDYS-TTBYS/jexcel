@@ -72,11 +72,39 @@ export interface Export {
   filter?: string;
 }
 
+/** 入力フォームの設定。LAN 内のブラウザから、表の行として入力できるようにする。 */
+export interface Form {
+  id: string;
+  name: string;
+  /** 回答の追加先の表（シート ID・スキーマ ID） */
+  sheet: string;
+  schema: string;
+  /** 入力欄にする列の ID（表示順） */
+  columns: string[];
+  description?: string;
+}
+
+/** 配信中のフォームの URL */
+export interface FormUrl {
+  formId: string;
+  name: string;
+  url: string;
+  /** 配信を始めてから受け付けた回答の数 */
+  submitted: number;
+}
+
+export interface FormsStatus {
+  running: boolean;
+  port: number | null;
+  urls: FormUrl[];
+}
+
 export interface JxcelFile {
   name: string;
   sheets: Sheet[];
   macros: Macro[];
   exports: Export[];
+  forms: Form[];
 }
 
 export interface ExportPreviewRow {
@@ -154,6 +182,9 @@ export type Change =
   | { kind: "exportRenamed"; id: string; old: string; new: string }
   | { kind: "exportChanged"; id: string; name: string }
   | { kind: "templateReplaced"; id: string; name: string }
+  | { kind: "formAdded"; id: string; name: string }
+  | { kind: "formRemoved"; id: string; name: string }
+  | { kind: "formChanged"; id: string; name: string }
   | { kind: "rowsReordered"; sheet: string; schema: string };
 
 export const SCALAR_KINDS = ["string", "int", "float", "decimal", "bool", "date", "dateTime", "enum", "any"] as const;

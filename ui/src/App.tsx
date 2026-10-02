@@ -8,6 +8,7 @@ import { SchemaEditor } from "./components/SchemaEditor";
 // Monaco は大きいので、マクロパネルを開いたときに初めて読み込む
 const MacroPanel = lazy(() => import("./components/MacroPanel"));
 const ExportPanel = lazy(() => import("./components/ExportPanel"));
+const FormsPanel = lazy(() => import("./components/FormsPanel"));
 import { newId, type Column, type Snapshot } from "./types";
 
 export function App({ backend }: { backend: Backend }) {
@@ -26,6 +27,7 @@ export function App({ backend }: { backend: Backend }) {
   const [showSchema, setShowSchema] = useState(false);
   const [showMacros, setShowMacros] = useState(false);
   const [showExports, setShowExports] = useState(false);
+  const [showForms, setShowForms] = useState(false);
   const [dialog, setDialog] = useState<DialogSpec | null>(null);
   const [historyKey, setHistoryKey] = useState(0);
   // マクロエディタの保留中の編集を書き出す（保存・確認の前に呼ぶ）
@@ -100,6 +102,14 @@ export function App({ backend }: { backend: Backend }) {
     return () => void unlisten.then((f) => f());
   }, [backend]);
 
+  // フォーム配信中に回答が届いたら、表を読み直す
+  useEffect(() => {
+    const unlisten = backend.onFormsChanged(() => {
+      backend.current().then(setSnap, () => {});
+    });
+    return () => void unlisten.then((f) => f());
+  }, [backend, setSnap]);
+
   useEffect(() => {
     const h = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key === "s") {
@@ -155,6 +165,9 @@ export function App({ backend }: { backend: Backend }) {
         onChange={(e) => setMessage(e.target.value)}
       />
       <span className="spacer" />
+      <button disabled={!snap} aria-pressed={showForms} onClick={() => setShowForms((v) => !v)}>
+        フォーム
+      </button>
       <button disabled={!snap} aria-pressed={showExports} onClick={() => setShowExports((v) => !v)}>
         書き出し
       </button>
@@ -285,6 +298,17 @@ export function App({ backend }: { backend: Backend }) {
         {showExports && (
           <Suspense fallback={<aside className="exports"><p className="muted pad">読み込み中…</p></aside>}>
             <ExportPanel
+              backend={backend}
+              file={snap.file}
+              onSnapshot={setSnap}
+              onError={onError}
+              onConfirm={(title, message, onOk) => setDialog({ kind: "confirm", title, message, onOk })}
+            />
+          </Suspense>
+        )}
+        {showForms && (
+          <Suspense fallback={<aside className="exports"><p className="muted pad">読み込み中…</p></aside>}>
+            <FormsPanel
               backend={backend}
               file={snap.file}
               onSnapshot={setSnap}

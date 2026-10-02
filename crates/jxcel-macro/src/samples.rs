@@ -121,6 +121,7 @@ mod tests {
             }],
             macros: vec![],
             exports: Default::default(),
+            forms: Default::default(),
             templates: Default::default(),
         }
     }

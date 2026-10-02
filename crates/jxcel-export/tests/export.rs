@@ -77,6 +77,7 @@ fn invoices(rows: &[InvoiceRow]) -> JxcelFile {
         }],
         macros: Default::default(),
         exports: Default::default(),
+        forms: Default::default(),
         templates: Default::default(),
     }
 }

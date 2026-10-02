@@ -2,6 +2,7 @@
 // Rust 側の挙動を簡易的に再現するだけで、永続化はしない。
 
 import type { Backend } from "./backend";
+import { canBeField } from "./forms";
 // Rust 側（crates/jxcel-macro）と同じ実行ライブラリを再利用する。
 import prelude from "../../crates/jxcel-macro/src/prelude.js?raw";
 import stdLib from "../../crates/jxcel-macro/src/std.js?raw";
@@ -14,6 +15,7 @@ import {
   type CommitInfo,
   type ComputedValues,
   type ExportPreview,
+  type FormsStatus,
   type DataSchema,
   type DataType,
   type JxcelFile,
@@ -116,6 +118,12 @@ function diff(a: JxcelFile, b: JxcelFile): Change[] {
     }
   }
   for (const e of a.exports) if (!b.exports.some((x) => x.id === e.id)) out.push({ kind: "exportRemoved", id: e.id, name: e.name });
+  for (const x of b.forms) {
+    const old = a.forms.find((y) => y.id === x.id);
+    if (!old) out.push({ kind: "formAdded", id: x.id, name: x.name });
+    else if (JSON.stringify(old) !== JSON.stringify(x)) out.push({ kind: "formChanged", id: x.id, name: x.name });
+  }
+  for (const x of a.forms) if (!b.forms.some((y) => y.id === x.id)) out.push({ kind: "formRemoved", id: x.id, name: x.name });
   return out;
 }
 
@@ -235,6 +243,42 @@ export function createMockBackend(): Backend {
 
   // ブラウザ単体にはテンプレートの中身を読む手段がないので、差し込み欄は「対象の表の全列」として見せる
   const mockPlaceholders = new Map<string, string[]>();
+  // フォーム配信（模擬）: 起動中のポートと、回答が届いたときに UI へ知らせるハンドラ
+  let formsPort: number | null = null;
+  let formsChanged: (() => void) | null = null;
+  const submitted = new Map<string, number>();
+  const formsStatus = (): FormsStatus => ({
+    running: formsPort !== null,
+    port: formsPort,
+    urls:
+      formsPort === null
+        ? []
+        : (file?.forms ?? []).map((x) => ({
+            formId: x.id,
+            name: x.name,
+            url: `http://192.168.0.10:${formsPort}/f/${x.id.toLowerCase().padEnd(32, "0").slice(0, 32)}`,
+            submitted: submitted.get(x.id) ?? 0,
+          })),
+  });
+  // テスト用: 回答が届いたことにする（フォームは ID か名前、列は ID か列名で指す。Rust 側の submit_form の簡易版。型変換だけで検証はしない）
+  const submitMock = (formId: string, values: Record<string, unknown>) => {
+    if (!file || formsPort === null) throw "配信中ではありません";
+    const x = file.forms.find((y) => y.id === formId || y.name === formId);
+    if (!x) throw "フォーム が見つかりません";
+    formId = x.id;
+    const s = schemaOf(file, x.sheet, x.schema);
+    const cells: Record<string, unknown> = {};
+    for (const [cid, v] of Object.entries(values)) {
+      const c = s.columns.find((y) => y.id === cid || y.name === cid);
+      if (!c || !x.columns.includes(c.id)) throw `フォームにない欄です: ${cid}`;
+      cells[c.id] = c.type.kind === "int" || c.type.kind === "float" ? Number(v) : v;
+    }
+    s.rows.push({ id: newId(), cells });
+    dirty = true;
+    submitted.set(formId, (submitted.get(formId) ?? 0) + 1);
+    formsChanged?.();
+  };
+  if (typeof window !== "undefined") (window as unknown as { __mockSubmit?: typeof submitMock }).__mockSubmit = submitMock;
   const clone = <T,>(x: T): T => structuredClone(x);
   const snap = (): Snapshot => {
     if (!file) throw "ファイルが開かれていません";
@@ -272,6 +316,7 @@ export function createMockBackend(): Backend {
         ],
         macros: [],
         exports: [],
+        forms: [],
       };
       path = null;
       dirty = false;
@@ -301,6 +346,7 @@ export function createMockBackend(): Backend {
       return snap();
     },
 
+    current: async () => snap(),
     addSheet: async (name) => edit((f) => void f.sheets.push({ id: newId(), name, schemas: [] })),
     renameSheet: async (sheet, name) =>
       edit((f) => {
@@ -308,7 +354,11 @@ export function createMockBackend(): Backend {
         if (!s) throw "シート が見つかりません";
         s.name = name;
       }),
-    deleteSheet: async (sheet) => edit((f) => void (f.sheets = f.sheets.filter((s) => s.id !== sheet))),
+    deleteSheet: async (sheet) =>
+      edit((f) => {
+        f.sheets = f.sheets.filter((s) => s.id !== sheet);
+        f.forms = f.forms.filter((x) => x.sheet !== sheet);
+      }),
     addSchema: async (sheet, name, columns) =>
       edit((f) => {
         const s = f.sheets.find((x) => x.id === sheet);
@@ -341,6 +391,7 @@ export function createMockBackend(): Backend {
         const s = schemaOf(f, sheet, schema);
         s.columns = s.columns.filter((c) => c.id !== column);
         for (const r of s.rows) delete r.cells[column];
+        for (const x of f.forms) if (x.sheet === sheet && x.schema === schema) x.columns = x.columns.filter((c) => c !== column);
       }),
     addRow: async (sheet, schema) => edit((f) => void schemaOf(f, sheet, schema).rows.push({ id: newId(), cells: {} })),
     deleteRow: async (sheet, schema, row) =>
@@ -490,6 +541,49 @@ export function createMockBackend(): Backend {
         }),
       };
     },
+    addForm: async (sheet, schema, name) =>
+      edit((f) => {
+        const s = schemaOf(f, sheet, schema);
+        const columns = s.columns.filter(canBeField).map((c) => c.id);
+        if (columns.length === 0) throw "入力欄にできる列がありません（計算列・ネスト型は使えません）";
+        f.forms.push({ id: newId(), name, sheet, schema, columns });
+      }),
+    updateForm: async (id, name, sheet, schema, columns, description) =>
+      edit((f) => {
+        if (!name.trim()) throw "フォームの名前が空です";
+        const s = schemaOf(f, sheet, schema);
+        for (const cid of columns) {
+          const c = s.columns.find((x) => x.id === cid);
+          if (!c) throw "列 が見つかりません";
+          if (!canBeField(c)) throw `「${c.name}」は入力欄にできません（計算列・ネスト型）`;
+        }
+        if (columns.length === 0) throw "入力欄を 1 つ以上選んでください";
+        const x = f.forms.find((y) => y.id === id);
+        if (!x) throw "フォーム が見つかりません";
+        Object.assign(x, { name: name.trim(), sheet, schema, columns, description: description.trim() || undefined });
+      }),
+    deleteForm: async (id) =>
+      edit((f) => {
+        if (!f.forms.some((x) => x.id === id)) throw "フォーム が見つかりません";
+        f.forms = f.forms.filter((x) => x.id !== id);
+      }),
+    // ブラウザ単体では本物の配信はできない。URL の表示と、回答が届いたときの再描画だけを再現する。
+    formsStart: async (port) => {
+      formsPort = port;
+      return formsStatus();
+    },
+    formsStop: async () => {
+      formsPort = null;
+      return formsStatus();
+    },
+    formsStatus: async () => formsStatus(),
+    onFormsChanged: async (handler) => {
+      formsChanged = handler;
+      return () => {
+        if (formsChanged === handler) formsChanged = null;
+      };
+    },
+
     runExport: async () => {
       throw "ブラウザ単体ではファイルを書き出せません（デスクトップ版で実行してください）";
     },

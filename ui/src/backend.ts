@@ -1,4 +1,4 @@
-import type { Change, Column, CommitInfo, ExportPreview, ExportResult, MacroSample, RunOutput, Snapshot } from "./types";
+import type { Change, Column, CommitInfo, ExportPreview, ExportResult, FormsStatus, MacroSample, RunOutput, Snapshot } from "./types";
 
 /** UI が必要とする操作。Tauri 実装とブラウザ単体用のモック実装がある。 */
 export interface Backend {
@@ -13,6 +13,8 @@ export interface Backend {
   openFile(path: string): Promise<Snapshot>;
   saveFile(path: string | null, message: string): Promise<Snapshot>;
 
+  /** 開いているファイルの現在の状態（配信中に回答が届いたあとの再取得などに使う）。 */
+  current(): Promise<Snapshot>;
   addSheet(name: string): Promise<Snapshot>;
   renameSheet(sheet: string, name: string): Promise<Snapshot>;
   deleteSheet(sheet: string): Promise<Snapshot>;
@@ -41,6 +43,16 @@ export interface Backend {
   exportPreview(id: string, limit: number): Promise<ExportPreview>;
   /** 全行を書き出す。既存のファイルは上書きしない */
   runExport(id: string, outDir: string): Promise<ExportResult>;
+
+  addForm(sheet: string, schema: string, name: string): Promise<Snapshot>;
+  updateForm(id: string, name: string, sheet: string, schema: string, columns: string[], description: string): Promise<Snapshot>;
+  deleteForm(id: string): Promise<Snapshot>;
+  /** LAN へのフォーム配信。回答は開いているファイルに行として追加される（未保存の変更になる）。 */
+  formsStart(port: number): Promise<FormsStatus>;
+  formsStop(): Promise<FormsStatus>;
+  formsStatus(): Promise<FormsStatus>;
+  /** 配信中に回答が届いて表が変わったときに呼ばれる。 */
+  onFormsChanged(handler: () => void): Promise<() => void>;
 
   historyLog(): Promise<CommitInfo[]>;
   historyDiff(from: string, to: string): Promise<Change[]>;

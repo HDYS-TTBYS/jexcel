@@ -90,3 +90,22 @@ input, select { font: inherit; padding: 4px 6px; border: 1px solid var(--bd); bo
 .export-result { margin-top: 12px; padding: 8px 12px; background: var(--bg2); border-radius: 8px; font-size: 13px; }
 .export-result ul { margin: 4px 0; padding-left: 18px; }
 .export-result p { margin: 2px 0; }
+.forms .macro-bar.flat { padding: 0 0 8px; border-bottom: 0; flex-wrap: wrap; }
+.forms h4:first-child { margin-top: 4px; }
+.serve-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.serve-row .port { width: 72px; }
+.serve-row button { white-space: nowrap; flex: none; }
+.forms label.inline { flex-direction: row; align-items: center; gap: 6px; font-weight: 600; }
+.forms .warn { font-size: 12px; margin: 8px 0; }
+.forms .urls { list-style: none; margin: 8px 0; padding: 0; display: flex; flex-direction: column; gap: 10px; }
+.url-row { display: flex; gap: 6px; margin-top: 4px; }
+.url-row input { flex: 1; min-width: 0; font-family: ui-monospace, monospace; font-size: 12px; }
+.url-row button { white-space: nowrap; flex: none; }
+.forms textarea { font: inherit; resize: vertical; }
+.fields { border: 1px solid var(--bd); border-radius: 8px; padding: 6px 10px 8px; }
+.fields legend { font-weight: 600; padding: 0 4px; }
+.field-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 2px 0; }
+.field-row label.check { flex-direction: row; align-items: center; gap: 6px; font-weight: 400; }
+.field-row .mv { display: inline-flex; gap: 2px; }
+.field-row .mv button { padding: 0 6px; }
+.forms .req { color: var(--err); margin-left: 2px; }

@@ -58,6 +58,12 @@ export function describeChange(c: Change, file: JxcelFile): string {
       return `書き出し「${c.name}」の設定を変更`;
     case "templateReplaced":
       return `書き出し「${c.name}」のテンプレートを差し替え`;
+    case "formAdded":
+      return `フォーム「${c.name}」を追加`;
+    case "formRemoved":
+      return `フォーム「${c.name}」を削除`;
+    case "formChanged":
+      return `フォーム「${c.name}」の設定を変更`;
     case "rowsReordered":
       return "行の並び順を変更";
   }

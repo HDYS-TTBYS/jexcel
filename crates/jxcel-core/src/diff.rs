@@ -124,6 +124,19 @@ pub enum Change {
         id: String,
         name: String,
     },
+    FormAdded {
+        id: String,
+        name: String,
+    },
+    FormRemoved {
+        id: String,
+        name: String,
+    },
+    /// 題名・対象の表・入力欄・説明のいずれかが変わった
+    FormChanged {
+        id: String,
+        name: String,
+    },
     /// 行の並びだけが変わった（共通する行の相対順序が違う）
     RowsReordered {
         sheet: String,
@@ -189,7 +202,32 @@ pub fn diff(old: &JxcelFile, new: &JxcelFile) -> Vec<Change> {
     }
     diff_macros(old, new, &mut out);
     diff_exports(old, new, &mut out);
+    diff_forms(old, new, &mut out);
     out
+}
+
+fn diff_forms(old: &JxcelFile, new: &JxcelFile, out: &mut Vec<Change>) {
+    for f in &old.forms {
+        if !new.forms.iter().any(|n| n.id == f.id) {
+            out.push(Change::FormRemoved {
+                id: f.id.clone(),
+                name: f.name.clone(),
+            });
+        }
+    }
+    for n in &new.forms {
+        match old.forms.iter().find(|f| f.id == n.id) {
+            None => out.push(Change::FormAdded {
+                id: n.id.clone(),
+                name: n.name.clone(),
+            }),
+            Some(f) if f != n => out.push(Change::FormChanged {
+                id: n.id.clone(),
+                name: n.name.clone(),
+            }),
+            Some(_) => {}
+        }
+    }
 }
 
 fn diff_exports(old: &JxcelFile, new: &JxcelFile, out: &mut Vec<Change>) {
@@ -552,5 +590,44 @@ mod tests {
         assert!(diff(&old, &gone)
             .iter()
             .any(|c| matches!(c, Change::SheetRemoved { .. })));
+    }
+
+    #[test]
+    fn form_changes() {
+        use crate::Form;
+        let base = sample();
+        let mut with = base.clone();
+        with.forms.push(Form {
+            id: "f1".into(),
+            name: "受付".into(),
+            sheet: "s".into(),
+            schema: "d".into(),
+            columns: vec!["a".into()],
+            description: String::new(),
+        });
+        assert_eq!(
+            diff(&base, &with),
+            vec![Change::FormAdded {
+                id: "f1".into(),
+                name: "受付".into()
+            }]
+        );
+        let mut m = with.clone();
+        m.forms[0].columns.push("b".into());
+        assert_eq!(
+            diff(&with, &m),
+            vec![Change::FormChanged {
+                id: "f1".into(),
+                name: "受付".into()
+            }]
+        );
+        assert_eq!(
+            diff(&m, &base),
+            vec![Change::FormRemoved {
+                id: "f1".into(),
+                name: "受付".into()
+            }]
+        );
+        assert!(diff(&m, &m).is_empty());
     }
 }

@@ -15,6 +15,8 @@ pub struct JxcelFile {
     /// 書き出し（テンプレートへの差し込み）の設定。
     #[serde(default)]
     pub exports: Vec<Export>,
+    /// LAN で配信する入力フォームの設定（順序つき）。
+    pub forms: Vec<Form>,
     /// 書き出しのテンプレート本体（xlsx / docx のバイト列。キーは `Export::id`）。
     /// 大きいので UI へ返す JSON には含めない。永続化では `exports/<id>.<拡張子>` として別に保存する。
     #[serde(skip)]
@@ -63,6 +65,23 @@ pub struct Export {
     /// 空でなければ、この式が真になる行だけを書き出す
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filter: Option<String>,
+}
+
+/// 入力フォームの設定: 表の一部の列を、LAN 内のブラウザから行として入力できるようにする。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Form {
+    pub id: String,
+    /// フォームの題名（回答者にも見える）
+    pub name: String,
+    /// 回答の追加先の表（シート ID・スキーマ ID）
+    pub sheet: String,
+    pub schema: String,
+    /// 入力欄にする列の ID（表示順）
+    pub columns: Vec<String>,
+    /// 題名の下に出す説明（空なら出さない）
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
 }
 
 /// TypeScript で書いたマクロ。`source` はユーザーが書いたままの TS（実行時に JS へ変換する）。

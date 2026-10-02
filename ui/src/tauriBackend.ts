@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { FILE_FILTER, TEMPLATE_FILTER, type Backend } from "./backend";
@@ -23,6 +24,7 @@ export const tauriBackend: Backend = {
   openFile: (path) => invoke("open_file", { path }),
   saveFile: (path, message) => invoke("save_file", { path, message }),
 
+  current: () => invoke("current_file"),
   addSheet: (name) => invoke("add_sheet", { name }),
   renameSheet: (sheet, name) => invoke("rename_sheet", { sheet, name }),
   deleteSheet: (sheet) => invoke("delete_sheet", { sheet }),
@@ -46,6 +48,14 @@ export const tauriBackend: Backend = {
   deleteExport: (id) => invoke("delete_export", { id }),
   exportPreview: (id, limit) => invoke("export_preview", { id, limit }),
   runExport: (id, outDir) => invoke("run_export", { id, outDir }),
+
+  addForm: (sheet, schema, name) => invoke("add_form", { sheet, schema, name }),
+  updateForm: (id, name, sheet, schema, columns, description) => invoke("update_form", { id, name, sheet, schema, columns, description }),
+  deleteForm: (id) => invoke("delete_form", { id }),
+  formsStart: (port) => invoke("forms_start", { port }),
+  formsStop: () => invoke("forms_stop"),
+  formsStatus: () => invoke("forms_status"),
+  onFormsChanged: (handler) => listen("jxcel://changed", () => handler()),
 
   historyLog: () => invoke("history_log"),
   historyDiff: (from, to) => invoke("history_diff", { from, to }),

@@ -1,14 +1,19 @@
 //! Tauri のコマンド層。ロジックはすべて `jxcel-app` の `Session` にあり、ここは薄い橋渡しだけ。
 
+use jxcel_app::forms::{FormServer, FormsStatus};
 use jxcel_app::{ExportPreview, ExportResult, RunOutput, Session, Snapshot};
 use jxcel_core::diff::Change;
 use jxcel_core::Column;
 use jxcel_git::CommitInfo;
 use serde_json::Value;
-use std::sync::Mutex;
-use tauri::State;
+use std::sync::{Arc, Mutex};
+use tauri::{Emitter, State};
 
-type App<'a> = State<'a, Mutex<Session>>;
+// フォームの配信スレッドも同じセッションに回答を書き込むので、共有できる形で持つ。
+type Shared = Arc<Mutex<Session>>;
+type App<'a> = State<'a, Shared>;
+/// 配信中のフォームサーバー（止まっていれば `None`）。
+type Forms<'a> = State<'a, Mutex<Option<FormServer>>>;
 type Reply<T> = Result<T, String>;
 
 /// セッションをロックして操作を実行し、エラーを UI 向けの文字列にする。
@@ -34,6 +39,11 @@ fn open_file(app: App, path: String) -> Reply<Snapshot> {
 #[tauri::command(async)]
 fn save_file(app: App, path: Option<String>, message: String) -> Reply<Snapshot> {
     with(&app, |s| s.save(path.as_deref(), &message))
+}
+
+#[tauri::command(async)]
+fn current_file(app: App) -> Reply<Snapshot> {
+    with(&app, |s| s.current())
 }
 
 #[tauri::command(async)]
@@ -161,6 +171,77 @@ fn run_export(app: App, id: String, out_dir: String) -> Reply<ExportResult> {
 }
 
 #[tauri::command(async)]
+fn add_form(app: App, sheet: String, schema: String, name: String) -> Reply<Snapshot> {
+    with(&app, |s| s.add_form(&sheet, &schema, &name))
+}
+
+#[tauri::command(async)]
+fn update_form(
+    app: App,
+    id: String,
+    name: String,
+    sheet: String,
+    schema: String,
+    columns: Vec<String>,
+    description: String,
+) -> Reply<Snapshot> {
+    with(&app, |s| {
+        s.update_form(&id, &name, &sheet, &schema, columns, &description)
+    })
+}
+
+#[tauri::command(async)]
+fn delete_form(app: App, id: String) -> Reply<Snapshot> {
+    with(&app, |s| s.delete_form(&id))
+}
+
+fn forms_lock<'a>(forms: &'a Forms) -> Reply<std::sync::MutexGuard<'a, Option<FormServer>>> {
+    forms
+        .lock()
+        .map_err(|_| "内部状態が壊れています".to_string())
+}
+
+fn status_of(server: &Option<FormServer>) -> FormsStatus {
+    server
+        .as_ref()
+        .map(FormServer::status)
+        .unwrap_or_else(FormsStatus::stopped)
+}
+
+/// フォームの配信を始める。回答が届くたびに UI へ `jxcel://changed` を送る。
+#[tauri::command(async)]
+fn forms_start(
+    window: tauri::WebviewWindow,
+    app: App,
+    forms: Forms,
+    port: u16,
+) -> Reply<FormsStatus> {
+    let mut server = forms_lock(&forms)?;
+    if server.is_none() {
+        let session = Arc::clone(&app);
+        let started = FormServer::start(session, port, move || {
+            let _ = window.emit("jxcel://changed", ());
+        })
+        .map_err(|e| e.to_string())?;
+        *server = Some(started);
+    }
+    Ok(status_of(&server))
+}
+
+#[tauri::command(async)]
+fn forms_stop(forms: Forms) -> Reply<FormsStatus> {
+    // 取り出して手放す（待ち受けスレッドの停止を待つので、ロックは先に外す）
+    let taken = forms_lock(&forms)?.take();
+    drop(taken);
+    Ok(FormsStatus::stopped())
+}
+
+#[tauri::command(async)]
+fn forms_status(forms: Forms) -> Reply<FormsStatus> {
+    Ok(status_of(&*forms_lock(&forms)?))
+}
+
+#[tauri::command(async)]
 fn history_log(app: App) -> Reply<Vec<CommitInfo>> {
     with(&app, |s| s.history_log())
 }
@@ -178,11 +259,13 @@ fn restore(app: App, rev: String) -> Reply<Snapshot> {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .manage(Mutex::new(Session::new()))
+        .manage(Shared::new(Mutex::new(Session::new())))
+        .manage(Mutex::<Option<FormServer>>::new(None))
         .invoke_handler(tauri::generate_handler![
             new_file,
             open_file,
             save_file,
+            current_file,
             add_sheet,
             rename_sheet,
             delete_sheet,
@@ -204,6 +287,12 @@ pub fn run() {
             delete_export,
             export_preview,
             run_export,
+            add_form,
+            update_form,
+            delete_form,
+            forms_start,
+            forms_stop,
+            forms_status,
             history_log,
             history_diff,
             restore,

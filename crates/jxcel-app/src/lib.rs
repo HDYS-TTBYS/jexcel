@@ -3,6 +3,8 @@
 //! 開いているファイルの状態（モデル・履歴・保存先・未保存フラグ）を `Session` が持ち、
 //! UI からの編集はすべてここを通る。編集のたびに更新後のモデル全体を返す（MVP の単純化）。
 
+pub mod forms;
+
 use jxcel_core::diff::Change;
 use jxcel_core::types::TypeRegistry;
 use jxcel_core::{new_id, Column, DataSchema, Export, JxcelFile, Macro, Row, Sheet, TemplateKind};
@@ -11,6 +13,7 @@ use jxcel_git::CommitInfo;
 use jxcel_macro::ComputedValues;
 use serde::Serialize;
 use serde_json::Value;
+
 use std::path::PathBuf;
 use std::time::Duration;
 use thiserror::Error;
@@ -192,6 +195,7 @@ impl Session {
             }],
             macros: Default::default(),
             exports: Default::default(),
+            forms: Default::default(),
             templates: Default::default(),
         };
         self.doc = Some(Doc {
@@ -268,6 +272,7 @@ impl Session {
         self.edit(move |f, _| {
             let before = f.sheets.len();
             f.sheets.retain(|s| s.id != sheet);
+            f.forms.retain(|form| form.sheet != sheet);
             (f.sheets.len() != before)
                 .then_some(())
                 .ok_or(Error::NotFound("シート"))
@@ -346,6 +351,12 @@ impl Session {
             }
             for r in &mut s.rows {
                 r.cells.remove(&column);
+            }
+            // 消した列は、フォームの入力欄からも外す
+            for form in &mut f.forms {
+                if form.sheet == sheet && form.schema == schema {
+                    form.columns.retain(|c| c != &column);
+                }
             }
             Ok(())
         })

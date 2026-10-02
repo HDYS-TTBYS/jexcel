@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io::{Cursor, Read, Write};
 
-use crate::model::{Column, DataSchema, Export, JxcelFile, Macro, Row, Sheet};
+use crate::model::{Column, DataSchema, Export, Form, JxcelFile, Macro, Row, Sheet};
 use crate::{Error, Result, FORMAT_VERSION};
 
 pub type FileTree = BTreeMap<String, Vec<u8>>;
@@ -27,6 +27,9 @@ struct Manifest {
     /// 書き出しの設定（順序つき）。テンプレート本体は `exports/<id>.<拡張子>`。旧形式のファイルには無い。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     exports: Vec<Export>,
+    /// 入力フォームの設定（順序つき）。旧形式のファイルには無い。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    forms: Vec<Form>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -182,6 +185,7 @@ impl JxcelFile {
                     })
                     .collect(),
                 exports: self.exports.clone(),
+                forms: self.forms.clone(),
             }),
         );
         Ok(tree)
@@ -262,6 +266,7 @@ impl JxcelFile {
             sheets,
             macros,
             exports: manifest.exports,
+            forms: manifest.forms,
             templates,
         })
     }
@@ -343,6 +348,7 @@ pub(crate) mod tests {
             }],
             macros: Default::default(),
             exports: Default::default(),
+            forms: Default::default(),
             templates: Default::default(),
         }
     }
@@ -558,5 +564,27 @@ pub(crate) mod tests {
             JxcelFile::from_tree(&t),
             Err(Error::UnsupportedVersion(99))
         ));
+    }
+
+    #[test]
+    fn forms_roundtrip_and_old_files_have_no_forms_key() {
+        let mut f = sample();
+        let out = f.to_tree().unwrap();
+        // フォームのないファイルの manifest には forms キーを出さない（既存ファイルの差分を増やさない）
+        assert!(!String::from_utf8_lossy(&out[MANIFEST]).contains("forms"));
+
+        f.forms.push(Form {
+            id: "fm1".into(),
+            name: "受付".into(),
+            sheet: f.sheets[0].id.clone(),
+            schema: f.sheets[0].schemas[0].id.clone(),
+            columns: vec!["a".into()],
+            description: String::new(),
+        });
+        let tree = f.to_tree().unwrap();
+        let manifest = String::from_utf8_lossy(&tree[MANIFEST]).to_string();
+        assert!(manifest.contains("\"forms\""));
+        assert!(!manifest.contains("description")); // 空の説明は出さない
+        assert_eq!(JxcelFile::from_tree(&tree).unwrap().forms, f.forms);
     }
 }
