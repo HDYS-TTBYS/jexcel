@@ -93,6 +93,10 @@ fn walk(el: &mut Element, ctx: &mut Ctx, scope: &mut Scope) -> Result<bool> {
     if is_block_container(&el.name) && direct_paragraph_markers(el).iter().any(|m| !m.is_empty()) {
         return block_container(el, ctx, scope);
     }
+    // セルの中の段落のループ（同じセルの別の段落で組になる印）
+    if el.name == "w:tc" && cell_markers(el).iter().flatten().any(|m| m.1) {
+        return block_container(el, ctx, scope);
+    }
     let mut changed = false;
     if el.name == "w:p" {
         changed |= paragraph(el, &mut |expr| resolve(ctx, scope, expr))?;
@@ -128,6 +132,76 @@ fn has_rows(tbl: &Element) -> bool {
         .any(|n| matches!(n, Node::Element(e) if e.name == "w:tr"))
 }
 
+/// セル（`<w:tc>`）の直下の段落の印を、セルの段落のループの印（true）と、行のループの印（false）に分ける。
+/// 要素の子（段落以外は空）ごとの、文書順の印。**同じセルの別の段落で `{{#each}}` と `{{/each}}` が組になる**ものだけが
+/// セルの段落のループ。1 つの段落の中で閉じるもの（`{{#each x}}…{{/each}}`）・組にならないものは行のループの印のまま。
+fn cell_markers(tc: &Element) -> Vec<Vec<(Marker, bool)>> {
+    let mut per: Vec<Vec<(Marker, bool)>> = tc
+        .children
+        .iter()
+        .filter_map(|n| match n {
+            Node::Element(e) => Some(e),
+            _ => None,
+        })
+        .map(|e| {
+            let mut found = vec![];
+            if e.name == "w:p" {
+                collect_markers(e, &mut found);
+            }
+            found.into_iter().map(|m| (m, false)).collect()
+        })
+        .collect();
+    // (段落, 段落の中の位置) の組を、文書順のスタックで対応づける
+    let mut stack: Vec<(usize, usize)> = vec![];
+    let mut pairs = vec![];
+    for (p, ms) in per.iter().enumerate() {
+        for (k, (m, _)) in ms.iter().enumerate() {
+            match m {
+                Marker::Open(_) => stack.push((p, k)),
+                Marker::Close => {
+                    if let Some(open) = stack.pop() {
+                        if open.0 != p {
+                            pairs.push((open, (p, k)));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for (a, b) in pairs {
+        per[a.0][a.1].1 = true;
+        per[b.0][b.1].1 = true;
+    }
+    per
+}
+
+/// セルの段落のループの印だけを、段落ごとに（`block_container` の入力として）返す。
+/// セルの段落のループの中に行のループの印があるとエラー。
+fn cell_loop_marks(tc: &Element) -> Result<Vec<Vec<Marker>>> {
+    let per = cell_markers(tc);
+    // 文書順の印の列で、セルの段落のループの内側（深さ 1 以上）にある行のループの印を探す
+    let mut depth = 0usize;
+    for ms in &per {
+        for (m, cell_loop) in ms {
+            match (cell_loop, m) {
+                (true, Marker::Open(_)) => depth += 1,
+                (true, Marker::Close) => depth -= 1,
+                (false, _) if depth > 0 => {
+                    return Err(expr_error(
+                        "#each",
+                        "セルの段落のループの中に、行のループの印は書けません",
+                    ))
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(per
+        .into_iter()
+        .map(|ms| ms.into_iter().filter(|x| x.1).map(|x| x.0).collect())
+        .collect())
+}
+
 /// 直下の段落ごとの、ループの印（段落以外は空）。
 fn direct_paragraph_markers(el: &Element) -> Vec<Vec<Marker>> {
     el.children
@@ -149,6 +223,12 @@ fn direct_paragraph_markers(el: &Element) -> Vec<Vec<Marker>> {
 /// 本文などの、表の外の段落のループ。`{{#each 式}}` の段落から `{{/each}}` の段落まで（表などの
 /// 間のブロックを含む）が、要素の数だけ繰り返される。印だけの段落は出力しない。
 fn block_container(el: &mut Element, ctx: &mut Ctx, scope: &mut Scope) -> Result<bool> {
+    // セルは、セルの段落のループの印だけを見る（ほかの印は、その行のループの印）
+    let cell_marks = if el.name == "w:tc" {
+        Some(cell_loop_marks(el)?)
+    } else {
+        None
+    };
     let children = std::mem::take(&mut el.children);
     // 要素（段落・表・節の設定など）ごとに、直前の要素以降のテキストなどをひとまとめにして持つ
     let mut items: Vec<TableRow> = vec![];
@@ -164,16 +244,19 @@ fn block_container(el: &mut Element, ctx: &mut Ctx, scope: &mut Scope) -> Result
     }
     let trailing = pending;
 
-    let marks: Vec<Vec<Marker>> = items
-        .iter()
-        .map(|r| {
-            let mut found = vec![];
-            if r.row.name == "w:p" {
-                collect_markers(&r.row, &mut found);
-            }
-            found
-        })
-        .collect();
+    let marks: Vec<Vec<Marker>> = match cell_marks {
+        Some(m) => m,
+        None => items
+            .iter()
+            .map(|r| {
+                let mut found = vec![];
+                if r.row.name == "w:p" {
+                    collect_markers(&r.row, &mut found);
+                }
+                found
+            })
+            .collect(),
+    };
     let mut blocks = parse_blocks(&marks)?;
     number(&mut blocks, &mut ctx.next_loop);
     // 中の表のループの番号は、ブロックを何回繰り返しても同じになるよう、要素ごとに先に確保する
@@ -205,6 +288,19 @@ fn block_container(el: &mut Element, ctx: &mut Ctx, scope: &mut Scope) -> Result
         )?;
     }
     out.extend(trailing);
+    // セルは段落で終わらなければならない（ブロックが全部消えたとき・表で終わるとき）
+    if el.name == "w:tc"
+        && !out
+            .iter()
+            .rev()
+            .find_map(|n| match n {
+                Node::Element(e) => Some(e.name == "w:p"),
+                _ => None,
+            })
+            .unwrap_or(false)
+    {
+        out.push(Node::Element(Element::new("w:p")));
+    }
     el.children = out;
     ctx.next_loop = cursor;
     Ok(changed)
@@ -357,6 +453,9 @@ fn emit(
 /// 表（入れ子の表を含む）の中のループの数。番号を静的に振るために使う。
 fn static_loops(el: &Element) -> Result<usize> {
     let mut n = 0;
+    if el.name == "w:tc" {
+        n += count_blocks(&parse_blocks(&cell_loop_marks(el)?)?);
+    }
     for c in &el.children {
         let Node::Element(ce) = c else { continue };
         if ce.name == "w:tbl" {
@@ -397,7 +496,7 @@ fn resolve(ctx: &mut Ctx, scope: &Scope, expr: &str) -> std::result::Result<Valu
     if marker(expr).is_some() {
         return if scope.is_empty() {
             Err(
-                "{{#each}} と {{/each}} は、表の行の中か、本文の段落（表の外）に書いてください"
+                "{{#each}} と {{/each}} は、表の行の中か、本文の段落（表の外）・セルの別々の段落に書いてください"
                     .into(),
             )
         } else {
@@ -421,6 +520,21 @@ fn collect_markers(el: &Element, found: &mut Vec<Marker>) {
                 found.push(mk);
             }
         }
+    }
+    if el.name == "w:tc" {
+        // セルの段落のループの印は、行のループの印ではない
+        let per = cell_markers(el);
+        let mut idx = 0;
+        for c in &el.children {
+            let Node::Element(ce) = c else { continue };
+            if ce.name == "w:p" {
+                found.extend(per[idx].iter().filter(|x| !x.1).map(|x| x.0.clone()));
+            } else if ce.name != "w:tbl" {
+                collect_markers(ce, found);
+            }
+            idx += 1;
+        }
+        return;
     }
     for c in &el.children {
         if let Node::Element(ce) = c {

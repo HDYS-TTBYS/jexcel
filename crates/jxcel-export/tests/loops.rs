@@ -888,3 +888,96 @@ fn docx_paragraph_loops_are_planned_with_their_numbers() {
     assert_eq!(sources, [("明細", None), ("付属", Some(0))]);
     assert!(p.loops[0].exprs.contains(&"品目".to_string()));
 }
+
+// ---------------------------------------------------------------- セルの中の段落のループ
+
+const CELL_PARAGRAPHS_DOCX: &[u8] = include_bytes!("fixtures/cell-paragraphs.docx");
+
+/// 表の各セルの、段落ごとのテキスト（行 → セル → 段落）。
+fn cell_paragraphs(zip: &[u8]) -> Vec<Vec<Vec<String>>> {
+    let root = part(zip, "word/document.xml");
+    let mut rows = vec![];
+    elements(&root, "tr", &mut rows);
+    rows.iter()
+        .map(|tr| {
+            let mut cells = vec![];
+            elements(tr, "tc", &mut cells);
+            cells
+                .iter()
+                .map(|tc| {
+                    tc.children
+                        .iter()
+                        .filter_map(|n| match n {
+                            Node::Element(p) if p.local() == "p" => {
+                                let mut ts = vec![];
+                                elements(p, "t", &mut ts);
+                                Some(ts.iter().map(|t| t.text()).collect::<String>())
+                            }
+                            _ => None,
+                        })
+                        .collect()
+                })
+                .collect()
+        })
+        .collect()
+}
+
+#[test]
+fn docx_paragraph_loops_work_inside_a_table_cell() {
+    let out = render_with(Kind::Docx, CELL_PARAGRAPHS_DOCX, &mut Nest::sample())
+        .unwrap_or_else(|e| panic!("{e}"));
+    let rows = cell_paragraphs(&out);
+    // 行は増えず、セルの中の段落だけが繰り返される。印だけの段落は出力しない
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows[1][0],
+        ["1. ねじ", "- a", "- b", "2. 板"],
+        "{:?}",
+        rows[1]
+    );
+    assert_eq!(rows[1][1], ["INV-7"]);
+    // セルを空にしても、セルは段落で終わる（Word の決まり）
+    struct Empty;
+    impl Source for Empty {
+        fn value(&mut self, e: &str) -> Result<Value, String> {
+            Ok(json!(e))
+        }
+        fn loop_len(
+            &mut self,
+            _: usize,
+            _: Option<usize>,
+            _: &[usize],
+            _: &str,
+        ) -> Result<usize, String> {
+            Ok(0)
+        }
+        fn item_value(&mut self, _: usize, _: &[usize], _: &str) -> Result<Value, String> {
+            unreachable!()
+        }
+    }
+    let out = render_with(Kind::Docx, CELL_PARAGRAPHS_DOCX, &mut Empty).unwrap();
+    assert_eq!(cell_paragraphs(&out)[1][0], [""]);
+}
+
+#[test]
+fn docx_cell_paragraph_loops_are_planned_and_row_markers_inside_are_rejected() {
+    let p = plan(Kind::Docx, CELL_PARAGRAPHS_DOCX).unwrap();
+    let sources: Vec<(&str, Option<usize>)> = p
+        .loops
+        .iter()
+        .map(|l| (l.source.as_str(), l.parent))
+        .collect();
+    assert_eq!(sources, [("明細", None), ("付属", Some(0))]);
+
+    // セルの段落のループの中に、同じ段落で閉じる行のループの印を書くとエラー
+    let mut pkg = Package::read(CELL_PARAGRAPHS_DOCX).unwrap();
+    let xml_text = String::from_utf8(pkg.get("word/document.xml").unwrap().to_vec()).unwrap();
+    pkg.set(
+        "word/document.xml",
+        xml_text
+            .replace("- {{名}}", "{{#each 付属}}{{名}}{{/each}}")
+            .into_bytes(),
+    );
+    let e = render_with(Kind::Docx, &pkg.write().unwrap(), &mut Nest::sample()).unwrap_err();
+    assert!(e.to_string().contains("セルの段落のループの中"), "{e}");
+}

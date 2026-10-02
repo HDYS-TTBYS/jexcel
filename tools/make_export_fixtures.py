@@ -196,6 +196,21 @@ def make_paragraph_docx():
     d.save(OUT / "paragraphs.docx")
 
 
+def make_cell_paragraph_docx():
+    """表のセルの中の段落のループ。同じセルの別々の段落で {{#each}} と {{/each}} が組になる（入れ子も）。"""
+    d = Document()
+    t = d.add_table(rows=2, cols=2)
+    t.style = "Table Grid"
+    t.cell(0, 0).text = "明細"
+    t.cell(0, 1).text = "請求番号"
+    cell = t.cell(1, 0)
+    cell.text = "{{#each 明細}}"
+    for line in ["{{_n}}. {{品目}}", "{{#each 付属}}", "- {{名}}", "{{/each}}", "{{/each}}"]:
+        cell.add_paragraph(line)
+    t.cell(1, 1).text = "{{請求番号}}"
+    d.save(OUT / "cell-paragraphs.docx")
+
+
 def make_nested_table_docx():
     """繰り返す行の中の表（入れ子の表）の中のループ。印は {{#each}} だけ（従来の 1 行ループ）。"""
     d = Document()
@@ -245,6 +260,7 @@ make_docx()
 make_xlsx()
 make_nested_docx()
 make_paragraph_docx()
+make_cell_paragraph_docx()
 make_nested_table_docx()
 make_nested_xlsx()
 make_loop_docx()
