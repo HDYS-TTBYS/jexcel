@@ -1381,6 +1381,98 @@ mod tests {
     }
 
     #[test]
+    fn std_datetime_comparison_uses_the_instant() {
+        check_table(
+            &sample(),
+            &[
+                // 文字列では前後が逆になる組（+09:00 の 10:00 は Z の 01:00 と同じ瞬間）
+                ("'2024-01-31T10:00:00+09:00' < '2024-01-31T02:00:00Z'", json!(false)),
+                (
+                    "std.date.compare('2024-01-31T10:00:00+09:00', '2024-01-31T02:00:00Z')",
+                    json!(-1),
+                ),
+                (
+                    "std.date.compare('2024-01-31T10:00:00+09:00', '2024-01-31T01:00:00Z')",
+                    json!(0),
+                ),
+                (
+                    "std.date.compare('2024-01-31T10:00:00+09:00', '2024-01-30T23:59:59-05:00')",
+                    json!(-1),
+                ),
+                (
+                    "std.date.compare('2024-01-31T10:00:00.5+09:00', '2024-01-31T10:00:00.25+09:00')",
+                    json!(1),
+                ),
+                (
+                    "std.date.compare('2024-01-31T10:00:00.50+09:00', '2024-01-31T01:00:00.5Z')",
+                    json!(0),
+                ),
+                ("std.date.compare(null, '2024-01-31T10:00:00Z')", json!(null)),
+                ("std.date.toEpochMs('1970-01-01T09:00:00.123+09:00')", json!(123)),
+                ("std.date.toEpochMs('2024-01-31T00:00:00Z')", json!(1706659200000_i64)),
+                ("std.date.toEpochMs('1969-12-31T23:59:59.999Z')", json!(-1)),
+                (
+                    "std.date.diffSeconds('2024-01-31T10:00:00+09:00', '2024-01-31T00:00:00Z')",
+                    json!(3600),
+                ),
+                (
+                    "std.date.diffSeconds('2024-01-31T00:00:01.5Z', '2024-01-31T09:00:00+09:00')",
+                    json!(1.5),
+                ),
+                (
+                    "std.date.earliest(['2024-01-31T10:00:00+09:00', null, '2024-01-31T00:30:00Z', '2024-01-31T02:00:00Z'])",
+                    json!("2024-01-31T00:30:00Z"),
+                ),
+                (
+                    "std.date.latest(['2024-01-31T10:00:00+09:00', null, '2024-01-31T00:30:00Z', '2024-01-31T02:00:00Z'])",
+                    json!("2024-01-31T02:00:00Z"),
+                ),
+                ("std.date.latest([null])", json!(null)),
+                // 並べ替えは、オフセットが混ざっていても瞬間の順（同じ瞬間は元の順、空は最後）
+                (
+                    "std.sortBy([{t:'2024-01-31T10:00:00+09:00', n:'a'}, {t:null, n:'z'}, {t:'2024-01-31T00:30:00Z', n:'b'}, {t:'2024-01-31T01:00:00Z', n:'c'}, {t:'2024-01-30T23:00:00-05:00', n:'d'}], 't').map(r => r.n).join('')",
+                    json!("bacdz"),
+                ),
+                (
+                    "std.sortBy([{t:'2024-01-31T10:00:00+09:00', n:'a'}, {t:null, n:'z'}, {t:'2024-01-31T00:30:00Z', n:'b'}, {t:'2024-01-31T02:00:00Z', n:'c'}], 't', 'desc').map(r => r.n).join('')",
+                    json!("cabz"),
+                ),
+                // 日付だけ・通常の文字列は、従来どおり文字列の順
+                (
+                    "std.sortBy([{t:'2024-02-01', n:'a'}, {t:'2024-01-31', n:'b'}], 't').map(r => r.n).join('')",
+                    json!("ba"),
+                ),
+            ],
+        );
+        for (src, want) in [
+            (
+                "std.date.compare('2024-01-31T10:00:00', '2024-01-31T10:00:00Z')",
+                "オフセットのない",
+            ),
+            (
+                "std.date.compare('2024-01-31', '2024-01-31T10:00:00Z')",
+                "日時ではありません",
+            ),
+            (
+                "std.date.earliest(['2024-01-31T10:00:00Z', '2024-01-31T11:00:00'])",
+                "オフセットのない",
+            ),
+            ("std.date.toEpochMs('abc')", "日付ではありません"),
+        ] {
+            let e = run(
+                &format!("export default () => {src}"),
+                &sample(),
+                &Options::default(),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(&e, Error::Runtime(m) if m.contains(want)),
+                "{src}: {e}"
+            );
+        }
+    }
+
+    #[test]
     fn std_decimals_are_exact() {
         check_table(
             &sample(),

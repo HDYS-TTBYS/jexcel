@@ -118,6 +118,26 @@
     return (min < 0 ? "-" : "+") + pad2(Math.floor(a / 60)) + ":" + pad2(a % 60);
   }
 
+  // 日時の「瞬間」（オフセットを考慮した UTC の秒と、小数秒の 9 桁）。オフセットのない日時は比べられないので例外
+  function instantOf(s) {
+    const t = parseDateTime(s);
+    if (t.off === null) throw new Error("オフセットのない日時は比較できません: " + s);
+    return { sec: toDays(t.y, t.mo, t.d) * 86400 + t.hh * 3600 + t.mi * 60 + t.ss - t.off * 60, frac: (t.frac.slice(1) + "000000000").slice(0, 9) };
+  }
+  const cmpInstant = (a, b) => (a.sec !== b.sec ? (a.sec < b.sec ? -1 : 1) : a.frac < b.frac ? -1 : a.frac > b.frac ? 1 : 0);
+  // オフセット付きの日時の文字列か（sortBy が、文字列の比較ではなく瞬間で比べるかの判定）
+  const DT_OFFSET = /^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(\.\d+)?([Zz]|[+-]\d{2}:\d{2})$/;
+
+  function pickInstant(values, dir) {
+    let best = null;
+    let bestKey = null;
+    for (const v of values) {
+      if (isNil(v)) continue;
+      const k = instantOf(v);
+      if (best === null || cmpInstant(k, bestKey) * dir > 0) [best, bestKey] = [v, k];
+    }
+    return best;
+  }
   const date = {
     today() {
       const t = new Date();
@@ -216,6 +236,30 @@
     /** 日時のオフセット（分。"Z" と "+00:00" は 0、東京は 540）。オフセットのない日時は null */
     offsetMinutes(s) {
       return isNil(s) ? null : parseDateTime(s).off;
+    },
+    /** a と b の前後（瞬間で比べる）: a が前なら -1、同じなら 0、後なら 1。どちらかが null なら null。オフセットのない日時は例外 */
+    compare(a, b) {
+      return isNil(a) || isNil(b) ? null : cmpInstant(instantOf(a), instantOf(b));
+    },
+    /** 1970-01-01T00:00:00Z からのミリ秒（オフセットを考慮）。オフセットのない日時は例外 */
+    toEpochMs(s) {
+      if (isNil(s)) return null;
+      const t = instantOf(s);
+      return t.sec * 1000 + Number(t.frac.slice(0, 3));
+    },
+    /** a - b の秒数（オフセットを考慮。小数秒も含む）。どちらかが null なら null */
+    diffSeconds(a, b) {
+      if (isNil(a) || isNil(b)) return null;
+      const [x, y] = [instantOf(a), instantOf(b)];
+      return x.sec - y.sec + (Number(x.frac) - Number(y.frac)) / 1e9;
+    },
+    /** 一番早い日時（瞬間で比べ、元の文字列を返す）。null は無視し、残りが無ければ null */
+    earliest(values) {
+      return pickInstant(values, -1);
+    },
+    /** 一番遅い日時（瞬間で比べ、元の文字列を返す）。null は無視し、残りが無ければ null */
+    latest(values) {
+      return pickInstant(values, 1);
     },
     /** 同じ時刻を、別のタイムゾーンのオフセットで表した日時にする。例: toOffset("2024-01-31T01:30:00Z", "+09:00") → "2024-01-31T10:30:00+09:00"。元にオフセットがない日時は変換できず例外 */
     toOffset(s, offset) {
@@ -431,7 +475,7 @@
         return true;
       });
     },
-    /** 新しい配列を返す。空の値は昇順・降順どちらでも最後 */
+    /** 新しい配列を返す。空の値は昇順・降順どちらでも最後。オフセット付きの日時の文字列は、文字列ではなく瞬間で比べる */
     sortBy(rows, col, order) {
       const dir = order === "desc" ? -1 : 1;
       return rows
@@ -439,6 +483,15 @@
         .sort(([a, i], [b, j]) => {
           const [x, y] = [cell(a, col), cell(b, col)];
           if (isNil(x) || isNil(y)) return isNil(x) && isNil(y) ? i - j : isNil(x) ? 1 : -1;
+          // オフセット付きの日時どうしは、文字列ではなく瞬間で比べる（+09:00 と Z が混ざっていても正しく並ぶ）
+          if (typeof x === "string" && typeof y === "string" && DT_OFFSET.test(x) && DT_OFFSET.test(y)) {
+            try {
+              const c = cmpInstant(instantOf(x), instantOf(y));
+              return c !== 0 ? c * dir : i - j;
+            } catch (e) {
+              // 存在しない日時などは、文字列の比較にする
+            }
+          }
           return x < y ? -dir : x > y ? dir : i - j;
         })
         .map(([r]) => r);

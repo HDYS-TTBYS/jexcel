@@ -87,6 +87,20 @@ interface JxcelStdDate {
   /** 日時のオフセット（分。"Z" は 0、東京は 540）。オフセットのない日時は null */
   offsetMinutes(datetime: string | null): number | null;
   /**
+   * 2 つの日時の前後を、オフセットを考慮した「瞬間」で比べます（a が前なら -1、同じなら 0、後なら 1）。
+   * "2024-01-31T10:00:00+09:00" と "2024-01-31T01:00:00Z" は同じ瞬間です。文字列として < で比べると、
+   * オフセットが違う日時は正しく比べられません。どちらかが null なら null、オフセットのない日時は例外です。
+   */
+  compare(a: string | null, b: string | null): -1 | 0 | 1 | null;
+  /** 1970-01-01T00:00:00Z からのミリ秒（オフセットを考慮）。オフセットのない日時は例外 */
+  toEpochMs(datetime: string | null): number | null;
+  /** a - b の秒数（オフセットを考慮。小数秒も含む）。どちらかが null なら null */
+  diffSeconds(a: string | null, b: string | null): number | null;
+  /** 一番早い日時（瞬間で比べ、元の文字列を返す）。null は無視し、残りが無ければ null */
+  earliest(values: (string | null)[]): string | null;
+  /** 一番遅い日時（瞬間で比べ、元の文字列を返す）。null は無視し、残りが無ければ null */
+  latest(values: (string | null)[]): string | null;
+  /**
    * 同じ時刻を、別のタイムゾーンのオフセットで表した日時にします。
    * 例: toOffset("2024-01-31T01:30:00Z", "+09:00") → "2024-01-31T10:30:00+09:00"。
    * offset は "+09:00"・"Z"・分（540）。元の日時にオフセットがないと例外です。
@@ -185,6 +199,7 @@ interface JxcelStd {
   /**
    * 列で並べ替えた新しい配列。空の値は昇順でも降順でも最後。同じ値は元の順を保ちます。
    * 文字列は文字コード順です（五十音順ではありません。ひらがなとカタカナ、漢字は混ざった順になります）。
+   * ただし、オフセット付きの日時の文字列どうし（"2024-01-31T10:00:00+09:00" など）は、瞬間で比べます。
    */
   sortBy<T extends Record<string, any>>(rows: T[], col: string, order?: "asc" | "desc"): T[];
 

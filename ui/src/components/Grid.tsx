@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef } from "react";
 import { AgGridReact } from "ag-grid-react";
 import { AllCommunityModule, ModuleRegistry, type CellEditRequestEvent, type ColDef, type ICellRendererParams } from "ag-grid-community";
+import { compareValues } from "../compare";
 import { formatValue, parseInput } from "../parse";
 import type { CellResult, Column, DataSchema, Row } from "../types";
 
@@ -43,6 +44,18 @@ export function Grid({ schema, computed, onSetCell, onDeleteRow, onError }: Prop
             return r && "e" in r ? r.e : undefined;
           }
         : undefined,
+      // 並べ替えは、表示用の文字列ではなく元の値を、列の型で比べる（数は数として、日時は瞬間で）。空は昇順でも降順でも最後
+      comparator: (_a, _b, na, nb, isDescending) => {
+        const raw = (n: typeof na) => {
+          if (!n.data) return null;
+          if (!c.computed) return n.data.cells[c.id] ?? null;
+          const r = result(c, n.data);
+          return r && "v" in r ? (r.v ?? null) : null;
+        };
+        const [x, y] = [raw(na), raw(nb)];
+        if (x === null || y === null) return x === y ? 0 : (x === null ? 1 : -1) * (isDescending ? -1 : 1);
+        return compareValues(c.type, x, y);
+      },
       cellEditor: c.type.kind === "enum" ? "agSelectCellEditor" : undefined,
       cellEditorParams: c.type.kind === "enum" ? { values: ["", ...c.type.values] } : undefined,
       cellClass: (p) => {

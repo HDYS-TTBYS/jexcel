@@ -46,3 +46,15 @@ export function datetimeToOffset(s: string, offsetMin: number, zulu: boolean): s
   const off = offsetMin === 0 && zulu ? "Z" : `${offsetMin < 0 ? "-" : "+"}${p2(Math.floor(a / 60))}:${p2(a % 60)}`;
   return `${String(ny).padStart(4, "0")}-${p2(nm)}-${p2(nd)}T${p2(Math.floor(r / 3600))}:${p2(Math.floor((r % 3600) / 60))}:${p2(r % 60)}${m[7] ?? ""}${off}`;
 }
+
+/** オフセットを考慮した「瞬間」（UTC の秒と、小数秒の 9 桁）。日時として読めない文字列は null。 */
+export function instantOf(s: string): { sec: number; frac: string } | null {
+  const m = /^(\d{4})-(\d{2})-(\d{2})[Tt](\d{2}):(\d{2}):(\d{2})(\.\d+)?(Z|z|[+-]\d{2}:\d{2})$/.exec(s);
+  if (!m) return null;
+  const [y, mo, d, hh, mi, ss] = [1, 2, 3, 4, 5, 6].map((i) => Number(m[i]));
+  const off = parseOffset(m[8]);
+  if (off === null || mo < 1 || mo > 12 || d < 1 || d > 31 || hh > 23 || mi > 59 || ss > 60) return null;
+  const [cy, cm, cd] = fromDays(toDays(y, mo, d));
+  if (cy !== y || cm !== mo || cd !== d) return null;
+  return { sec: toDays(y, mo, d) * 86400 + hh * 3600 + mi * 60 + ss - off * 60, frac: ((m[7] ?? ".").slice(1) + "000000000").slice(0, 9) };
+}
