@@ -27,7 +27,11 @@ pnpm --dir ui dev            # ブラウザ単体で起動（モックバック�
 pnpm --dir ui test           # Vitest
 pnpm --dir ui test -- parse  # 単一ファイルの絞り込み
 pnpm --dir ui build          # tsc + vite build（src-tauri が ui/dist を埋め込む）
+pnpm --dir ui e2e            # Playwright の e2e（vite の dev サーバを自動で起動する）
+pnpm --dir ui e2e -- guard   # 単一ファイルの絞り込み
 ```
+
+e2e（`ui/e2e/*.e2e.mjs`）は、ブラウザ単体（モックバックエンド）の UI を実際の Chromium で操作して確かめる。Vitest の対象から外すため `.e2e.mjs` という名前にしてある（`playwright.config.mjs` の `testMatch`）。Playwright 管理外の Chromium を使うときは `PW_CHROMIUM` に実行ファイルのパスを入れる（Playwright は 1.56 に固定していて、ブラウザのリビジョンが合う必要がある）。`form-page.e2e.mjs` は本物の Rust のサーバーを使うので、先に `cargo build -p jxcel-app --example serve_forms` が要る（CI では必須、ローカルで無ければスキップ）。CI の `e2e` ジョブが同じことを行い、失敗時は `playwright-report` を成果物に残す。Tauri の実ウィンドウ（ファイルダイアログや OS 連携）は対象外。
 
 Tauri アプリ（`src-tauri/`。**必ずリポジトリルートから**実行する。CLI は cwd 配下の `tauri.conf.json` を探す。ルートの `tauri` スクリプトは Windows の cmd でも動くよう、`.bin/` ではなく `node …/tauri.js` で呼んでいる）:
 

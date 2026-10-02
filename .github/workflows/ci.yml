@@ -35,6 +35,35 @@ jobs:
       - run: pnpm --dir ui test
       - run: pnpm --dir ui build
 
+  # ブラウザ単体（モックバックエンド）の UI を、実際のブラウザで操作して確かめる。
+  # フォーム配信の画面は、本物の Rust のサーバー（example）を起動して確かめる。
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: pnpm --dir ui install --frozen-lockfile
+      - run: cargo build -p jxcel-app --example serve_forms
+      - run: pnpm --dir ui exec playwright install --with-deps chromium
+      - run: pnpm --dir ui e2e
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-report
+          path: |
+            ui/playwright-report
+            ui/test-results
+          retention-days: 7
+
   app:
     name: tauri build (${{ matrix.os }})
     needs: [core, ui]
