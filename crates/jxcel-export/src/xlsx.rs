@@ -99,7 +99,7 @@ pub fn process(pkg: &mut Package, src: &mut dyn Source) -> Result<()> {
     };
     let names = sheet_names(pkg)?;
     // 行がずれたシートの記録（シート名 → 記録）。定義名の参照をずらすのに使う
-    let mut moved: std::collections::HashMap<String, Moves> = Default::default();
+    let mut moved = Moved::new(sheet_order(pkg)?);
     let mut any = false;
     for name in &sheets {
         let mut doc = xml::parse(pkg.get(name).expect("listed"))?;
@@ -153,6 +153,9 @@ pub fn process(pkg: &mut Package, src: &mut dyn Source) -> Result<()> {
             }
             pkg.set("xl/workbook.xml", xml::write(&doc)?);
         }
+    }
+    if let Some(message) = moved.error.take() {
+        return Err(expr_error("3D 参照", message));
     }
     Ok(())
 }
@@ -496,11 +499,7 @@ fn map_formula_elements(el: &mut Element, f: &mut dyn FnMut(&str) -> String) {
 
 /// このシート（またはグラフ）の数式の中の、ほかの（行がずれた）シートへの参照をずらす。変えたら true。
 /// 共有数式は、先に 1 つずつの数式に展開する（参照先が動くと、共有の相対位置が崩れるため）。
-fn shift_other_sheet_refs(
-    root: &mut Element,
-    own_name: Option<&str>,
-    moved: &std::collections::HashMap<String, Moves>,
-) -> bool {
+fn shift_other_sheet_refs(root: &mut Element, own_name: Option<&str>, moved: &Moved) -> bool {
     let mut texts = vec![];
     formula_texts(root, &mut texts);
     if !texts
@@ -528,6 +527,25 @@ fn shift_other_sheet_refs(
     map_formula_elements(root, &mut |t| shift_sheet_refs(t, moved, own_name));
     drop_cached_results(root);
     true
+}
+
+/// ブックの中のシート名を、タブの並び（`workbook.xml` の `<sheets>` の順）で。
+fn sheet_order(pkg: &Package) -> Result<Vec<String>> {
+    let Some(wb) = pkg.get("xl/workbook.xml") else {
+        return Ok(vec![]);
+    };
+    let wb = xml::parse(wb)?;
+    let mut out = vec![];
+    if let Some(sheets) = child(&wb.root, "sheets") {
+        for n in &sheets.children {
+            if let Node::Element(e) = n {
+                if let Some(name) = e.attr("name") {
+                    out.push(name.to_string());
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// 部品のパス（`xl/worksheets/sheet1.xml`）→ シート名。`workbook.xml` と、その関係の定義から引く。
@@ -570,7 +588,7 @@ fn sheet_names(pkg: &Package) -> Result<std::collections::HashMap<String, String
 }
 
 /// 定義名（印刷範囲・印刷タイトル・名前付き範囲）の中の、行がずれたシートへの参照をずらす。
-fn shift_defined_names(workbook: &mut Element, moved: &std::collections::HashMap<String, Moves>) {
+fn shift_defined_names(workbook: &mut Element, moved: &Moved) {
     let Some(names) = child_mut(workbook, "definedNames") else {
         return;
     };
@@ -589,11 +607,7 @@ fn shift_defined_names(workbook: &mut Element, moved: &std::collections::HashMap
 
 /// `Sheet1!$A$1:$C$8` のような、シート名つきの参照（範囲・行だけの範囲 `Sheet1!$1:$3`）をずらす。
 /// 対象は `moved` にあるシートだけ。文字列リテラルの中は触らない。
-fn shift_sheet_refs(
-    f: &str,
-    moved: &std::collections::HashMap<String, Moves>,
-    skip: Option<&str>,
-) -> String {
+fn shift_sheet_refs(f: &str, moved: &Moved, skip: Option<&str>) -> String {
     let chars: Vec<char> = f.chars().collect();
     let mut out = String::with_capacity(f.len());
     let mut i = 0;
@@ -646,27 +660,28 @@ fn shift_sheet_refs(
             i += 1;
             continue;
         };
-        // 3D 参照（`Sheet1:Sheet3!A1`）は、間のシートの行がそろってずれるとは限らないのでずらさない
+        // 3D 参照: `Sheet1:Sheet3!A1`（名前に空白があれば `'Sheet 1:Sheet 3'!A1`）。範囲の中のシートすべての同じ参照
+        let mut bang = next;
+        let mut span: Option<(String, String)> = None;
         if chars.get(next) == Some(&':') {
-            if let Some(bang) = three_d_end(&chars, next + 1) {
-                out.extend(&chars[i..=bang]);
-                i = bang + 1;
-                while i < chars.len()
-                    && (chars[i].is_ascii_alphanumeric() || "$:".contains(chars[i]))
-                {
-                    out.push(chars[i]);
-                    i += 1;
-                }
-                continue;
+            if let Some(b) = three_d_end(&chars, next + 1) {
+                let last: String = chars[next + 1..b].iter().collect();
+                span = Some((sheet.clone(), last.trim_matches('\'').replace("''", "'")));
+                bang = b;
+            }
+        } else if c == '\'' && chars.get(next) == Some(&'!') {
+            if let Some((x, y)) = sheet.split_once(':') {
+                span = Some((x.to_string(), y.to_string()));
             }
         }
-        if chars.get(next) != Some(&'!') {
+        if chars.get(bang) != Some(&'!') {
             out.extend(&chars[i..next.min(chars.len())]);
             i = next.min(chars.len());
             continue;
         }
-        out.extend(&chars[i..=next]);
-        i = next + 1;
+        let start = i;
+        out.extend(&chars[i..=bang]);
+        i = bang + 1;
         // `!` の後ろの参照（`$A$1`、`$A$1:$C$8`、`$1:$3`）
         let take = |from: usize| {
             let mut j = from;
@@ -686,6 +701,32 @@ fn shift_sheet_refs(
         } else {
             (None, a_end)
         };
+        if let Some((x, y)) = span {
+            // 範囲の中のシートのどれでも、ずらした結果が同じなら、その結果にする。違えば、黙って壊さずエラー
+            let pos = |n: &str| moved.order.iter().position(|o| same_sheet(o, n));
+            if let (Some(p), Some(q)) = (pos(&x), pos(&y)) {
+                let mapped: Vec<String> = moved.order[p.min(q)..=p.max(q)]
+                    .iter()
+                    .map(|n| match moved.get(n) {
+                        Some(m) => map_sheet_ref(&a, b.as_deref(), m),
+                        None => chars[i..end].iter().collect(),
+                    })
+                    .collect();
+                if mapped.iter().all(|m| *m == mapped[0]) {
+                    out.push_str(&mapped[0]);
+                } else {
+                    let whole: String = chars[start..end].iter().collect();
+                    moved.fail(format!(
+                        "{whole} は、範囲内のシートで行のずれ方が違うため、ずらせません（行ループのあるシートを 3D 参照に含めないでください）"
+                    ));
+                    out.extend(&chars[i..end]);
+                }
+            } else {
+                out.extend(&chars[i..end]);
+            }
+            i = end;
+            continue;
+        }
         match moved
             .get(&sheet)
             .filter(|_| skip.is_none_or(|k| !same_sheet(k, &sheet)))
@@ -758,6 +799,45 @@ fn drop_cached_results(el: &mut Element) {
     for n in &mut el.children {
         if let Node::Element(c) = n {
             drop_cached_results(c);
+        }
+    }
+}
+
+/// 行がずれたシートの記録（シート名 → 記録）と、ブックの中のシートの並び。3D 参照（`Sheet1:Sheet3!A1`）を
+/// 範囲の中のシートに展開するために並びを持つ。
+struct Moved {
+    by_name: std::collections::HashMap<String, Moves>,
+    /// ブックの中のシート名の並び（`workbook.xml` の `<sheets>` の順）
+    order: Vec<String>,
+    /// ずらせない参照があったときのメッセージ（最初の 1 件）
+    error: std::cell::RefCell<Option<String>>,
+}
+
+impl Moved {
+    fn new(order: Vec<String>) -> Self {
+        Self {
+            by_name: Default::default(),
+            order,
+            error: Default::default(),
+        }
+    }
+
+    fn insert(&mut self, name: String, m: Moves) {
+        self.by_name.insert(name, m);
+    }
+
+    fn get(&self, name: &str) -> Option<&Moves> {
+        self.by_name.get(name)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.by_name.is_empty()
+    }
+
+    fn fail(&self, message: String) {
+        let mut e = self.error.borrow_mut();
+        if e.is_none() {
+            *e = Some(message);
         }
     }
 }
@@ -1404,6 +1484,19 @@ fn rewrite_refs(f: &str, mut rewrite: impl FnMut(Option<&str>, &str) -> Option<S
                 }
                 let token: String = chars[start..j].iter().collect();
                 let next = chars.get(j).copied();
+                // 3D 参照（`Sheet1:Sheet3!A1`）は、1 つのシートへの参照ではない。どのシート名にも当たらない印を付ける
+                if next == Some(':')
+                    && boundary_ok
+                    && !is_col_token(&token)
+                    && !is_row_token(&token)
+                {
+                    if let Some(bang) = three_d_end(&chars, j + 1) {
+                        out.extend(&chars[start..=bang]);
+                        i = bang + 1;
+                        sheet = Some("\u{0}3D".to_string());
+                        continue;
+                    }
+                }
                 // シート名（直後が `!`）
                 if next == Some('!') && boundary_ok {
                     out.push_str(&token);
@@ -1924,11 +2017,9 @@ mod tests {
     #[test]
     fn sheet_qualified_references_are_shifted_only_for_moved_sheets() {
         let (m, _) = moves(&[(5, 3)], 12);
-        let moved: std::collections::HashMap<String, Moves> = [
-            ("請求書".to_string(), m),
-            ("Sheet 2".to_string(), moves(&[(2, 2)], 4).0),
-        ]
-        .into();
+        let mut moved = Moved::new(vec![]);
+        moved.insert("請求書".to_string(), m);
+        moved.insert("Sheet 2".to_string(), moves(&[(2, 2)], 4).0);
         let s = |f: &str| shift_sheet_refs(f, &moved, None);
         assert_eq!(s("請求書!$A$1:$C$8"), "請求書!$A$1:$C$10");
         assert_eq!(s("'請求書'!$B$6"), "'請求書'!$B$8");
@@ -1993,15 +2084,28 @@ mod tests {
     }
 
     #[test]
-    fn three_d_references_are_not_shifted() {
-        let (m, _) = moves(&[(5, 3)], 12);
-        let moved: std::collections::HashMap<String, Moves> = [("Sheet3".to_string(), m)].into();
+    fn three_d_references_are_shifted_only_when_every_sheet_in_the_span_agrees() {
+        let order: Vec<String> = ["A", "B", "C", "D", "Sheet 5"].map(String::from).into();
+        let mut moved = Moved::new(order.clone());
+        moved.insert("B".to_string(), moves(&[(5, 3)], 12).0);
+        moved.insert("C".to_string(), moves(&[(5, 3)], 12).0);
         let s = |f: &str| shift_sheet_refs(f, &moved, None);
-        assert_eq!(s("SUM(Sheet1:Sheet3!A6)"), "SUM(Sheet1:Sheet3!A6)");
-        assert_eq!(
-            s("SUM('Sheet 1':'Sheet 3'!A6:B7)"),
-            "SUM('Sheet 1':'Sheet 3'!A6:B7)"
-        );
-        assert_eq!(s("Sheet3!A6"), "Sheet3!A8");
+        // 範囲内の動いたシートが同じずれ方（B と C）なら、そのとおりにずらす
+        assert_eq!(s("SUM(B:C!A6)"), "SUM(B:C!A8)");
+        assert_eq!(moved.error.borrow().as_deref(), None);
+        // ずれない位置（ループより前）の参照は、どの範囲でも同じなのでそのまま
+        assert_eq!(s("SUM(A:D!A2)"), "SUM(A:D!A2)");
+        assert_eq!(moved.error.borrow().as_deref(), None);
+        // 動いていないシートを含む範囲で、ずれる行を指すと、結果がそろわない → エラー
+        assert_eq!(s("SUM(A:C!A6)"), "SUM(A:C!A6)");
+        let e = moved.error.borrow().clone().unwrap();
+        assert!(e.contains("A:C!A6") && e.contains("3D 参照"), "{e}");
+        // 引用符つき（空白のある名前）・文字列リテラルの中・普通の参照
+        let mut m2 = Moved::new(order);
+        m2.insert("Sheet 5".to_string(), moves(&[(5, 3)], 12).0);
+        let t = |f: &str| shift_sheet_refs(f, &m2, None);
+        assert_eq!(t("'Sheet 5:Sheet 5'!A6"), "'Sheet 5:Sheet 5'!A8");
+        assert_eq!(t("\"A:C!A6\""), "\"A:C!A6\"");
+        assert_eq!(t("'Sheet 5'!A6"), "'Sheet 5'!A8");
     }
 }

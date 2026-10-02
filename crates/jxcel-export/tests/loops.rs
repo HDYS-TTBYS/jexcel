@@ -1077,3 +1077,37 @@ fn xlsx_rules_charts_and_row_ranges_follow_the_shifted_rows() {
         ["明細!$A$3:$A$9", "'明細'!$B$10"]
     );
 }
+
+#[test]
+fn xlsx_three_d_references_are_shifted_or_rejected() {
+    let template = nested_xlsx_with_other_references();
+    let with_formula = |f: &str| {
+        let mut pkg = Package::read(&template).unwrap();
+        let text =
+            String::from_utf8(pkg.get("xl/worksheets/sheet2.xml").unwrap().to_vec()).unwrap();
+        pkg.set(
+            "xl/worksheets/sheet2.xml",
+            text.replace(
+                "</sheetData>",
+                &format!("<row r=\"9\"><c r=\"A9\"><f>{f}</f></c></row></sheetData>"),
+            )
+            .into_bytes(),
+        );
+        render_with(Kind::Xlsx, &pkg.write().unwrap(), &mut Nest::sample())
+    };
+    // 範囲（明細〜Sheet2）の中で、動いたのは明細だけ。ループより前の行（1 行目）はどのシートでも同じなので、そのまま
+    let out = with_formula("SUM(明細:Sheet2!B1)").unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(
+        formulas_of(&out, "xl/worksheets/sheet2.xml")["A9"],
+        "SUM(明細:Sheet2!B1)"
+    );
+    // ずれる行を指すと、シートごとに結果が違うのでエラー（黙って壊さない）
+    let e = with_formula("SUM(明細:Sheet2!B6)").unwrap_err();
+    assert!(e.to_string().contains("3D 参照"), "{e}");
+    // 範囲が動いたシートだけ（明細〜明細）なら、普通の参照と同じにずらす
+    let out = with_formula("SUM(明細:明細!B6)").unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(
+        formulas_of(&out, "xl/worksheets/sheet2.xml")["A9"],
+        "SUM(明細:明細!B10)"
+    );
+}
