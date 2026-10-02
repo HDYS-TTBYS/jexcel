@@ -96,6 +96,8 @@ export interface FormUrl {
 export interface FormsStatus {
   running: boolean;
   port: number | null;
+  /** 回答者に合言葉を求めているか */
+  protected: boolean;
   urls: FormUrl[];
 }
 

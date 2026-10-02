@@ -14,16 +14,29 @@ use crate::{Error, Result, Session, Snapshot};
 use jxcel_core::{new_id, Column, DataType, Form, JxcelFile, Row};
 use serde::Serialize;
 use serde_json::{json, Map, Value};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::Read;
-use std::net::UdpSocket;
+use std::net::{IpAddr, Ipv4Addr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const FORM_PAGE: &str = include_str!("form.html");
 const MAX_BODY: u64 = 64 * 1024;
 const WORKERS: usize = 4;
+
+/// 合言葉を渡すリクエストヘッダ（URL に載せない）。
+const CODE_HEADER: &str = "X-Jxcel-Code";
+/// 合言葉の長さ（バイト数＝文字数）の範囲
+const CODE_LEN: std::ops::RangeInclusive<usize> = 4..=64;
+/// 1 つの端末（IP アドレス）からの失敗（合言葉の間違い・存在しない URL）がこの回数に達すると、窓の間ロックする
+const FAIL_LIMIT: usize = 8;
+const FAIL_WINDOW: Duration = Duration::from_secs(300);
+/// 1 つの端末からの送信（回答）の上限。窓の間に超えると 429
+const SUBMIT_LIMIT: usize = 30;
+const SUBMIT_WINDOW: Duration = Duration::from_secs(60);
+/// 覚えておく端末の数の上限（超えたら期限切れを捨て、それでも多ければ全部捨てる）
+const MAX_TRACKED: usize = 4096;
 
 /// 入力欄にできる列の種類（ブラウザの入力部品に対応する）。計算列・ネスト型は `None`。
 pub fn field_kind(c: &Column) -> Option<&'static str> {
@@ -360,6 +373,8 @@ pub struct FormUrl {
 pub struct FormsStatus {
     pub running: bool,
     pub port: Option<u16>,
+    /// 合言葉が必要か
+    pub protected: bool,
     pub urls: Vec<FormUrl>,
 }
 
@@ -368,6 +383,7 @@ impl FormsStatus {
         Self {
             running: false,
             port: None,
+            protected: false,
             urls: vec![],
         }
     }
@@ -379,8 +395,79 @@ struct Tokens {
     by_token: HashMap<String, String>,
 }
 
+/// 端末ごとの失敗と送信の回数の制限（時刻は引数で受け取るのでテストできる）。
+#[derive(Default)]
+struct Limiter {
+    fails: HashMap<IpAddr, VecDeque<Instant>>,
+    submits: HashMap<IpAddr, VecDeque<Instant>>,
+}
+
+/// 窓より古い記録を捨てる。
+fn expire(q: &mut VecDeque<Instant>, now: Instant, window: Duration) {
+    while q.front().is_some_and(|t| now.duration_since(*t) >= window) {
+        q.pop_front();
+    }
+}
+
+fn prune(map: &mut HashMap<IpAddr, VecDeque<Instant>>, now: Instant, window: Duration) {
+    if map.len() <= MAX_TRACKED {
+        return;
+    }
+    map.retain(|_, q| {
+        expire(q, now, window);
+        !q.is_empty()
+    });
+    if map.len() > MAX_TRACKED {
+        map.clear();
+    }
+}
+
+impl Limiter {
+    /// ロック中なら、解けるまでの時間。
+    fn locked(&mut self, ip: IpAddr, now: Instant) -> Option<Duration> {
+        let q = self.fails.get_mut(&ip)?;
+        expire(q, now, FAIL_WINDOW);
+        if q.len() < FAIL_LIMIT {
+            return None;
+        }
+        Some(FAIL_WINDOW.saturating_sub(now.duration_since(q[q.len() - FAIL_LIMIT])))
+    }
+
+    fn fail(&mut self, ip: IpAddr, now: Instant) {
+        prune(&mut self.fails, now, FAIL_WINDOW);
+        let q = self.fails.entry(ip).or_default();
+        expire(q, now, FAIL_WINDOW);
+        q.push_back(now);
+    }
+
+    /// 送信を 1 回数える。上限を超えていれば、空くまでの時間。
+    fn submit(&mut self, ip: IpAddr, now: Instant) -> std::result::Result<(), Duration> {
+        prune(&mut self.submits, now, SUBMIT_WINDOW);
+        let q = self.submits.entry(ip).or_default();
+        expire(q, now, SUBMIT_WINDOW);
+        if q.len() >= SUBMIT_LIMIT {
+            return Err(SUBMIT_WINDOW.saturating_sub(now.duration_since(q[0])));
+        }
+        q.push_back(now);
+        Ok(())
+    }
+}
+
+/// 時間を一定にして比べる（合言葉の長さ以外を、応答の速さから推測されないように）。
+fn same_code(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    let mut diff = a.len() ^ b.len();
+    for i in 0..a.len().max(b.len()) {
+        diff |= (a.get(i).copied().unwrap_or(0) ^ b.get(i).copied().unwrap_or(0)) as usize;
+    }
+    diff == 0
+}
+
 struct Shared {
     session: Arc<Mutex<Session>>,
+    /// 設定されていれば、定義の取得と回答の送信にヘッダで合言葉が要る
+    access_code: Option<String>,
+    limiter: Mutex<Limiter>,
     tokens: Mutex<Tokens>,
     submitted: Mutex<HashMap<String, u32>>,
     stop: AtomicBool,
@@ -397,11 +484,26 @@ pub struct FormServer {
 
 impl FormServer {
     /// `port` で待ち受けを始める（0 なら空いているポート）。全ネットワークから届く。
+    ///
+    /// `access_code` を渡すと、フォームの定義の取得と回答の送信に合言葉（ヘッダ）が要る。
+    /// ファイルには保存せず、配信を始めるたびに決める（URL のトークンと同じ扱い）。
     pub fn start(
         session: Arc<Mutex<Session>>,
         port: u16,
+        access_code: Option<String>,
         on_change: impl Fn() + Send + Sync + 'static,
     ) -> Result<Self> {
+        let access_code = access_code.filter(|c| !c.is_empty());
+        if let Some(c) = &access_code {
+            // ヘッダで送るので ASCII の印字可能文字だけ（ブラウザの fetch は日本語をヘッダに入れられない）
+            if !CODE_LEN.contains(&c.len()) || !c.bytes().all(|b| b.is_ascii_graphic()) {
+                return Err(Error::Invalid(format!(
+                    "合言葉は半角の英数字と記号（空白なし）の {}〜{} 文字にしてください",
+                    CODE_LEN.start(),
+                    CODE_LEN.end()
+                )));
+            }
+        }
         let server = tiny_http::Server::http(("0.0.0.0", port)).map_err(|e| {
             Error::Invalid(format!(
                 "ポート {port} で待ち受けできません（使用中の可能性があります）: {e}"
@@ -415,6 +517,8 @@ impl FormServer {
         let server = Arc::new(server);
         let shared = Arc::new(Shared {
             session,
+            access_code,
+            limiter: Mutex::default(),
             tokens: Mutex::default(),
             submitted: Mutex::default(),
             stop: AtomicBool::new(false),
@@ -477,6 +581,7 @@ impl FormServer {
         FormsStatus {
             running: true,
             port: Some(self.port),
+            protected: self.shared.access_code.is_some(),
             urls,
         }
     }
@@ -514,12 +619,25 @@ fn header(name: &str, value: &str) -> tiny_http::Header {
 }
 
 fn respond(req: tiny_http::Request, status: u16, content_type: &str, body: String) {
+    respond_with(req, status, content_type, body, &[]);
+}
+
+fn respond_with(
+    req: tiny_http::Request,
+    status: u16,
+    content_type: &str,
+    body: String,
+    extra: &[(&str, String)],
+) {
     let mut r = tiny_http::Response::from_string(body)
         .with_status_code(status)
         .with_header(header("Content-Type", content_type))
         .with_header(header("Cache-Control", "no-store"))
         .with_header(header("X-Content-Type-Options", "nosniff"))
         .with_header(header("Referrer-Policy", "no-referrer"));
+    for (name, value) in extra {
+        r = r.with_header(header(name, value));
+    }
     if content_type.starts_with("text/html") {
         r = r.with_header(header(
             "Content-Security-Policy",
@@ -539,6 +657,19 @@ fn respond_json(req: tiny_http::Request, status: u16, body: Value) {
     );
 }
 
+/// 回数の制限に達したときの応答（待つべき秒数を `Retry-After` で伝える）。
+fn respond_limited(req: tiny_http::Request, wait: Duration, what: &str) {
+    let secs = wait.as_secs() + 1;
+    respond_with(
+        req,
+        429,
+        "application/json; charset=utf-8",
+        json!({"error": format!("{what}。{secs} 秒ほど待ってからやり直してください"), "retryAfter": secs})
+            .to_string(),
+        &[("Retry-After", secs.to_string())],
+    );
+}
+
 fn error_status(e: &Error) -> u16 {
     match e {
         Error::NoFile => 503,
@@ -553,9 +684,43 @@ fn handle(shared: &Shared, mut req: tiny_http::Request) {
     let path = url.split('?').next().unwrap_or("").to_string();
     let method = req.method().clone();
     let parts: Vec<&str> = path.trim_matches('/').split('/').collect();
+    let ip = req
+        .remote_addr()
+        .map(|a| a.ip())
+        .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    let code = req
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv(CODE_HEADER))
+        .map(|h| h.value.as_str().to_string());
 
+    // フォームの URL への失敗が続いた端末は、しばらく何も受け付けない
+    if parts.first() == Some(&"f") {
+        let locked = shared.limiter.lock().unwrap().locked(ip, Instant::now());
+        if let Some(wait) = locked {
+            return respond_limited(req, wait, "失敗が続いたため、一時的に受け付けません");
+        }
+    }
+
+    // トークンからフォームを引く。知らないトークンは失敗として数える（トークンの総当たりを止める）
     let form_id = |token: &str| -> Option<String> {
-        shared.tokens.lock().unwrap().by_token.get(token).cloned()
+        let found = shared.tokens.lock().unwrap().by_token.get(token).cloned();
+        if found.is_none() {
+            shared.limiter.lock().unwrap().fail(ip, Instant::now());
+        }
+        found
+    };
+    // 合言葉の確認。ヘッダが無いのは数えず（ページを開いた直後の問い合わせ）、間違いは失敗として数える
+    let denied = || -> Option<Value> {
+        let want = shared.access_code.as_deref()?;
+        match code.as_deref() {
+            Some(got) if same_code(got, want) => None,
+            Some(_) => {
+                shared.limiter.lock().unwrap().fail(ip, Instant::now());
+                Some(json!({"error": "合言葉が違います", "needCode": true}))
+            }
+            None => Some(json!({"error": "合言葉を入力してください", "needCode": true})),
+        }
     };
 
     match (&method, parts.as_slice()) {
@@ -565,13 +730,17 @@ fn handle(shared: &Shared, mut req: tiny_http::Request) {
             "text/plain; charset=utf-8",
             "jxcel フォーム配信中です。共有された URL から開いてください。".into(),
         ),
-        (tiny_http::Method::Get, ["f", token]) if form_id(token).is_some() => {
-            respond(req, 200, "text/html; charset=utf-8", FORM_PAGE.into())
-        }
+        (tiny_http::Method::Get, ["f", token]) => match form_id(token) {
+            Some(_) => respond(req, 200, "text/html; charset=utf-8", FORM_PAGE.into()),
+            None => respond_json(req, 404, json!({"error": "見つかりません"})),
+        },
         (tiny_http::Method::Get, ["f", token, "def"]) => {
             let Some(id) = form_id(token) else {
                 return respond_json(req, 404, json!({"error": "フォームが見つかりません"}));
             };
+            if let Some(body) = denied() {
+                return respond_json(req, 401, body);
+            }
             let def = shared
                 .session
                 .lock()
@@ -586,6 +755,13 @@ fn handle(shared: &Shared, mut req: tiny_http::Request) {
             let Some(id) = form_id(token) else {
                 return respond_json(req, 404, json!({"error": "フォームが見つかりません"}));
             };
+            if let Some(body) = denied() {
+                return respond_json(req, 401, body);
+            }
+            let sent = shared.limiter.lock().unwrap().submit(ip, Instant::now());
+            if let Err(wait) = sent {
+                return respond_limited(req, wait, "送信が多すぎます");
+            }
             let mut body = Vec::new();
             if req
                 .as_reader()
@@ -821,12 +997,26 @@ mod tests {
     // ---- HTTP ----
 
     fn http(port: u16, method: &str, path: &str, body: Option<&str>) -> (u16, String, String) {
+        http_with(port, method, path, body, &[])
+    }
+
+    fn http_with(
+        port: u16,
+        method: &str,
+        path: &str,
+        body: Option<&str>,
+        headers: &[(&str, &str)],
+    ) -> (u16, String, String) {
+        let extra: String = headers
+            .iter()
+            .map(|(k, v)| format!("{k}: {v}\r\n"))
+            .collect();
         let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
         c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let body = body.unwrap_or("");
         write!(
             c,
-            "{method} {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            "{method} {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n{extra}Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
         )
         .unwrap();
@@ -845,7 +1035,7 @@ mod tests {
         let shared = Arc::new(Mutex::new(s));
         let changed = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let c2 = changed.clone();
-        let server = FormServer::start(shared.clone(), 0, move || {
+        let server = FormServer::start(shared.clone(), 0, None, move || {
             c2.fetch_add(1, Ordering::SeqCst);
         })
         .unwrap();
@@ -919,8 +1109,174 @@ mod tests {
     #[test]
     fn form_is_unavailable_while_no_file_is_open_and_port_conflicts_are_reported() {
         let shared = Arc::new(Mutex::new(Session::new()));
-        let a = FormServer::start(shared.clone(), 0, || {}).unwrap();
-        assert!(FormServer::start(shared, a.port(), || {}).is_err());
+        let a = FormServer::start(shared.clone(), 0, None, || {}).unwrap();
+        assert!(FormServer::start(shared, a.port(), None, || {}).is_err());
         assert!(a.status().urls.is_empty());
+    }
+
+    #[test]
+    fn limiter_locks_after_repeated_failures_and_recovers() {
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+        let other: IpAddr = "10.0.0.2".parse().unwrap();
+        let t0 = Instant::now();
+        let mut l = Limiter::default();
+        for i in 0..FAIL_LIMIT - 1 {
+            l.fail(ip, t0 + Duration::from_secs(i as u64));
+        }
+        assert!(l.locked(ip, t0 + Duration::from_secs(10)).is_none());
+        l.fail(ip, t0 + Duration::from_secs(10));
+        let now = t0 + Duration::from_secs(11);
+        let wait = l.locked(ip, now).expect("ロックされる");
+        // 解けるのは、上限に達する直前の失敗（最古ではなく FAIL_LIMIT 個前）が窓から出たとき
+        assert!(
+            wait > Duration::from_secs(280) && wait <= FAIL_WINDOW,
+            "{wait:?}"
+        );
+        // ほかの端末には影響しない
+        assert!(l.locked(other, now).is_none());
+        // 窓が過ぎれば解ける
+        assert!(l
+            .locked(ip, t0 + FAIL_WINDOW + Duration::from_secs(11))
+            .is_none());
+    }
+
+    #[test]
+    fn limiter_caps_submissions_per_window() {
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+        let t0 = Instant::now();
+        let mut l = Limiter::default();
+        for _ in 0..SUBMIT_LIMIT {
+            l.submit(ip, t0).unwrap();
+        }
+        let wait = l.submit(ip, t0 + Duration::from_secs(10)).unwrap_err();
+        assert_eq!(wait, Duration::from_secs(50));
+        assert!(l.submit("10.0.0.2".parse().unwrap(), t0).is_ok());
+        assert!(l.submit(ip, t0 + SUBMIT_WINDOW).is_ok());
+    }
+
+    #[test]
+    fn limiter_forgets_old_hosts_when_the_table_is_full() {
+        let t0 = Instant::now();
+        let mut l = Limiter::default();
+        for i in 0..MAX_TRACKED as u32 + 1 {
+            l.fail(IpAddr::V4(Ipv4Addr::from(i)), t0);
+        }
+        let later = t0 + FAIL_WINDOW + Duration::from_secs(1);
+        l.fail("9.9.9.9".parse().unwrap(), later);
+        assert_eq!(l.fails.len(), 1);
+    }
+
+    #[test]
+    fn same_code_compares_whole_strings() {
+        assert!(same_code("abcd", "abcd"));
+        assert!(!same_code("abcd", "abce"));
+        assert!(!same_code("abcd", "abc"));
+        assert!(!same_code("abc", "abcd"));
+        assert!(same_code("", ""));
+    }
+
+    #[test]
+    fn access_code_is_required_for_definition_and_submission() {
+        let (mut s, sheet, schema) = session();
+        s.add_form(&sheet, &schema, "受付").unwrap();
+        let shared = Arc::new(Mutex::new(s));
+        // 短すぎる・長すぎる合言葉は開始できない
+        assert!(FormServer::start(shared.clone(), 0, Some("abc".into()), || {}).is_err());
+        assert!(FormServer::start(shared.clone(), 0, Some("a".repeat(65)), || {}).is_err());
+        assert!(
+            FormServer::start(shared.clone(), 0, Some("ひみつの合言葉".into()), || {}).is_err()
+        );
+        assert!(FormServer::start(shared.clone(), 0, Some("ab cd".into()), || {}).is_err());
+        // 空は「なし」と同じ
+        let open = FormServer::start(shared.clone(), 0, Some(String::new()), || {}).unwrap();
+        assert!(!open.status().protected);
+        drop(open);
+
+        let server =
+            FormServer::start(shared.clone(), 0, Some("himitsu-1234".into()), || {}).unwrap();
+        let port = server.port();
+        let st = server.status();
+        assert!(st.protected);
+        let token = st.urls[0].url.rsplit('/').next().unwrap().to_string();
+        let (def, submit) = (format!("/f/{token}/def"), format!("/f/{token}/submit"));
+        let body = r#"{"values":{"name":"山田","qty":"2"}}"#;
+
+        // 画面（HTML）は合言葉なしで開ける。中身は何も入っていない
+        let (code, _, page) = http(port, "GET", &format!("/f/{token}"), None);
+        assert_eq!(code, 200);
+        assert!(!page.contains("受付"));
+
+        // ヘッダが無い: 401 で、行は増えない。失敗には数えない
+        for _ in 0..FAIL_LIMIT + 2 {
+            let (code, _, b) = http(port, "GET", &def, None);
+            assert_eq!(code, 401);
+            assert!(b.contains("needCode"), "{b}");
+        }
+        assert_eq!(http(port, "POST", &submit, Some(body)).0, 401);
+        assert!(rows(&shared.lock().unwrap(), &schema).is_empty());
+
+        // 正しい合言葉
+        let ok = [(CODE_HEADER, "himitsu-1234")];
+        let (code, _, b) = http_with(port, "GET", &def, None, &ok);
+        assert_eq!(code, 200, "{b}");
+        assert_eq!(http_with(port, "POST", &submit, Some(body), &ok).0, 200);
+        assert_eq!(rows(&shared.lock().unwrap(), &schema).len(), 1);
+
+        // 間違いが続くと、正しい合言葉でもロックされる（429 と Retry-After）
+        let bad = [(CODE_HEADER, "wrong")];
+        for _ in 0..FAIL_LIMIT {
+            assert_eq!(http_with(port, "GET", &def, None, &bad).0, 401);
+        }
+        let (code, head, b) = http_with(port, "GET", &def, None, &ok);
+        assert_eq!(code, 429, "{b}");
+        assert!(head.to_lowercase().contains("retry-after"), "{head}");
+        assert_eq!(http_with(port, "POST", &submit, Some(body), &ok).0, 429);
+        assert_eq!(rows(&shared.lock().unwrap(), &schema).len(), 1);
+    }
+
+    #[test]
+    fn guessing_tokens_locks_the_host_out() {
+        let (mut s, sheet, schema) = session();
+        s.add_form(&sheet, &schema, "受付").unwrap();
+        let server = FormServer::start(Arc::new(Mutex::new(s)), 0, None, || {}).unwrap();
+        let port = server.port();
+        let token = server.status().urls[0]
+            .url
+            .rsplit('/')
+            .next()
+            .unwrap()
+            .to_string();
+        for i in 0..FAIL_LIMIT {
+            assert_eq!(http(port, "GET", &format!("/f/{i:032}/def"), None).0, 404);
+        }
+        // 正しい URL もしばらく開けない（429）。トップは影響しない
+        assert_eq!(http(port, "GET", &format!("/f/{token}"), None).0, 429);
+        assert_eq!(http(port, "GET", "/", None).0, 200);
+    }
+
+    #[test]
+    fn submissions_are_rate_limited_per_host() {
+        let (mut s, sheet, schema) = session();
+        s.add_form(&sheet, &schema, "受付").unwrap();
+        let shared = Arc::new(Mutex::new(s));
+        let server = FormServer::start(shared.clone(), 0, None, || {}).unwrap();
+        let port = server.port();
+        let token = server.status().urls[0]
+            .url
+            .rsplit('/')
+            .next()
+            .unwrap()
+            .to_string();
+        let submit = format!("/f/{token}/submit");
+        let body = r#"{"values":{"name":"山田","qty":"2"}}"#;
+        for _ in 0..SUBMIT_LIMIT {
+            assert_eq!(http(port, "POST", &submit, Some(body)).0, 200);
+        }
+        let (code, head, b) = http(port, "POST", &submit, Some(body));
+        assert_eq!(code, 429, "{b}");
+        assert!(head.to_lowercase().contains("retry-after"));
+        assert_eq!(rows(&shared.lock().unwrap(), &schema).len(), SUBMIT_LIMIT);
+        // 定義の取得は止めない（回答の制限だけ）
+        assert_eq!(http(port, "GET", &format!("/f/{token}/def"), None).0, 200);
     }
 }

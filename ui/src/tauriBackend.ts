@@ -71,7 +71,7 @@ export const tauriBackend: Backend = {
   addForm: (sheet, schema, name) => invoke("add_form", { sheet, schema, name }),
   updateForm: (id, name, sheet, schema, columns, description) => invoke("update_form", { id, name, sheet, schema, columns, description }),
   deleteForm: (id) => invoke("delete_form", { id }),
-  formsStart: (port) => invoke("forms_start", { port }),
+  formsStart: (port, accessCode) => invoke("forms_start", { port, accessCode: accessCode || null }),
   formsStop: () => invoke("forms_stop"),
   formsStatus: () => invoke("forms_status"),
   onFormsChanged: (handler) => listen("jxcel://changed", () => handler()),

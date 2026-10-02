@@ -90,3 +90,64 @@ async function runFormPage(p, offset) {
     setTimeout(() => srv.kill(), 1000).unref();
   }
 }
+
+// 合言葉つきの配信: 合言葉を入れるまでフォームの中身は出ず、間違いは数えられ、続くとロックされる
+test("フォーム配信: 合言葉が要る・間違いが続くとロックされる", async ({ page: p }) => {
+  test.skip(!existsSync(bin) && !process.env.CI, `${bin} がありません（cargo build -p jxcel-app --example serve_forms）`);
+  const srv = spawn(bin, ["0", "himitsu-1234"], { stdio: ["pipe", "pipe", "inherit"] });
+  let out = "";
+  srv.stdout.on("data", (d) => (out += d));
+  const waitFor = async (pred, what) => {
+    const t = Date.now();
+    while (!pred()) {
+      if (Date.now() - t > 10_000) throw new Error(`待ち時間切れ: ${what}\n${out}`);
+      await new Promise((r) => setTimeout(r, 50));
+    }
+  };
+  try {
+    await waitFor(() => out.includes("READY"), "サーバーの起動");
+    const url = out.match(/URL (\S+)/)[1];
+    const errs = [];
+    p.on("pageerror", (e) => errs.push(e.message));
+
+    await p.goto(url);
+    await expect(p.locator("h1")).toHaveText("合言葉が必要です");
+    expect(await p.content()).not.toContain("来客受付");
+    expect(await p.locator("form label").count()).toBe(1);
+
+    // 間違い → メッセージが出て、入力欄はそのまま
+    await p.getByLabel("合言葉").fill("wrong-code");
+    await p.getByRole("button", { name: "開く" }).click();
+    await expect(p.locator("#msg")).toContainText("合言葉が違います");
+    await expect(p.locator("h1")).toHaveText("合言葉が必要です");
+
+    // 正しい合言葉 → フォームが開く。回答できる
+    await p.getByLabel("合言葉").fill("himitsu-1234");
+    await p.getByRole("button", { name: "開く" }).click();
+    await expect(p.locator("h1")).toHaveText("来客受付");
+    await p.locator("label", { hasText: "氏名" }).locator("input").fill("鈴木");
+    await p.locator("label", { hasText: "人数" }).locator("input").fill("2");
+    await p.locator("label", { hasText: "区分" }).locator("select").selectOption("個人");
+    await p.locator("form button").click();
+    await expect(p.locator("#msg")).toContainText("送信しました");
+    await waitFor(() => out.includes("ROWS"), "回答の到着");
+
+    // 同じタブで開き直しても、合言葉を覚えている（sessionStorage）
+    await p.reload();
+    await expect(p.locator("h1")).toHaveText("来客受付");
+
+    // 合言葉なしの直接の問い合わせは 401（数えない）。画面での間違い 1 回と合わせて 8 回間違えるとロック（429）され、正しい合言葉でも通らない
+    const def = url + "/def";
+    expect((await p.request.get(def)).status()).toBe(401);
+    for (let i = 0; i < 7; i++) {
+      expect((await p.request.get(def, { headers: { "x-jxcel-code": "nope-" + i } })).status()).toBe(401);
+    }
+    const locked = await p.request.get(def, { headers: { "x-jxcel-code": "himitsu-1234" } });
+    expect(locked.status()).toBe(429);
+    expect(Number(locked.headers()["retry-after"])).toBeGreaterThan(0);
+    expect(errs).toEqual([]);
+  } finally {
+    srv.stdin.write("\n");
+    setTimeout(() => srv.kill(), 1000).unref();
+  }
+});

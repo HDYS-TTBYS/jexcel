@@ -228,11 +228,12 @@ fn forms_start(
     app: App,
     forms: Forms,
     port: u16,
+    access_code: Option<String>,
 ) -> Reply<FormsStatus> {
     let mut server = forms_lock(&forms)?;
     if server.is_none() {
         let session = Arc::clone(&app);
-        let started = FormServer::start(session, port, move || {
+        let started = FormServer::start(session, port, access_code, move || {
             let _ = window.emit("jxcel://changed", ());
         })
         .map_err(|e| e.to_string())?;

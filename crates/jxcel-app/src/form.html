@@ -113,7 +113,7 @@ function collect() {
   return values;
 }
 
-$("form").addEventListener("submit", async (e) => {
+async function onSubmit(e) {
   e.preventDefault();
   const btn = $("form").querySelector("button");
   let values;
@@ -121,8 +121,9 @@ $("form").addEventListener("submit", async (e) => {
   btn.disabled = true;
   msg("送信中…");
   try {
-    const res = await fetch(base + "/submit", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ values }) });
+    const res = await fetch(base + "/submit", { method: "POST", headers: headers({ "content-type": "application/json" }), body: JSON.stringify({ values }) });
     const body = await res.json().catch(() => ({}));
+    if (res.status === 401 && body.needCode) { code = ""; return askCode("合言葉が変わりました。もう一度入力してください"); }
     if (!res.ok) throw new Error(body.error || "送信に失敗しました（" + res.status + "）");
     msg("送信しました。ありがとうございました。", "ok");
     $("form").reset();
@@ -131,13 +132,52 @@ $("form").addEventListener("submit", async (e) => {
   } finally {
     btn.disabled = false;
   }
-});
+}
 
-fetch(base + "/def").then(async (res) => {
-  const body = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(body.error || "フォームを読み込めません（" + res.status + "）");
-  build(body);
-}).catch((err) => { $("title").textContent = "フォームを開けません"; msg(err.message, "err"); });
+// 合言葉。ヘッダで送る（URL に載せない）。このタブを閉じるまで覚える
+let code = "";
+try { code = sessionStorage.getItem("jxcel-code:" + base) || ""; } catch (_) {}
+const headers = (extra) => Object.assign({}, extra, code ? { "x-jxcel-code": code } : {});
+
+function askCode(message) {
+  $("title").textContent = "合言葉が必要です";
+  $("desc").hidden = true;
+  const form = $("form");
+  form.textContent = "";
+  fields = [];
+  const label = document.createElement("label");
+  label.append("合言葉");
+  const input = document.createElement("input");
+  input.type = "password";
+  input.autocomplete = "off";
+  input.setAttribute("aria-label", "合言葉");
+  label.append(input);
+  const btn = document.createElement("button");
+  btn.type = "submit";
+  btn.textContent = "開く";
+  form.append(label, btn);
+  form.onsubmit = (e) => {
+    e.preventDefault();
+    code = input.value.trim();
+    try { sessionStorage.setItem("jxcel-code:" + base, code); } catch (_) {}
+    msg("");
+    load();
+  };
+  msg(message || "", message ? "err" : "");
+  input.focus();
+}
+
+async function load() {
+  try {
+    const res = await fetch(base + "/def", { headers: headers() });
+    const body = await res.json().catch(() => ({}));
+    if (res.status === 401 && body.needCode) { code = ""; return askCode(body.error === "合言葉が違います" ? body.error : ""); }
+    if (!res.ok) throw new Error(body.error || "フォームを読み込めません（" + res.status + "）");
+    $("form").onsubmit = onSubmit;
+    build(body);
+  } catch (err) { $("title").textContent = "フォームを開けません"; msg(err.message, "err"); }
+}
+load();
 </script>
 </body>
 </html>

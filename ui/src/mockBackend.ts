@@ -248,10 +248,12 @@ export function createMockBackend(): Backend {
   // フォーム配信（模擬）: 起動中のポートと、回答が届いたときに UI へ知らせるハンドラ
   let formsPort: number | null = null;
   let formsChanged: (() => void) | null = null;
+  let formsProtected = false;
   const submitted = new Map<string, number>();
   const formsStatus = (): FormsStatus => ({
     running: formsPort !== null,
     port: formsPort,
+    protected: formsPort !== null && formsProtected,
     urls:
       formsPort === null
         ? []
@@ -596,7 +598,10 @@ export function createMockBackend(): Backend {
         f.forms = f.forms.filter((x) => x.id !== id);
       }),
     // ブラウザ単体では本物の配信はできない。URL の表示と、回答が届いたときの再描画だけを再現する。
-    formsStart: async (port) => {
+    formsStart: async (port, accessCode) => {
+      // Rust 側（FormServer::start）と同じ規則
+      if (accessCode && !/^[\x21-\x7e]{4,64}$/.test(accessCode)) throw "合言葉は半角の英数字と記号（空白なし）の 4〜64 文字にしてください";
+      formsProtected = !!accessCode;
       formsPort = port;
       return formsStatus();
     },

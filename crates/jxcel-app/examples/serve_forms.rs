@@ -44,7 +44,9 @@ fn main() {
         .nth(1)
         .and_then(|p| p.parse().ok())
         .unwrap_or(0);
-    let server = FormServer::start(shared, port, move || {
+    // 2 番目の引数が合言葉（省略すると合言葉なし）
+    let code = std::env::args().nth(2);
+    let server = FormServer::start(shared, port, code, move || {
         let snap = for_print.lock().unwrap().current().unwrap();
         let rows: Vec<_> = snap.file.sheets[0]
             .schemas

@@ -41,8 +41,9 @@ export default function FormsPanel({ backend, file, onSnapshot, onError, onConfi
   const changed = JSON.stringify(draft) !== JSON.stringify(applied);
 
   // 配信の状態
-  const [status, setStatus] = useState<FormsStatus>({ running: false, port: null, urls: [] });
+  const [status, setStatus] = useState<FormsStatus>({ running: false, port: null, protected: false, urls: [] });
   const [port, setPort] = useState(String(DEFAULT_PORT));
+  const [code, setCode] = useState("");
   const refreshStatus = useCallback(() => backend.formsStatus().then(setStatus, (e) => onError(String(e))), [backend, onError]);
   // フォームの増減・回答の到着で、URL 一覧と回答数を読み直す
   const formsKey = JSON.stringify(forms.map((f) => f.id));
@@ -93,7 +94,7 @@ export default function FormsPanel({ backend, file, onSnapshot, onError, onConfi
     const n = Number(port);
     if (!Number.isInteger(n) || n < 1 || n > 65535) return onError("ポートは 1〜65535 の整数にしてください");
     try {
-      setStatus(await backend.formsStart(n));
+      setStatus(await backend.formsStart(n, code.trim() || undefined));
     } catch (e) {
       onError(String(e));
     }
@@ -137,6 +138,10 @@ export default function FormsPanel({ backend, file, onSnapshot, onError, onConfi
             ポート
             <input aria-label="ポート" className="port" value={port} disabled={status.running} onChange={(e) => setPort(e.target.value)} />
           </label>
+          <label className="inline">
+            合言葉（任意）
+            <input aria-label="合言葉" className="code" value={code} disabled={status.running} placeholder="なし" onChange={(e) => setCode(e.target.value)} />
+          </label>
           {status.running ? (
             <button onClick={stop}>配信を停止</button>
           ) : (
@@ -145,11 +150,12 @@ export default function FormsPanel({ backend, file, onSnapshot, onError, onConfi
             </button>
           )}
           <span className="muted" role="status">
-            {status.running ? `配信中（ポート ${status.port}）` : "停止中"}
+            {status.running ? `配信中（ポート ${status.port}${status.protected ? "・合言葉あり" : ""}）` : "停止中"}
           </span>
         </div>
         <p className="muted warn">
-          同じネットワークで URL を知っている人は誰でも、回答を行として追加できます。回答は開いているファイルに追加され、保存するまで確定しません。
+          同じネットワークで URL を知っている人は誰でも（合言葉を決めたときは、合言葉も知っている人が）、回答を行として追加できます。
+          合言葉は半角の英数字と記号（4〜64 文字）で、ファイルには保存しません。間違いや存在しない URL が続いた端末は数分間ロックされ、1 台からの回答は 1 分に 30 件までです。回答は開いているファイルに追加され、保存するまで確定しません。
           配信中はこのウィンドウ（アプリ）を開いたままにしてください。URL は配信を始めるたびに変わります。
         </p>
         {status.running && (

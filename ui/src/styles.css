@@ -94,6 +94,7 @@ input, select { font: inherit; padding: 4px 6px; border: 1px solid var(--bd); bo
 .forms h4:first-child { margin-top: 4px; }
 .serve-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .serve-row .port { width: 72px; }
+.serve-row .code { width: 150px; }
 .serve-row button { white-space: nowrap; flex: none; }
 .forms label.inline { flex-direction: row; align-items: center; gap: 6px; font-weight: 600; }
 .forms .warn { font-size: 12px; margin: 8px 0; }
