@@ -12,14 +12,16 @@ interface Props {
   onUpdate: (c: Column) => void;
   onAdd: (c: Column) => void;
   onDelete: (columnId: string) => void;
+  /** 日時列の値を別のオフセットに一括変換する（ダイアログは呼び出し側が出す） */
+  onConvert: (c: Column) => void;
 }
 
-export function SchemaEditor({ schema, onClose, onUpdate, onAdd, onDelete }: Props) {
+export function SchemaEditor({ schema, onClose, onUpdate, onAdd, onDelete, onConvert }: Props) {
   return (
     <Modal title={`スキーマ「${schema.name}」の列`} onClose={onClose} wide>
       <div className="column-list">
         {schema.columns.map((c) => (
-          <ColumnRow key={c.id} schemaId={schema.id} column={c} onUpdate={onUpdate} onDelete={onDelete} />
+          <ColumnRow key={c.id} schemaId={schema.id} column={c} onUpdate={onUpdate} onDelete={onDelete} onConvert={onConvert} />
         ))}
       </div>
       <div className="actions">
@@ -37,11 +39,13 @@ function ColumnRow({
   column,
   onUpdate,
   onDelete,
+  onConvert,
 }: {
   schemaId: string;
   column: Column;
   onUpdate: (c: Column) => void;
   onDelete: (id: string) => void;
+  onConvert: (c: Column) => void;
 }) {
   const [draft, setDraft] = useState(column);
   const changed = JSON.stringify(draft) !== JSON.stringify(column);
@@ -74,6 +78,11 @@ function ColumnRow({
         <button className="primary" disabled={!changed} onClick={() => onUpdate(draft)}>
           適用
         </button>
+        {column.type.kind === "dateTime" && !column.computed && (
+          <button title="この列の日時を、同じ時刻のまま別のタイムゾーンのオフセットの表記に直します" onClick={() => onConvert(column)}>
+            タイムゾーンを変換…
+          </button>
+        )}
         <button title="列を削除" onClick={() => onDelete(column.id)}>
           削除
         </button>

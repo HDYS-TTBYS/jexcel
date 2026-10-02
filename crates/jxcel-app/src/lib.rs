@@ -7,7 +7,9 @@ pub mod forms;
 
 use jxcel_core::diff::Change;
 use jxcel_core::types::TypeRegistry;
-use jxcel_core::{new_id, Column, DataSchema, Export, JxcelFile, Macro, Row, Sheet, TemplateKind};
+use jxcel_core::{
+    new_id, Column, DataSchema, DataType, Export, JxcelFile, Macro, Row, Sheet, TemplateKind,
+};
 use jxcel_git::archive::Archive;
 use jxcel_git::CommitInfo;
 use jxcel_macro::ComputedValues;
@@ -92,6 +94,19 @@ pub struct WrittenFile {
 pub struct ExportRowError {
     pub row_no: usize,
     pub message: String,
+}
+
+/// 日時列のオフセット一括変換の結果。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConvertResult {
+    pub snapshot: Snapshot,
+    /// 値が変わったセルの数
+    pub converted: usize,
+    /// すでにそのオフセットで、変わらなかったセルの数
+    pub unchanged: usize,
+    /// 変換できず、そのままにしたセルの数（うるう秒・範囲外など。変換の対象になった値だけを数える）
+    pub skipped: usize,
 }
 
 /// 書き出しのプレビュー。
@@ -439,6 +454,65 @@ impl Session {
                 r.cells.insert(column, value);
             }
             Ok(())
+        })
+    }
+
+    /// 日時型の列の値を、同じ時刻のまま別のオフセット（`+09:00`・`Z` など）の表記に直す。
+    /// 値の入っているセルだけが対象で、変換できない値はそのまま残す。変更はまとめて 1 回の編集になる。
+    pub fn convert_datetime_offset(
+        &mut self,
+        sheet: &str,
+        schema: &str,
+        column: &str,
+        offset: &str,
+    ) -> Result<ConvertResult> {
+        let minutes = jxcel_core::types::parse_offset(offset).ok_or_else(|| {
+            Error::Invalid(format!(
+                "オフセットは「+09:00」「-05:30」「Z」の形で指定してください: {offset}"
+            ))
+        })?;
+        let zulu = offset.trim().eq_ignore_ascii_case("z");
+        let (sheet, schema, column) = (sheet.to_string(), schema.to_string(), column.to_string());
+        let (mut converted, mut unchanged, mut skipped) = (0, 0, 0);
+        let was_dirty = self.doc()?.dirty;
+        let mut snapshot = self.edit(|f, _| {
+            let s = find_schema(f, &sheet, &schema)?;
+            let col = s
+                .columns
+                .iter()
+                .find(|c| c.id == column)
+                .ok_or(Error::NotFound("列"))?;
+            if !matches!(col.ty, DataType::DateTime) || col.computed.is_some() {
+                return Err(Error::Invalid(format!(
+                    "「{}」は日時型の列ではありません（計算列は変換できません）",
+                    col.name
+                )));
+            }
+            for r in &mut s.rows {
+                let Some(Value::String(v)) = r.cells.get(&column) else {
+                    continue;
+                };
+                match jxcel_core::types::datetime_to_offset(v, minutes, zulu) {
+                    Some(n) if &n == v => unchanged += 1,
+                    Some(n) => {
+                        r.cells.insert(column.clone(), Value::String(n));
+                        converted += 1;
+                    }
+                    None => skipped += 1,
+                }
+            }
+            Ok(())
+        })?;
+        if converted == 0 {
+            // 何も変わらなかったときは、未保存の状態にしない
+            self.doc()?.dirty = was_dirty;
+            snapshot = self.snapshot()?;
+        }
+        Ok(ConvertResult {
+            snapshot,
+            converted,
+            unchanged,
+            skipped,
         })
     }
 
@@ -1296,6 +1370,92 @@ mod tests {
         let path = dir.join("loops.jxcel");
         std::fs::write(&path, file.to_zip().unwrap()).unwrap();
         path.to_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn convert_datetime_offsets_in_bulk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("conv.jxcel").to_str().unwrap().to_string();
+        let mut s = Session::new();
+        let snap = s.new_file("t").unwrap();
+        let sheet = snap.file.sheets[0].id.clone();
+        let snap = s
+            .add_schema(
+                &sheet,
+                "受付",
+                vec![
+                    Column::new("at", "日時", DataType::DateTime),
+                    Column::new("name", "名前", DataType::String),
+                    Column::new("calc", "計算", DataType::DateTime)
+                        .computed("export default () => null"),
+                ],
+            )
+            .unwrap();
+        let schema = snap.file.sheets[0].schemas.last().unwrap().id.clone();
+        for (i, v) in [
+            "2026-10-02T01:30:00Z",
+            "2026-10-02T10:30:00+09:00",
+            "2026-10-02T23:59:60Z",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let row = s.add_row(&sheet, &schema).unwrap().file.sheets[0]
+                .schemas
+                .last()
+                .unwrap()
+                .rows[i]
+                .id
+                .clone();
+            // うるう秒は検証を通るので入る
+            s.set_cell(&sheet, &schema, &row, "at", json!(v)).unwrap();
+        }
+        s.add_row(&sheet, &schema).unwrap(); // 値のない行は対象外
+        s.save(Some(path.as_str()), "元").unwrap();
+        assert!(!s.current().unwrap().dirty);
+
+        let r = s
+            .convert_datetime_offset(&sheet, &schema, "at", "+09:00")
+            .unwrap();
+        assert_eq!((r.converted, r.unchanged, r.skipped), (1, 1, 1));
+        let rows = &r.snapshot.file.sheets[0].schemas.last().unwrap().rows;
+        assert_eq!(rows[0].cells["at"], json!("2026-10-02T10:30:00+09:00"));
+        assert_eq!(rows[1].cells["at"], json!("2026-10-02T10:30:00+09:00"));
+        assert_eq!(rows[2].cells["at"], json!("2026-10-02T23:59:60Z")); // 変換できないものはそのまま
+        assert!(!rows[3].cells.contains_key("at"));
+        assert!(r.snapshot.dirty);
+
+        // もう一度やっても変わらず、未保存にもならない
+        s.save(Some(path.as_str()), "変換後").unwrap();
+        let again = s
+            .convert_datetime_offset(&sheet, &schema, "at", "+09:00")
+            .unwrap();
+        assert_eq!((again.converted, again.unchanged, again.skipped), (0, 2, 1));
+        assert!(!again.snapshot.dirty);
+
+        // Z に戻せる（履歴にも残る）
+        let back = s
+            .convert_datetime_offset(&sheet, &schema, "at", "z")
+            .unwrap();
+        assert_eq!(
+            back.snapshot.file.sheets[0].schemas.last().unwrap().rows[0].cells["at"],
+            json!("2026-10-02T01:30:00Z")
+        );
+
+        // 誤りは拒否し、何も変えない
+        for (col, off) in [
+            ("at", "JST"),
+            ("at", "+9:00"),
+            ("name", "+09:00"),
+            ("calc", "+09:00"),
+            ("nope", "+09:00"),
+        ] {
+            assert!(
+                s.convert_datetime_offset(&sheet, &schema, col, off)
+                    .is_err(),
+                "{col} {off}"
+            );
+        }
     }
 
     #[test]

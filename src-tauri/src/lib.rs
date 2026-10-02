@@ -1,7 +1,7 @@
 //! Tauri のコマンド層。ロジックはすべて `jxcel-app` の `Session` にあり、ここは薄い橋渡しだけ。
 
 use jxcel_app::forms::{FormServer, FormsStatus};
-use jxcel_app::{ExportPreview, ExportResult, RunOutput, Session, Snapshot};
+use jxcel_app::{ConvertResult, ExportPreview, ExportResult, RunOutput, Session, Snapshot};
 use jxcel_core::diff::Change;
 use jxcel_core::Column;
 use jxcel_git::CommitInfo;
@@ -79,6 +79,19 @@ fn update_column(app: App, sheet: String, schema: String, column: Column) -> Rep
 #[tauri::command(async)]
 fn delete_column(app: App, sheet: String, schema: String, column: String) -> Reply<Snapshot> {
     with(&app, |s| s.delete_column(&sheet, &schema, &column))
+}
+
+#[tauri::command(async)]
+fn convert_datetime_offset(
+    app: App,
+    sheet: String,
+    schema: String,
+    column: String,
+    offset: String,
+) -> Reply<ConvertResult> {
+    with(&app, |s| {
+        s.convert_datetime_offset(&sheet, &schema, &column, &offset)
+    })
 }
 
 #[tauri::command(async)]
@@ -273,6 +286,7 @@ pub fn run() {
             add_column,
             update_column,
             delete_column,
+            convert_datetime_offset,
             add_row,
             delete_row,
             set_cell,

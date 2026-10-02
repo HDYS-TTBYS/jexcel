@@ -3,6 +3,7 @@
 
 import type { Backend } from "./backend";
 import { canBeField } from "./forms";
+import { datetimeToOffset, parseOffset } from "./datetime";
 // Rust 側（crates/jxcel-macro）と同じ実行ライブラリを再利用する。
 import prelude from "../../crates/jxcel-macro/src/prelude.js?raw";
 import stdLib from "../../crates/jxcel-macro/src/std.js?raw";
@@ -394,6 +395,40 @@ export function createMockBackend(): Backend {
         for (const r of s.rows) delete r.cells[column];
         for (const x of f.forms) if (x.sheet === sheet && x.schema === schema) x.columns = x.columns.filter((c) => c !== column);
       }),
+    convertDatetimeOffset: async (sheet, schema, column, offset) => {
+      const minutes = parseOffset(offset);
+      if (minutes === null) throw `オフセットは「+09:00」「-05:30」「Z」の形で指定してください: ${offset}`;
+      const zulu = /^z$/i.test(offset.trim());
+      let converted = 0;
+      let unchanged = 0;
+      let skipped = 0;
+      const wasDirty = dirty;
+      const prev = file;
+      const snapshot = edit((f) => {
+        const s = schemaOf(f, sheet, schema);
+        const col = s.columns.find((c) => c.id === column);
+        if (!col) throw "列 が見つかりません";
+        if (col.type.kind !== "dateTime" || col.computed) throw `「${col.name}」は日時型の列ではありません（計算列は変換できません）`;
+        for (const r of s.rows) {
+          const v = r.cells[column];
+          if (typeof v !== "string") continue;
+          const n = datetimeToOffset(v, minutes, zulu);
+          if (n === null) skipped++;
+          else if (n === v) unchanged++;
+          else {
+            r.cells[column] = n;
+            converted++;
+          }
+        }
+      });
+      if (converted === 0) {
+        // 何も変わらなかったときは、未保存の状態にしない
+        file = prev;
+        dirty = wasDirty;
+        return { snapshot: snap(), converted, unchanged, skipped };
+      }
+      return { snapshot, converted, unchanged, skipped };
+    },
     addRow: async (sheet, schema) => edit((f) => void schemaOf(f, sheet, schema).rows.push({ id: newId(), cells: {} })),
     deleteRow: async (sheet, schema, row) =>
       edit((f) => {

@@ -32,6 +32,7 @@ export const tauriBackend: Backend = {
   addColumn: (sheet, schema, column) => invoke("add_column", { sheet, schema, column }),
   updateColumn: (sheet, schema, column) => invoke("update_column", { sheet, schema, column }),
   deleteColumn: (sheet, schema, column) => invoke("delete_column", { sheet, schema, column }),
+  convertDatetimeOffset: (sheet, schema, column, offset) => invoke("convert_datetime_offset", { sheet, schema, column, offset }),
   addRow: (sheet, schema) => invoke("add_row", { sheet, schema }),
   deleteRow: (sheet, schema, row) => invoke("delete_row", { sheet, schema, row }),
   setCell: (sheet, schema, row, column, value) => invoke("set_cell", { sheet, schema, row, column, value }),

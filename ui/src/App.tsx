@@ -347,6 +347,26 @@ export function App({ backend }: { backend: Backend }) {
           onAdd={(c) => void run(backend.addColumn(sheet.id, schema.id, c))}
           onUpdate={(c) => void run(backend.updateColumn(sheet.id, schema.id, c))}
           onDelete={(id) => void run(backend.deleteColumn(sheet.id, schema.id, id))}
+          onConvert={(c) =>
+            setDialog({
+              kind: "prompt",
+              title: `「${c.name}」のタイムゾーンを変換`,
+              message:
+                "同じ時刻のまま、別のオフセットの表記に直します（例: +09:00、-05:30、Z）。UTC（Z）で保存された日時を日本時間にするときは +09:00。値の入っているセルすべてが対象で、元に戻すには逆の変換をします。",
+              initial: "+09:00",
+              onOk: (offset) =>
+                void backend
+                  .convertDatetimeOffset(sheet.id, schema.id, c.id, offset)
+                  .then((r) => {
+                    setSnap(r.snapshot);
+                    const lines = [`${r.converted} 件を変換しました。`];
+                    if (r.unchanged > 0) lines.push(`${r.unchanged} 件はすでにそのオフセットでした。`);
+                    if (r.skipped > 0) lines.push(`${r.skipped} 件は変換できず、そのままにしました（うるう秒など）。`);
+                    setDialog({ kind: "notice", title: "タイムゾーンの変換", message: lines.join("\n") });
+                  })
+                  .catch(onError),
+            })
+          }
         />
       )}
       {dialog && <Dialog key={`${dialog.kind}:${dialog.title}`} spec={dialog} onClose={() => setDialog(null)} />}

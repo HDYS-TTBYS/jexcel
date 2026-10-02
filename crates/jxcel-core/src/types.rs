@@ -191,6 +191,106 @@ fn is_datetime(s: &str) -> bool {
     }
 }
 
+/// 日時のオフセット指定（`Z`・`+09:00`・`-05:30`）を分にする。
+pub fn parse_offset(s: &str) -> Option<i32> {
+    let s = s.trim();
+    if s.eq_ignore_ascii_case("z") {
+        return Some(0);
+    }
+    let b = s.as_bytes();
+    if b.len() != 6 || !(b[0] == b'+' || b[0] == b'-') || b[3] != b':' {
+        return None;
+    }
+    if !b[1..3].iter().chain(&b[4..6]).all(u8::is_ascii_digit) {
+        return None;
+    }
+    let (h, m): (i32, i32) = (s[1..3].parse().ok()?, s[4..6].parse().ok()?);
+    if h > 23 || m > 59 {
+        return None;
+    }
+    Some(if b[0] == b'-' {
+        -(h * 60 + m)
+    } else {
+        h * 60 + m
+    })
+}
+
+/// 1970-01-01 からの日数（グレゴリオ暦）。
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (yoe + era * 400 + i64::from(m <= 2), m, d)
+}
+
+/// RFC 3339 の日時を、同じ時刻のまま別のオフセットの表記に直す。`zulu` なら 0 分を `Z` で書く。
+/// 小数秒はそのまま。うるう秒（60 秒）や、日時として不正な文字列は `None`。
+pub fn datetime_to_offset(s: &str, offset_min: i32, zulu: bool) -> Option<String> {
+    if !is_datetime(s) {
+        return None;
+    }
+    let (date, time) = s.split_once(['T', 't'])?;
+    let (hh, mi, ss): (i64, i64, i64) = (
+        time[0..2].parse().ok()?,
+        time[3..5].parse().ok()?,
+        time[6..8].parse().ok()?,
+    );
+    if ss > 59 {
+        return None;
+    }
+    let mut rest = &time[8..];
+    let mut frac = "";
+    if rest.starts_with('.') {
+        let n = 1 + rest[1..].bytes().take_while(u8::is_ascii_digit).count();
+        frac = &rest[..n];
+        rest = &rest[n..];
+    }
+    let from = parse_offset(rest)?;
+    let (y, m, d): (i64, i64, i64) = (
+        date[0..4].parse().ok()?,
+        date[5..7].parse().ok()?,
+        date[8..10].parse().ok()?,
+    );
+    let secs = days_from_civil(y, m, d) * 86400 + hh * 3600 + mi * 60 + ss - i64::from(from) * 60
+        + i64::from(offset_min) * 60;
+    let (day, r) = (secs.div_euclid(86400), secs.rem_euclid(86400));
+    let (ny, nm, nd) = civil_from_days(day);
+    if !(0..=9999).contains(&ny) {
+        return None;
+    }
+    let off = if offset_min == 0 && zulu {
+        "Z".to_string()
+    } else {
+        let a = offset_min.abs();
+        format!(
+            "{}{:02}:{:02}",
+            if offset_min < 0 { '-' } else { '+' },
+            a / 60,
+            a % 60
+        )
+    };
+    Some(format!(
+        "{ny:04}-{nm:02}-{nd:02}T{:02}:{:02}:{:02}{frac}{off}",
+        r / 3600,
+        r % 3600 / 60,
+        r % 60
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,5 +352,53 @@ mod tests {
         });
         assert!(c.validate(&json!(2), &reg).is_ok());
         assert!(c.validate(&json!(3), &reg).is_err());
+    }
+
+    #[test]
+    fn datetime_offsets_convert_the_same_instant() {
+        let c = |s: &str, off: &str| {
+            let z = off.eq_ignore_ascii_case("z");
+            datetime_to_offset(s, parse_offset(off).unwrap(), z)
+        };
+        assert_eq!(
+            c("2026-10-02T01:30:00Z", "+09:00").as_deref(),
+            Some("2026-10-02T10:30:00+09:00")
+        );
+        assert_eq!(
+            c("2026-10-02T20:00:00Z", "+09:00").as_deref(),
+            Some("2026-10-03T05:00:00+09:00")
+        );
+        assert_eq!(
+            c("2024-03-01T00:30:00+09:00", "Z").as_deref(),
+            Some("2024-02-29T15:30:00Z")
+        );
+        assert_eq!(
+            c("2024-03-01T00:30:00+09:00", "+00:00").as_deref(),
+            Some("2024-02-29T15:30:00+00:00")
+        );
+        assert_eq!(
+            c("2024-01-01T00:00:00.250+09:00", "-05:30").as_deref(),
+            Some("2023-12-31T09:30:00.250-05:30")
+        );
+        assert_eq!(
+            c("2026-10-02t01:30:00z", "+09:00").as_deref(),
+            Some("2026-10-02T10:30:00+09:00")
+        );
+        // すでに同じオフセットなら変わらない
+        assert_eq!(
+            c("2026-10-02T10:30:00+09:00", "+09:00").as_deref(),
+            Some("2026-10-02T10:30:00+09:00")
+        );
+        // 不正・うるう秒・範囲外
+        assert_eq!(c("2026-10-02", "+09:00"), None);
+        assert_eq!(c("2026-10-02T23:59:60Z", "+09:00"), None);
+        assert_eq!(c("0000-01-01T00:00:00+09:00", "Z"), None);
+        for bad in ["", "9", "+9:00", "+24:00", "+09:60", "JST", "+0900"] {
+            assert_eq!(parse_offset(bad), None, "{bad}");
+        }
+        assert_eq!(
+            (parse_offset("Z"), parse_offset(" -03:30 ")),
+            (Some(0), Some(-210))
+        );
     }
 }

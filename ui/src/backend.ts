@@ -1,4 +1,4 @@
-import type { Change, Column, CommitInfo, ExportPreview, ExportResult, FormsStatus, MacroSample, RunOutput, Snapshot } from "./types";
+import type { Change, Column, CommitInfo, ConvertResult, ExportPreview, ExportResult, FormsStatus, MacroSample, RunOutput, Snapshot } from "./types";
 
 /** UI が必要とする操作。Tauri 実装とブラウザ単体用のモック実装がある。 */
 export interface Backend {
@@ -22,6 +22,8 @@ export interface Backend {
   addColumn(sheet: string, schema: string, column: Column): Promise<Snapshot>;
   updateColumn(sheet: string, schema: string, column: Column): Promise<Snapshot>;
   deleteColumn(sheet: string, schema: string, column: string): Promise<Snapshot>;
+  /** 日時型の列の値を、同じ時刻のまま別のオフセット（+09:00 など）の表記に直す。 */
+  convertDatetimeOffset(sheet: string, schema: string, column: string, offset: string): Promise<ConvertResult>;
   addRow(sheet: string, schema: string): Promise<Snapshot>;
   deleteRow(sheet: string, schema: string, row: string): Promise<Snapshot>;
   setCell(sheet: string, schema: string, row: string, column: string, value: unknown): Promise<Snapshot>;

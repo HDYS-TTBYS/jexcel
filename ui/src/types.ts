@@ -140,6 +140,17 @@ export interface ExportResult {
   errors: { rowNo: number; message: string }[];
 }
 
+/** 日時列のオフセット一括変換の結果 */
+export interface ConvertResult {
+  snapshot: Snapshot;
+  /** 値が変わったセルの数 */
+  converted: number;
+  /** すでにそのオフセットで、変わらなかったセルの数 */
+  unchanged: number;
+  /** 変換できず、そのままにしたセルの数 */
+  skipped: number;
+}
+
 /** 同梱のサンプルマクロ（実体は crates/jxcel-macro/samples/*.ts） */
 export interface MacroSample {
   id: string;

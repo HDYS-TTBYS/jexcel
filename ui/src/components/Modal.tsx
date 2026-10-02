@@ -18,7 +18,9 @@ export function Modal({ title, onClose, children, wide }: { title: string; onClo
 
 // WebView によっては window.prompt / confirm が使えないため、自前のダイアログを使う。
 export type DialogSpec =
-  | { kind: "prompt"; title: string; initial: string; onOk: (value: string) => void }
+  | { kind: "prompt"; title: string; initial: string; message?: string; onOk: (value: string) => void }
+  // 結果の通知。OK だけ。
+  | { kind: "notice"; title: string; message: string }
   | { kind: "confirm"; title: string; message: string; onOk: () => void }
   // 未保存の変更がある状態で先へ進むときの 3 択。閉じる/Esc はキャンセル扱い。
   | { kind: "unsaved"; title: string; message: string; onSave: () => void; onDiscard: () => void };
@@ -55,6 +57,18 @@ export function Dialog({ spec, onClose }: { spec: DialogSpec; onClose: () => voi
       </Modal>
     );
   }
+  if (spec.kind === "notice") {
+    return (
+      <Modal title={spec.title} onClose={onClose}>
+        <p style={{ whiteSpace: "pre-line" }}>{spec.message}</p>
+        <div className="actions">
+          <button className="primary" autoFocus onClick={onClose}>
+            OK
+          </button>
+        </div>
+      </Modal>
+    );
+  }
   const ok = () => {
     if (spec.kind === "prompt") {
       if (!value.trim()) return;
@@ -64,6 +78,7 @@ export function Dialog({ spec, onClose }: { spec: DialogSpec; onClose: () => voi
   };
   return (
     <Modal title={spec.title} onClose={onClose}>
+      {spec.kind === "prompt" && spec.message && <p className="muted">{spec.message}</p>}
       {spec.kind === "prompt" ? (
         <input ref={ref} value={value} autoFocus onChange={(e) => setValue(e.target.value)} onKeyDown={(e) => e.key === "Enter" && ok()} />
       ) : (
