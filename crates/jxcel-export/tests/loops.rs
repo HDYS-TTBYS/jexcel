@@ -1183,3 +1183,51 @@ fn xlsx_extension_formulas_and_ranges_follow_the_shifted_rows() {
     );
     assert_eq!(get("xl/worksheets/sheet2.xml", "sqref"), ["A1", "A6"]);
 }
+
+#[test]
+fn xlsx_pivot_tables_follow_the_shifted_rows_and_refresh_on_load() {
+    let mut pkg = Package::read(&nested_xlsx_with_other_references()).unwrap();
+    // 明細シートに置かれたピボットテーブル（総合計の行 6 の下 = 7 行目から）。元データはループを含む範囲
+    pkg.set(
+        "xl/worksheets/_rels/sheet1.xml.rels",
+        concat!(
+            "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">",
+            "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotTable\" Target=\"../pivotTables/pivotTable1.xml\"/>",
+            "</Relationships>"
+        )
+        .as_bytes()
+        .to_vec(),
+    );
+    pkg.set(
+        "xl/pivotTables/pivotTable1.xml",
+        br#"<pivotTableDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" name="P" cacheId="1"><location ref="F7:H9" firstHeaderRow="1" firstDataRow="1" firstDataCol="1"/></pivotTableDefinition>"#.to_vec(),
+    );
+    let cache = |sheet: &str| {
+        format!(
+            r#"<pivotCacheDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><cacheSource type="worksheet"><worksheetSource ref="A2:C5" sheet="{sheet}"/></cacheSource></pivotCacheDefinition>"#
+        )
+        .into_bytes()
+    };
+    pkg.set("xl/pivotCache/pivotCacheDefinition1.xml", cache("明細"));
+    pkg.set("xl/pivotCache/pivotCacheDefinition2.xml", cache("Sheet2"));
+    let out = render_with(Kind::Xlsx, &pkg.write().unwrap(), &mut Nest::sample())
+        .unwrap_or_else(|e| panic!("{e}"));
+
+    // 置き場所は下へずれる（6 行目の総合計が 10 行目になるので、7〜9 行目は 11〜13 行目）
+    let loc = part(&out, "xl/pivotTables/pivotTable1.xml");
+    let mut l = vec![];
+    elements(&loc, "location", &mut l);
+    assert_eq!(l[0].attr("ref"), Some("F11:H13"));
+    // 元データの範囲はループを含むので最後のコピーまで広がり、開くときに更新させる
+    let c1 = part(&out, "xl/pivotCache/pivotCacheDefinition1.xml");
+    let mut w = vec![];
+    elements(&c1, "worksheetSource", &mut w);
+    assert_eq!(w[0].attr("ref"), Some("A2:C9"));
+    assert_eq!(c1.attr("refreshOnLoad"), Some("1"));
+    // 動いていないシートが元データのキャッシュは触らない
+    let c2 = part(&out, "xl/pivotCache/pivotCacheDefinition2.xml");
+    let mut w = vec![];
+    elements(&c2, "worksheetSource", &mut w);
+    assert_eq!(w[0].attr("ref"), Some("A2:C5"));
+    assert_eq!(c2.attr("refreshOnLoad"), None);
+}

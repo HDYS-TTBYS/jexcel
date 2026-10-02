@@ -126,7 +126,11 @@ pub fn process(pkg: &mut Package, src: &mut dyn Source) -> Result<()> {
     for (part, sheet_name) in &names {
         if let Some(m) = moved.get(sheet_name) {
             shift_drawing_anchors(pkg, part, m)?;
+            shift_pivot_locations(pkg, part, m)?;
         }
+    }
+    if !moved.is_empty() {
+        shift_pivot_sources(pkg, &moved)?;
     }
     // グラフの系列の参照（`<c:f>Sheet1!$B$2:$B$9</c:f>`）
     if !moved.is_empty() {
@@ -384,27 +388,89 @@ fn sheet(root: &mut Element, ctx: &mut Ctx, moved: &mut Option<Moves>) -> Result
 /// アンカーの行（0 から数える）を、行ループでずれたことに合わせて動かす。
 /// 始まりは最初のコピー、終わりは最後のコピーの位置にするので、ループを含む範囲に掛かる図は伸びる。
 fn shift_drawing_anchors(pkg: &mut Package, sheet_part: &str, moves: &Moves) -> Result<()> {
-    let (dir, file) = sheet_part.rsplit_once('/').unwrap_or(("", sheet_part));
-    let rels_name = format!("{dir}/_rels/{file}.rels");
-    let Some(bytes) = pkg.get(&rels_name) else {
-        return Ok(());
-    };
-    let rels = xml::parse(bytes)?;
-    let mut drawings = vec![];
-    for n in &rels.root.children {
-        let Node::Element(e) = n else { continue };
-        if e.attr("Type").is_some_and(|t| t.ends_with("/drawing")) {
-            if let Some(t) = e.attr("Target") {
-                drawings.push(resolve_part_path(dir, t));
-            }
-        }
-    }
-    for name in drawings {
+    for name in related_parts(pkg, sheet_part, "/drawing")? {
         let Some(bytes) = pkg.get(&name) else {
             continue;
         };
         let mut doc = xml::parse(bytes)?;
         if shift_anchor_rows(&mut doc.root, moves) {
+            pkg.set(&name, xml::write(&doc)?);
+        }
+    }
+    Ok(())
+}
+
+/// シートの関係の定義から、種類（`Type` の末尾。`/drawing`・`/pivotTable`）が合う部品の名前を集める。
+fn related_parts(pkg: &Package, sheet_part: &str, type_suffix: &str) -> Result<Vec<String>> {
+    let (dir, file) = sheet_part.rsplit_once('/').unwrap_or(("", sheet_part));
+    let rels_name = format!("{dir}/_rels/{file}.rels");
+    let Some(bytes) = pkg.get(&rels_name) else {
+        return Ok(vec![]);
+    };
+    let rels = xml::parse(bytes)?;
+    let mut out = vec![];
+    for n in &rels.root.children {
+        let Node::Element(e) = n else { continue };
+        if e.attr("Type").is_some_and(|t| t.ends_with(type_suffix)) {
+            if let Some(t) = e.attr("Target") {
+                out.push(resolve_part_path(dir, t));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// このシートに置かれたピボットテーブルの場所（`<location ref="…">`）を、行がずれたことに合わせて動かす。
+fn shift_pivot_locations(pkg: &mut Package, sheet_part: &str, moves: &Moves) -> Result<()> {
+    for name in related_parts(pkg, sheet_part, "/pivotTable")? {
+        let Some(bytes) = pkg.get(&name) else {
+            continue;
+        };
+        let mut doc = xml::parse(bytes)?;
+        let mut changed = false;
+        if let Some(loc) = child_mut(&mut doc.root, "location") {
+            let before = loc.attr("ref").map(String::from);
+            remap_attr(loc, "ref", moves);
+            changed = before.as_deref() != loc.attr("ref");
+        }
+        if changed {
+            pkg.set(&name, xml::write(&doc)?);
+        }
+    }
+    Ok(())
+}
+
+/// ピボットテーブルの元データ（`xl/pivotCache/pivotCacheDefinition*.xml` の `<worksheetSource sheet ref>`）が、
+/// 行がずれたシートの範囲なら、範囲をずらす（ループを含めば最後のコピーまで広がる）。
+/// 保存済みのキャッシュは差し込み前のデータなので、開くときに更新させる（`refreshOnLoad`）。
+fn shift_pivot_sources(pkg: &mut Package, moved: &Moved) -> Result<()> {
+    let caches: Vec<String> = pkg
+        .names()
+        .filter(|n| {
+            n.starts_with("xl/pivotCache/pivotCacheDefinition")
+                && n.ends_with(".xml")
+                && !n.contains("/_rels/")
+        })
+        .map(String::from)
+        .collect();
+    for name in caches {
+        let mut doc = xml::parse(pkg.get(&name).expect("listed"))?;
+        let mut hit = false;
+        if let Some(src) = child_mut(&mut doc.root, "cacheSource") {
+            for n in &mut src.children {
+                let Node::Element(w) = n else { continue };
+                if w.local() != "worksheetSource" {
+                    continue;
+                }
+                let Some(m) = w.attr("sheet").and_then(|sheet| moved.get(sheet)) else {
+                    continue;
+                };
+                remap_attr(w, "ref", m);
+                hit = true;
+            }
+        }
+        if hit {
+            doc.root.set_attr("refreshOnLoad", "1");
             pkg.set(&name, xml::write(&doc)?);
         }
     }
