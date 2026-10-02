@@ -4,6 +4,11 @@
 //! （`{{取引` と `先}}` が別のラン、など）。そのため、段落ごとにランのテキストをつなげてから欄を探し、
 //! 置換後の文字列は欄の最初のランに入れ（書式はそのランのものになる）、残りのランからは欄の部分を取り除く。
 //!
+//! 段落のループ: 表の外（本文・ヘッダー・フッター・脚注）の段落に `{{#each 式}}` と書くと、その段落が要素の数だけ
+//! 繰り返される。`{{/each}}` を別の段落に書くと、その間のブロック（段落・表）がひとまとめに繰り返される
+//! （`{{#each}}` だけの段落・`{{/each}}` だけの段落は出力しない）。入れ子にもでき、間に挟んだ表の行のループは
+//! 外側の要素の中で入れ子として展開される。表のセルの中の印は、その行のループの印。
+//!
 //! 行ループ: 表の行（`<w:tr>`）のどこかに `{{#each 式}}` と書くと、その行が式の配列の要素の数だけ繰り返される
 //! （印は取り除かれ、行の中の欄は要素ごとに差し込まれる。要素が 0 件ならその行は消える）。
 //! 別の行に `{{/each}}` と書くと、その間の行（印の行を含む）がひとまとめに繰り返される。
@@ -66,20 +71,165 @@ fn path_of(scope: &Scope) -> Vec<usize> {
     scope.iter().map(|f| f.1).collect()
 }
 
+/// 段落のループ（表の外の `{{#each}}`）を書ける、ブロックの並びを直接持つ要素。
+/// 表のセルは含めない（セルの中の印は、その行のループの印）。
+fn is_block_container(name: &str) -> bool {
+    matches!(
+        name,
+        "w:body" | "w:hdr" | "w:ftr" | "w:footnote" | "w:endnote"
+    )
+}
+
+/// 要素 `el`（段落か表）を処理する。表は行のループを展開する。
+fn visit(el: &mut Element, ctx: &mut Ctx, scope: &mut Scope) -> Result<bool> {
+    if el.name == "w:tbl" {
+        table(el, ctx, scope)
+    } else {
+        walk(el, ctx, scope)
+    }
+}
+
 fn walk(el: &mut Element, ctx: &mut Ctx, scope: &mut Scope) -> Result<bool> {
+    if is_block_container(&el.name) && direct_paragraph_markers(el).iter().any(|m| !m.is_empty()) {
+        return block_container(el, ctx, scope);
+    }
     let mut changed = false;
     if el.name == "w:p" {
         changed |= paragraph(el, &mut |expr| resolve(ctx, scope, expr))?;
     }
-    for child in &mut el.children {
+    // 行がすべて消えた表（Word は行のない表を開けない）
+    let mut emptied = vec![];
+    for (i, child) in el.children.iter_mut().enumerate() {
         let Node::Element(c) = child else { continue };
         if c.name == "w:tbl" {
-            changed |= table(c, ctx, scope)?;
+            let t = table(c, ctx, scope)?;
+            changed |= t;
+            if t && !has_rows(c) {
+                emptied.push(i);
+            }
         } else {
             changed |= walk(c, ctx, scope)?;
         }
     }
+    for i in emptied.into_iter().rev() {
+        if el.name == "w:tc" {
+            // セルは段落で終わらなければならないので、空の段落に置き換える
+            el.children[i] = Node::Element(Element::new("w:p"));
+        } else {
+            el.children.remove(i);
+        }
+    }
     Ok(changed)
+}
+
+fn has_rows(tbl: &Element) -> bool {
+    tbl.children
+        .iter()
+        .any(|n| matches!(n, Node::Element(e) if e.name == "w:tr"))
+}
+
+/// 直下の段落ごとの、ループの印（段落以外は空）。
+fn direct_paragraph_markers(el: &Element) -> Vec<Vec<Marker>> {
+    el.children
+        .iter()
+        .filter_map(|n| match n {
+            Node::Element(e) => Some(e),
+            _ => None,
+        })
+        .map(|e| {
+            let mut found = vec![];
+            if e.name == "w:p" {
+                collect_markers(e, &mut found);
+            }
+            found
+        })
+        .collect()
+}
+
+/// 本文などの、表の外の段落のループ。`{{#each 式}}` の段落から `{{/each}}` の段落まで（表などの
+/// 間のブロックを含む）が、要素の数だけ繰り返される。印だけの段落は出力しない。
+fn block_container(el: &mut Element, ctx: &mut Ctx, scope: &mut Scope) -> Result<bool> {
+    let children = std::mem::take(&mut el.children);
+    // 要素（段落・表・節の設定など）ごとに、直前の要素以降のテキストなどをひとまとめにして持つ
+    let mut items: Vec<TableRow> = vec![];
+    let mut pending: Vec<Node> = vec![];
+    for child in children {
+        match child {
+            Node::Element(e) => items.push(TableRow {
+                before: std::mem::take(&mut pending),
+                row: e,
+            }),
+            other => pending.push(other),
+        }
+    }
+    let trailing = pending;
+
+    let marks: Vec<Vec<Marker>> = items
+        .iter()
+        .map(|r| {
+            let mut found = vec![];
+            if r.row.name == "w:p" {
+                collect_markers(&r.row, &mut found);
+            }
+            found
+        })
+        .collect();
+    let mut blocks = parse_blocks(&marks)?;
+    number(&mut blocks, &mut ctx.next_loop);
+    // 中の表のループの番号は、ブロックを何回繰り返しても同じになるよう、要素ごとに先に確保する
+    let mut cursor = ctx.next_loop;
+    let mut base = Vec::with_capacity(items.len());
+    for r in &items {
+        base.push(cursor);
+        cursor += if r.row.name == "w:tbl" {
+            table_loops(&r.row)?
+        } else {
+            static_loops(&r.row)?
+        };
+    }
+    let mut out: Vec<Node> = vec![];
+    let mut changed = false;
+    if !items.is_empty() {
+        emit(
+            &Emit {
+                rows: &items,
+                row_base: &base,
+                drop_marker_paragraphs: true,
+            },
+            (0, items.len() - 1),
+            &blocks,
+            ctx,
+            scope,
+            &mut out,
+            &mut changed,
+        )?;
+    }
+    out.extend(trailing);
+    el.children = out;
+    ctx.next_loop = cursor;
+    Ok(changed)
+}
+
+/// 段落のテキストが、ループの印を除くと空か。
+fn is_marker_only(p: &Element) -> bool {
+    let mut paths = vec![];
+    collect_t(p, &mut vec![], &mut paths);
+    let text: String = paths.iter().map(|pa| element_ref(p, pa).text()).collect();
+    let found = find(&text);
+    if !found.iter().any(|m| marker(&m.expr).is_some()) {
+        return false;
+    }
+    let mut rest = String::new();
+    let mut at = 0;
+    for m in &found {
+        rest.push_str(&text[at..m.start]);
+        if marker(&m.expr).is_none() {
+            rest.push_str(&text[m.start..m.end]);
+        }
+        at = m.end;
+    }
+    rest.push_str(&text[at..]);
+    rest.trim().is_empty()
 }
 
 /// 表。行のループ（1 行ずつの `{{#each}}`、または `{{#each}}`〜`{{/each}}` で囲んだ複数の行）を展開する。
@@ -128,6 +278,7 @@ fn table(tbl: &mut Element, ctx: &mut Ctx, scope: &mut Scope) -> Result<bool> {
         &Emit {
             rows: &rows,
             row_base: &row_base,
+            drop_marker_paragraphs: false,
         },
         (0, rows.len() - 1),
         &blocks,
@@ -150,6 +301,8 @@ struct TableRow {
 struct Emit<'a> {
     rows: &'a [TableRow],
     row_base: &'a [usize],
+    /// 印だけの段落を出力しない（本文の段落のループ）
+    drop_marker_paragraphs: bool,
 }
 
 /// 行 `range`（両端を含む）を出力する。`blocks` の範囲は要素の数だけ繰り返し、それ以外の行はそのまま出す。
@@ -180,12 +333,21 @@ fn emit(
             i = b.last + 1;
         } else {
             let r = &e.rows[i];
+            if e.drop_marker_paragraphs && r.row.name == "w:p" && is_marker_only(&r.row) {
+                *changed = true;
+                i += 1;
+                continue;
+            }
             out.extend(r.before.iter().cloned());
             let mut row = r.row.clone();
             // 行の中の入れ子の表のループは、何回繰り返しても同じ番号から始める
             ctx.next_loop = e.row_base[i];
-            *changed |= walk(&mut row, ctx, scope)?;
-            out.push(Node::Element(row));
+            let t = visit(&mut row, ctx, scope)?;
+            *changed |= t;
+            // 行がすべて消えた表は出力しない
+            if !(t && row.name == "w:tbl" && !has_rows(&row)) {
+                out.push(Node::Element(row));
+            }
             i += 1;
         }
     }
@@ -234,7 +396,10 @@ fn table_loops(tbl: &Element) -> Result<usize> {
 fn resolve(ctx: &mut Ctx, scope: &Scope, expr: &str) -> std::result::Result<Value, String> {
     if marker(expr).is_some() {
         return if scope.is_empty() {
-            Err("{{#each}} と {{/each}} は、表の行の中に書いてください".into())
+            Err(
+                "{{#each}} と {{/each}} は、表の行の中か、本文の段落（表の外）に書いてください"
+                    .into(),
+            )
         } else {
             Ok(Value::String(String::new()))
         };

@@ -188,16 +188,16 @@ fn docx_loop_errors_are_reported() {
         "{e}"
     );
 
-    // 表の外に印を書いた
+    // 閉じる印だけがある（対応する {{#each}} がない）
     let mut doc = jxcel_export::package::Package::read(DOCX).unwrap();
     let xml_text = String::from_utf8(doc.get("word/document.xml").unwrap().to_vec()).unwrap();
     doc.set(
         "word/document.xml",
-        xml_text.replace("宛先: ", "宛先: {{#each x}}").into_bytes(),
+        xml_text.replace("宛先: ", "宛先: {{/each}}").into_bytes(),
     );
     let out = doc.write().unwrap();
     let e = render_with(Kind::Docx, &out, &mut Fake::new(items(1))).unwrap_err();
-    assert!(e.to_string().contains("表の行の中"), "{e}");
+    assert!(e.to_string().contains("each"), "{e}");
 }
 
 // ---------------------------------------------------------------- xlsx
@@ -797,4 +797,94 @@ fn xlsx_references_in_sheets_without_loops_are_left_alone() {
             .unwrap(),
         &before[..]
     );
+}
+
+// ---------------------------------------------------------------- 段落のループ
+
+const PARAGRAPHS_DOCX: &[u8] = include_bytes!("fixtures/paragraphs.docx");
+
+/// 本文の直下のブロックを、段落は文字列・表は `[行1|行2]` にして文書順に並べる。
+fn body_blocks(zip: &[u8]) -> Vec<String> {
+    let root = part(zip, "word/document.xml");
+    let mut bodies = vec![];
+    elements(&root, "body", &mut bodies);
+    let text_of = |e: &Element| {
+        let mut ts = vec![];
+        elements(e, "t", &mut ts);
+        ts.iter().map(|t| t.text()).collect::<String>()
+    };
+    bodies[0]
+        .children
+        .iter()
+        .filter_map(|n| match n {
+            Node::Element(e) if e.local() == "p" => Some(text_of(e)),
+            Node::Element(e) if e.local() == "tbl" => {
+                let mut rows = vec![];
+                elements(e, "tr", &mut rows);
+                Some(format!(
+                    "[{}]",
+                    rows.iter()
+                        .map(|r| text_of(r))
+                        .collect::<Vec<_>>()
+                        .join("|")
+                ))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn docx_paragraph_loops_repeat_blocks_between_the_markers() {
+    let out = render_with(Kind::Docx, PARAGRAPHS_DOCX, &mut Nest::sample())
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(
+        body_blocks(&out),
+        [
+            "請求書 INV-7",
+            // 印だけの段落は出力しない。1 つ目の明細: 段落・付属品の表（2 行）
+            "1. ねじ（3 個）",
+            "[- a|- b]",
+            // 2 つ目の明細: 付属品は 0 件なので表の行がすべて消え、表ごとなくなる
+            "2. 板（1 個）",
+            "以上 INV-7",
+        ]
+    );
+}
+
+#[test]
+fn docx_paragraph_loops_with_no_items_remove_the_block() {
+    struct Empty;
+    impl Source for Empty {
+        fn value(&mut self, e: &str) -> Result<Value, String> {
+            Ok(json!(e))
+        }
+        fn loop_len(
+            &mut self,
+            i: usize,
+            _: Option<usize>,
+            _: &[usize],
+            _: &str,
+        ) -> Result<usize, String> {
+            assert_eq!(i, 0, "外側が 0 件なら、内側のループは聞かれない");
+            Ok(0)
+        }
+        fn item_value(&mut self, _: usize, _: &[usize], _: &str) -> Result<Value, String> {
+            unreachable!()
+        }
+    }
+    let out = render_with(Kind::Docx, PARAGRAPHS_DOCX, &mut Empty).unwrap();
+    assert_eq!(body_blocks(&out), ["請求書 請求番号", "以上 請求番号"]);
+}
+
+#[test]
+fn docx_paragraph_loops_are_planned_with_their_numbers() {
+    let p = plan(Kind::Docx, PARAGRAPHS_DOCX).unwrap();
+    let sources: Vec<(&str, Option<usize>)> = p
+        .loops
+        .iter()
+        .map(|l| (l.source.as_str(), l.parent))
+        .collect();
+    assert_eq!(sources, [("明細", None), ("付属", Some(0))]);
+    assert!(p.loops[0].exprs.contains(&"品目".to_string()));
 }

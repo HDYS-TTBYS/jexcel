@@ -182,6 +182,20 @@ def make_nested_docx():
     d.save(OUT / "nested.docx")
 
 
+def make_paragraph_docx():
+    """表の外の段落のループ。{{#each}} だけの段落〜{{/each}} だけの段落の間に、段落と表（その行のループ）を挟む。"""
+    d = Document()
+    d.add_paragraph("請求書 {{請求番号}}")
+    d.add_paragraph("{{#each 明細}}")
+    d.add_paragraph("{{_n}}. {{品目}}（{{数}} 個）")
+    t = d.add_table(rows=1, cols=1)
+    t.style = "Table Grid"
+    t.cell(0, 0).text = "{{#each 付属}}- {{名}}"                # 外側の要素の中の、表の行のループ
+    d.add_paragraph("{{/each}}")
+    d.add_paragraph("以上 {{請求番号}}")
+    d.save(OUT / "paragraphs.docx")
+
+
 def make_nested_table_docx():
     """繰り返す行の中の表（入れ子の表）の中のループ。印は {{#each}} だけ（従来の 1 行ループ）。"""
     d = Document()
@@ -230,6 +244,7 @@ def make_nested_xlsx():
 make_docx()
 make_xlsx()
 make_nested_docx()
+make_paragraph_docx()
 make_nested_table_docx()
 make_nested_xlsx()
 make_loop_docx()
