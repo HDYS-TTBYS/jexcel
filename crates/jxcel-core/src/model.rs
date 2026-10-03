@@ -82,6 +82,58 @@ pub struct Form {
     /// 題名の下に出す説明（空なら出さない）
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub description: String,
+    /// 送信済みの回答を、回答者が後から直せるか（既定は「直せる・期限なし」。既定ならファイルに出さない）
+    #[serde(default, skip_serializing_if = "FormEdit::is_default")]
+    pub edit: FormEdit,
+}
+
+/// フォームの、送信済みの回答の修正の設定。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FormEdit {
+    /// 直せるか。`false` なら修正用トークンを渡さず、修正の要求も断る
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub allowed: bool,
+    /// 送信から何分まで直せるか（`None` なら期限なし。配信を止めるまで）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minutes: Option<u32>,
+}
+
+fn yes() -> bool {
+    true
+}
+
+fn is_true(b: &bool) -> bool {
+    *b
+}
+
+impl Default for FormEdit {
+    fn default() -> Self {
+        Self {
+            allowed: true,
+            minutes: None,
+        }
+    }
+}
+
+impl FormEdit {
+    /// 期限の上限（分）。30 日。
+    pub const MAX_MINUTES: u32 = 43_200;
+
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// 設定として正しいか（期限は 1 分以上、上限以下）。
+    pub fn validate(&self) -> Result<(), String> {
+        match self.minutes {
+            Some(m) if m == 0 || m > Self::MAX_MINUTES => Err(format!(
+                "修正できる期間は 1〜{} 分（30 日）で指定してください",
+                Self::MAX_MINUTES
+            )),
+            _ => Ok(()),
+        }
+    }
 }
 
 /// TypeScript で書いたマクロ。`source` はユーザーが書いたままの TS（実行時に JS へ変換する）。

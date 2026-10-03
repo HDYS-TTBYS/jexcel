@@ -70,6 +70,32 @@ test("フォーム配信のパネル", async ({ page: p }) => {
   await panel().getByRole("button", { name: "適用" }).click();
   await p.waitForFunction(() => document.querySelectorAll(".field-row input:checked").length === 2);
 
+  // 送信後の修正の設定（変えるとすぐ反映。下書きは捨てない）
+  const allowBox = panel().getByLabel("回答者が送信後に修正できる");
+  const minutesBox = panel().getByLabel("修正できる期間（分）");
+  check("修正は既定で許す・期限なし", (await allowBox.isChecked()) && (await minutesBox.inputValue()) === "");
+  await panel().getByLabel("説明").fill("書きかけの説明");
+  await minutesBox.fill("60");
+  await minutesBox.blur();
+  await p.waitForTimeout(150);
+  check("期間を入れても入力欄の下書きは消えない", (await panel().getByLabel("説明").inputValue()) === "書きかけの説明");
+  check("期間が反映される", (await minutesBox.inputValue()) === "60");
+  await minutesBox.fill("0");
+  await minutesBox.press("Enter");
+  await p.waitForFunction(() => document.body.innerText.includes("1〜43200 分"), null, { timeout: 3000 }).catch(() => {});
+  check("0 分は拒否され、元の値に戻る", (await p.locator("body").innerText()).includes("1〜43200 分") && (await minutesBox.inputValue()) === "60");
+  await allowBox.uncheck();
+  await p.waitForFunction(() => !document.querySelector('[aria-label="修正できる期間（分）"]'));
+  check("許さないと期間の欄は隠れる", (await minutesBox.count()) === 0);
+  check("設定を変えても下書きは消えない", (await panel().getByLabel("説明").inputValue()) === "書きかけの説明");
+  await allowBox.check();
+  check("許すに戻すと、前の期間が残っている", (await minutesBox.inputValue()) === "60");
+  await minutesBox.fill("");
+  await minutesBox.blur();
+  await p.waitForTimeout(150);
+  check("空にすると期限なし", (await minutesBox.inputValue()) === "");
+  await panel().getByLabel("説明").fill("お名前を入力してください");
+
   // 配信の開始
   check("必須の列を外す前は警告なし", true);
   await panel().getByRole("button", { name: "配信を開始" }).click();

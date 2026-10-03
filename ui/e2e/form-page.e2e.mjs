@@ -168,3 +168,56 @@ test("フォーム配信: 合言葉が要る・間違いが続くとロックさ
     setTimeout(() => srv.kill(), 1000).unref();
   }
 });
+
+// 修正の設定: 受け付けないフォームは修正の状態にならず、期限つきなら案内に期間が出る
+for (const [label, args, expectHint] of [
+  ["修正を受け付けない", ["0", "", "no-edit"], null],
+  ["期限つき（30 分）", ["0", "", "30"], "送信から 30 分以内"],
+  ["期限つき（2 時間）", ["0", "", "120"], "送信から 2 時間以内"],
+]) {
+  test(`フォーム配信: ${label}`, async ({ page: p }) => {
+    test.skip(!existsSync(bin) && !process.env.CI, `${bin} がありません（cargo build -p jxcel-app --example serve_forms）`);
+    const srv = spawn(bin, args, { stdio: ["pipe", "pipe", "inherit"] });
+    let out = "";
+    srv.stdout.on("data", (d) => (out += d));
+    const waitFor = async (pred, what) => {
+      const t = Date.now();
+      while (!pred()) {
+        if (Date.now() - t > 10_000) throw new Error(`待ち時間切れ: ${what}\n${out}`);
+        await new Promise((r) => setTimeout(r, 50));
+      }
+    };
+    try {
+      await waitFor(() => out.includes("READY"), "サーバーの起動");
+      const url = out.match(/URL (\S+)/)[1];
+      const errs = [];
+      p.on("pageerror", (e) => errs.push(e.message));
+      await p.goto(url);
+      await p.waitForSelector("form button");
+      await p.locator("label", { hasText: "氏名" }).locator("input").fill("山田");
+      await p.locator("label", { hasText: "人数" }).locator("input").fill("2");
+      await p.locator("label", { hasText: "区分" }).locator("select").selectOption("個人");
+      await p.locator("form button[type=submit]").click();
+      await expect(p.locator("#msg")).toContainText("送信しました");
+      await waitFor(() => out.includes("ROWS"), "回答の到着");
+      const msg = await p.locator("#msg").innerText();
+      if (expectHint) {
+        expect(msg).toContain(expectHint);
+        expect(await p.locator("form button[type=submit]").innerText()).toBe("修正を送信");
+      } else {
+        // 修正用の鍵が渡らないので、修正の状態にならず、内容は空に戻る。直すための案内も出ない
+        expect(msg).not.toContain("修正");
+        expect(await p.locator("form button[type=submit]").innerText()).toBe("送信");
+        expect(await p.getByRole("button", { name: "新しい回答として送る" }).isVisible()).toBe(false);
+        expect(await p.locator("label", { hasText: "氏名" }).locator("input").inputValue()).toBe("");
+        await p.reload();
+        await p.waitForSelector("form button");
+        expect(await p.locator("label", { hasText: "氏名" }).locator("input").inputValue()).toBe("");
+      }
+      expect(errs).toEqual([]);
+    } finally {
+      srv.stdin.write("\n");
+      setTimeout(() => srv.kill(), 1000).unref();
+    }
+  });
+}

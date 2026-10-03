@@ -315,6 +315,7 @@ pub fn read_zip_tree(bytes: &[u8]) -> Result<FileTree> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::model::FormEdit;
     use crate::types::DataType;
     use serde_json::json;
 
@@ -580,11 +581,49 @@ pub(crate) mod tests {
             schema: f.sheets[0].schemas[0].id.clone(),
             columns: vec!["a".into()],
             description: String::new(),
+            edit: Default::default(),
         });
         let tree = f.to_tree().unwrap();
         let manifest = String::from_utf8_lossy(&tree[MANIFEST]).to_string();
         assert!(manifest.contains("\"forms\""));
         assert!(!manifest.contains("description")); // 空の説明は出さない
+        assert!(!manifest.contains("edit")); // 既定の修正の設定も出さない
         assert_eq!(JxcelFile::from_tree(&tree).unwrap().forms, f.forms);
+
+        // 修正の設定は、既定と違うときだけ出る。往復して同じになる
+        f.forms[0].edit = FormEdit {
+            allowed: true,
+            minutes: Some(60),
+        };
+        let manifest = String::from_utf8_lossy(&f.to_tree().unwrap()[MANIFEST]).to_string();
+        assert!(manifest.contains("\"minutes\": 60") && !manifest.contains("allowed"));
+        f.forms[0].edit = FormEdit {
+            allowed: false,
+            minutes: None,
+        };
+        let tree = f.to_tree().unwrap();
+        let manifest = String::from_utf8_lossy(&tree[MANIFEST]).to_string();
+        assert!(manifest.contains("\"allowed\": false") && !manifest.contains("minutes"));
+        assert_eq!(JxcelFile::from_tree(&tree).unwrap().forms, f.forms);
+        // 期限は 1 分以上、30 日以下
+        assert!(FormEdit::default().validate().is_ok());
+        assert!(FormEdit {
+            allowed: true,
+            minutes: Some(0)
+        }
+        .validate()
+        .is_err());
+        assert!(FormEdit {
+            allowed: true,
+            minutes: Some(FormEdit::MAX_MINUTES + 1)
+        }
+        .validate()
+        .is_err());
+        assert!(FormEdit {
+            allowed: true,
+            minutes: Some(FormEdit::MAX_MINUTES)
+        }
+        .validate()
+        .is_ok());
     }
 }

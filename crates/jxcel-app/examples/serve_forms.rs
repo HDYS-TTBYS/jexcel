@@ -2,12 +2,12 @@
 //! 回答が届くたびに、表の全行を JSON で標準出力に出す。Enter で終了する。
 //!
 //! ```text
-//! cargo run -p jxcel-app --example serve_forms
+//! cargo run -p jxcel-app --example serve_forms [ポート [合言葉 [no-edit | 修正できる分数]]]
 //! ```
 
 use jxcel_app::forms::FormServer;
 use jxcel_app::Session;
-use jxcel_core::{Column, DataType};
+use jxcel_core::{Column, DataType, FormEdit};
 use std::sync::{Arc, Mutex};
 
 fn main() {
@@ -36,7 +36,33 @@ fn main() {
         )
         .unwrap();
     let schema = snap.file.sheets[0].schemas.last().unwrap().id.clone();
-    s.add_form(&sheet, &schema, "来客受付").unwrap();
+    let form = s.add_form(&sheet, &schema, "来客受付").unwrap().file.forms[0]
+        .id
+        .clone();
+    // 3 番目の引数が修正の設定（`no-edit` なら修正を受け付けない、数字ならその分数まで。省略は期限なし）
+    match std::env::args().nth(3).as_deref() {
+        Some("no-edit") => {
+            s.set_form_edit(
+                &form,
+                FormEdit {
+                    allowed: false,
+                    minutes: None,
+                },
+            )
+            .unwrap();
+        }
+        Some(m) if m.parse::<u32>().is_ok() => {
+            s.set_form_edit(
+                &form,
+                FormEdit {
+                    allowed: true,
+                    minutes: m.parse().ok(),
+                },
+            )
+            .unwrap();
+        }
+        _ => {}
+    }
 
     let shared = Arc::new(Mutex::new(s));
     let for_print = shared.clone();

@@ -123,6 +123,23 @@ function fill(values) {
     el.value = f.kind === "dateTime" ? String(v).slice(0, 16) : String(v);
   }
 }
+// 修正の設定（フォームの定義で届く）。案内の文に使う
+let editInfo = {};
+function span(m) {
+  if (m % 1440 === 0) return m / 1440 + " 日";
+  if (m % 60 === 0) return m / 60 + " 時間";
+  return m + " 分";
+}
+function editHint() {
+  if (editInfo.allowed === false) return "";
+  return editInfo.minutes ? "内容を直すときは、送信から " + span(editInfo.minutes) + "以内に、そのまま変えて「修正を送信」を押してください。" : "内容を直すときは、そのまま変えて「修正を送信」を押してください。";
+}
+// 修正できなくなった（期限切れ・フォームが修正を受け付けない）。内容は残したまま、新しい回答として送れる状態にする
+function editClosed(why) {
+  keepEdit("");
+  setMode();
+  msg(why + "。必要なら、新しい回答として送信してください。", "err");
+}
 function startNew() {
   keepEdit("");
   $("form").reset();
@@ -138,7 +155,8 @@ async function loadAnswer() {
       fill(body.values || {});
       setMode();
       msg("送信済みの回答です。直す場合は内容を変えて「修正を送信」を押してください。", "");
-    } else if (res.status === 404) { keepEdit(""); setMode(); }
+    } else if (res.status === 403 && body.editClosed) { keepEdit(""); setMode(); msg(body.error + "。", ""); }
+    else if (res.status === 404) { keepEdit(""); setMode(); }
   } catch (_) {}
 }
 
@@ -179,6 +197,7 @@ async function onSubmit(e) {
     });
     const body = await res.json().catch(() => ({}));
     if (res.status === 401 && body.needCode) { code = ""; return askCode("合言葉が変わりました。もう一度入力してください"); }
+    if (editing && res.status === 403 && body.editClosed) return editClosed(body.error);
     if (editing && res.status === 404) {
       // 配信が再開された・回答が表から消えた。新しい回答として送り直してもらう
       startNew();
@@ -191,7 +210,7 @@ async function onSubmit(e) {
       // 続けて直せるように、内容は残したまま修正の状態にする
       if (body.editToken) { keepEdit(body.editToken); setMode(); }
       else $("form").reset();
-      msg(body.editToken ? "送信しました。ありがとうございました。\n内容を直すときは、そのまま変えて「修正を送信」を押してください。" : "送信しました。ありがとうございました。", "ok");
+      msg(body.editToken ? "送信しました。ありがとうございました。\n" + editHint() : "送信しました。ありがとうございました。", "ok");
     }
   } catch (err) {
     msg(err.message, "err");
@@ -240,6 +259,7 @@ async function load() {
     if (res.status === 401 && body.needCode) { code = ""; return askCode(body.error === "合言葉が違います" ? body.error : ""); }
     if (!res.ok) throw new Error(body.error || "フォームを読み込めません（" + res.status + "）");
     $("form").onsubmit = onSubmit;
+    editInfo = body.edit || {};
     build(body);
     setMode();
     loadAnswer();

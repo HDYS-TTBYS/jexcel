@@ -592,6 +592,16 @@ export function createMockBackend(): Backend {
         if (!x) throw "フォーム が見つかりません";
         Object.assign(x, { name: name.trim(), sheet, schema, columns, description: description.trim() || undefined });
       }),
+    setFormEdit: async (id, allowed, minutes) =>
+      edit((f) => {
+        if (minutes !== null && (!Number.isInteger(minutes) || minutes < 1 || minutes > 43200))
+          throw "修正できる期間は 1〜43200 分（30 日）で指定してください";
+        const x = f.forms.find((y) => y.id === id);
+        if (!x) throw "フォーム が見つかりません";
+        // 既定（直せる・期限なし）のときは持たない（Rust 側の保存と同じ）
+        if (allowed && minutes === null) delete x.edit;
+        else x.edit = { ...(allowed ? {} : { allowed: false }), ...(minutes === null ? {} : { minutes }) };
+      }),
     deleteForm: async (id) =>
       edit((f) => {
         if (!f.forms.some((x) => x.id === id)) throw "フォーム が見つかりません";

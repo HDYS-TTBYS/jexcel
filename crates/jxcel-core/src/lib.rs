@@ -8,7 +8,8 @@ pub mod types;
 
 pub use error::{Error, Result};
 pub use model::{
-    Column, Computed, DataSchema, Export, Form, JxcelFile, Macro, Row, Sheet, TemplateKind,
+    Column, Computed, DataSchema, Export, Form, FormEdit, JxcelFile, Macro, Row, Sheet,
+    TemplateKind,
 };
 pub use types::{DataType, TypeRegistry};
 

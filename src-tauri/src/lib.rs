@@ -203,6 +203,14 @@ fn update_form(
     })
 }
 
+/// 送信済みの回答の修正の設定（直せるか・送信から何分まで直せるか。`minutes` が無ければ期限なし）。
+#[tauri::command(async)]
+fn set_form_edit(app: App, id: String, allowed: bool, minutes: Option<u32>) -> Reply<Snapshot> {
+    with(&app, |s| {
+        s.set_form_edit(&id, jxcel_core::FormEdit { allowed, minutes })
+    })
+}
+
 #[tauri::command(async)]
 fn delete_form(app: App, id: String) -> Reply<Snapshot> {
     with(&app, |s| s.delete_form(&id))
@@ -304,6 +312,7 @@ pub fn run() {
             run_export,
             add_form,
             update_form,
+            set_form_edit,
             delete_form,
             forms_start,
             forms_stop,

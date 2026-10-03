@@ -11,7 +11,7 @@
 //! - 本文は 64KB まで。計算列・ネスト型の列は入力欄にできない。
 
 use crate::{Error, Result, Session, Snapshot};
-use jxcel_core::{new_id, Column, DataType, Form, JxcelFile, Row};
+use jxcel_core::{new_id, Column, DataType, Form, FormEdit, JxcelFile, Row};
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -67,6 +67,8 @@ pub struct FormDef {
     pub title: String,
     pub description: String,
     pub fields: Vec<FormField>,
+    /// 送信済みの回答の修正の設定（回答者の画面の案内に使う）
+    pub edit: FormEdit,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -112,7 +114,24 @@ impl Session {
                 schema,
                 columns,
                 description: String::new(),
+                edit: FormEdit::default(),
             });
+            Ok(())
+        })
+    }
+
+    /// フォームの、送信済みの回答の修正の設定を変える（直せるか・送信から何分まで直せるか）。
+    /// 配信中なら、次の要求からすぐに効く（すでに渡した修正用トークンも、この設定で断る）。
+    pub fn set_form_edit(&mut self, id: &str, edit: FormEdit) -> Result<Snapshot> {
+        edit.validate().map_err(Error::Invalid)?;
+        let id = id.to_string();
+        self.edit(move |f, _| {
+            let form = f
+                .forms
+                .iter_mut()
+                .find(|x| x.id == id)
+                .ok_or(Error::NotFound("フォーム"))?;
+            form.edit = edit;
             Ok(())
         })
     }
@@ -217,6 +236,7 @@ impl Session {
             title: form.name.clone(),
             description: form.description.clone(),
             fields,
+            edit: form.edit.clone(),
         })
     }
 
@@ -563,7 +583,7 @@ struct Shared {
     tokens: Mutex<Tokens>,
     submitted: Mutex<HashMap<String, u32>>,
     /// 修正用のトークン → (フォーム ID, 回答の行 ID)。メモリだけ（配信を止めると無効になる）
-    edits: Mutex<HashMap<String, (String, String)>>,
+    edits: Mutex<HashMap<String, (String, String, Instant)>>,
     stop: AtomicBool,
     /// 回答を受け付けて表が変わったときに呼ぶ（UI の再描画用）
     on_change: Box<dyn Fn() + Send + Sync>,
@@ -774,6 +794,21 @@ fn error_status(e: &Error) -> u16 {
     }
 }
 
+/// 修正を断る理由（修正できるなら `None`）。`issued` は修正用トークンを渡した時刻。
+fn edit_denied(policy: &FormEdit, issued: Instant, now: Instant) -> Option<&'static str> {
+    if !policy.allowed {
+        return Some("このフォームは、送信後の修正を受け付けていません");
+    }
+    match policy.minutes {
+        Some(m)
+            if now.saturating_duration_since(issued) >= Duration::from_secs(u64::from(m) * 60) =>
+        {
+            Some("修正できる期間が過ぎました")
+        }
+        _ => None,
+    }
+}
+
 /// リクエストの本文（`{"values": {…}}`）から値を読む。エラーは (状態, メッセージ)。
 fn read_values(
     req: &mut tiny_http::Request,
@@ -848,21 +883,44 @@ fn handle(shared: &Shared, mut req: tiny_http::Request) {
         }
     };
 
-    // 修正用トークンから、このフォームの回答の行 ID を引く。知らない・別のフォームのものは失敗として数える
-    let edit_row = |form: &str| -> Option<String> {
+    // 修正用トークンから、このフォームの回答の行 ID を引く。
+    // 知らない・別のフォームのものは 404（失敗として数える）。フォームの設定が許さない・期限が過ぎたものは 403
+    let edit_row = |form: &str| -> std::result::Result<String, (u16, Value)> {
+        let not_found = || (404, json!({"error": "修正できる回答が見つかりません"}));
         let found = edit_token.as_deref().and_then(|t| {
             shared
                 .edits
                 .lock()
                 .unwrap()
                 .get(t)
-                .filter(|(f, _)| f == form)
-                .map(|(_, r)| r.clone())
+                .filter(|(f, _, _)| f == form)
+                .map(|(_, r, at)| (t.to_string(), r.clone(), *at))
         });
-        if found.is_none() && edit_token.is_some() {
-            shared.limiter.lock().unwrap().fail(ip, Instant::now());
+        let Some((token, row_id, issued)) = found else {
+            if edit_token.is_some() {
+                shared.limiter.lock().unwrap().fail(ip, Instant::now());
+            }
+            return Err(not_found());
+        };
+        let policy = shared
+            .session
+            .lock()
+            .ok()
+            .and_then(|s| s.forms().into_iter().find(|f| f.id == form))
+            .map(|f| f.edit);
+        let Some(policy) = policy else {
+            return Err(not_found());
+        };
+        match edit_denied(&policy, issued, Instant::now()) {
+            None => Ok(row_id),
+            Some(why) => {
+                // 期限が過ぎたトークンは捨てる（設定を変えて直せるようにしたときのため、許さない設定のときは残す）
+                if policy.allowed {
+                    shared.edits.lock().unwrap().remove(&token);
+                }
+                Err((403, json!({"error": why, "editClosed": true})))
+            }
         }
-        found
     };
 
     match (&method, parts.as_slice()) {
@@ -921,11 +979,16 @@ fn handle(shared: &Shared, mut req: tiny_http::Request) {
                         .unwrap()
                         .entry(id.clone())
                         .or_insert(0) += 1;
-                    // 回答者が後から直せるように、この回答だけを指す修正用トークンを渡す
+                    // 回答者が後から直せるように、この回答だけを指す修正用トークンを渡す（フォームが許していれば）
+                    let allowed = shared
+                        .session
+                        .lock()
+                        .map(|s| s.forms().iter().any(|f| f.id == id && f.edit.allowed))
+                        .unwrap_or(false);
                     let mut edits = shared.edits.lock().unwrap();
-                    let edit = (edits.len() < MAX_EDITS).then(|| {
+                    let edit = (allowed && edits.len() < MAX_EDITS).then(|| {
                         let t = random_token();
-                        edits.insert(t.clone(), (id, row_id));
+                        edits.insert(t.clone(), (id, row_id, Instant::now()));
                         t
                     });
                     drop(edits);
@@ -943,8 +1006,9 @@ fn handle(shared: &Shared, mut req: tiny_http::Request) {
             if let Some(body) = denied() {
                 return respond_json(req, 401, body);
             }
-            let Some(row_id) = edit_row(&id) else {
-                return respond_json(req, 404, json!({"error": "修正できる回答が見つかりません"}));
+            let row_id = match edit_row(&id) {
+                Ok(r) => r,
+                Err((status, body)) => return respond_json(req, status, body),
             };
             let found = shared
                 .session
@@ -967,8 +1031,9 @@ fn handle(shared: &Shared, mut req: tiny_http::Request) {
             if let Some(body) = denied() {
                 return respond_json(req, 401, body);
             }
-            let Some(row_id) = edit_row(&id) else {
-                return respond_json(req, 404, json!({"error": "修正できる回答が見つかりません"}));
+            let row_id = match edit_row(&id) {
+                Ok(r) => r,
+                Err((status, body)) => return respond_json(req, status, body),
             };
             let sent = shared.limiter.lock().unwrap().submit(ip, Instant::now());
             if let Err(wait) = sent {
@@ -1688,6 +1753,162 @@ mod tests {
             rows(&shared.lock().unwrap(), &schema)[0]["name"],
             json!("変更")
         );
+    }
+
+    #[test]
+    fn set_form_edit_is_validated_and_saved_with_the_form() {
+        let (mut s, sheet, schema) = session();
+        let id = s.add_form(&sheet, &schema, "受付").unwrap().file.forms[0]
+            .id
+            .clone();
+        assert!(s.forms()[0].edit.is_default());
+        let e = |allowed, minutes| FormEdit { allowed, minutes };
+        // 期限は 1 分以上 30 日以下
+        for bad in [Some(0), Some(FormEdit::MAX_MINUTES + 1)] {
+            assert!(matches!(
+                s.set_form_edit(&id, e(true, bad)),
+                Err(Error::Invalid(_))
+            ));
+        }
+        assert!(matches!(
+            s.set_form_edit("nope", e(true, None)),
+            Err(Error::NotFound(_))
+        ));
+        assert!(s.forms()[0].edit.is_default());
+
+        let snap = s.set_form_edit(&id, e(true, Some(90))).unwrap();
+        assert_eq!(snap.file.forms[0].edit, e(true, Some(90)));
+        assert!(snap.dirty);
+        // 回答者に渡す定義にも載る
+        assert_eq!(s.form_definition(&id).unwrap().edit, e(true, Some(90)));
+        s.set_form_edit(&id, e(false, None)).unwrap();
+        assert!(!s.form_definition(&id).unwrap().edit.allowed);
+    }
+
+    #[test]
+    fn edit_denied_follows_the_policy_and_the_deadline() {
+        let t0 = Instant::now();
+        let after = |secs| t0 + Duration::from_secs(secs);
+        let open = FormEdit::default();
+        // 期限なし: いつでも直せる
+        assert_eq!(edit_denied(&open, t0, after(10 * 86400)), None);
+        // 期限あり: ちょうどの時刻から断る
+        let limited = FormEdit {
+            allowed: true,
+            minutes: Some(10),
+        };
+        assert_eq!(edit_denied(&limited, t0, after(599)), None);
+        assert!(edit_denied(&limited, t0, after(600))
+            .unwrap()
+            .contains("期間"));
+        // 許さない設定: 期限の内でも断る
+        let closed = FormEdit {
+            allowed: false,
+            minutes: Some(10),
+        };
+        assert!(edit_denied(&closed, t0, t0)
+            .unwrap()
+            .contains("受け付けていません"));
+        // 時計が戻っても（issued が未来）壊れない
+        assert_eq!(edit_denied(&limited, after(100), t0), None);
+    }
+
+    #[test]
+    fn edit_settings_apply_to_the_running_server() {
+        let (mut s, sheet, schema) = session();
+        let fid = s.add_form(&sheet, &schema, "受付").unwrap().file.forms[0]
+            .id
+            .clone();
+        let shared = Arc::new(Mutex::new(s));
+        let server = FormServer::start(shared.clone(), 0, None, || {}).unwrap();
+        let port = server.port();
+        let token = server.status().urls[0]
+            .url
+            .rsplit('/')
+            .next()
+            .unwrap()
+            .to_string();
+        let (submit, edit, answer) = (
+            format!("/f/{token}/submit"),
+            format!("/f/{token}/edit"),
+            format!("/f/{token}/answer"),
+        );
+        let set = |e: FormEdit| {
+            shared.lock().unwrap().set_form_edit(&fid, e).unwrap();
+        };
+        let send = |name: &str| -> Value {
+            let body = format!(r#"{{"values":{{"name":"{name}"}}}}"#);
+            let (code, _, b) = http(port, "POST", &submit, Some(&body));
+            assert_eq!(code, 200, "{b}");
+            serde_json::from_str(&b).unwrap()
+        };
+        let edit_body = r#"{"values":{"name":"直した"}}"#;
+
+        // 許さない設定のフォーム: 修正用トークンを渡さない
+        set(FormEdit {
+            allowed: false,
+            minutes: None,
+        });
+        assert!(send("山田")["editToken"].is_null());
+        assert_eq!(rows(&shared.lock().unwrap(), &schema).len(), 1);
+
+        // 許す設定にすると、新しい回答にはトークンが渡る
+        set(FormEdit::default());
+        let et = send("佐藤")["editToken"].as_str().unwrap().to_string();
+        let h = [(EDIT_HEADER, et.as_str())];
+        assert_eq!(http_with(port, "GET", &answer, None, &h).0, 200);
+
+        // 配信中に「許さない」へ変えると、すでに渡したトークンもすぐに断る（403・editClosed）。行は変わらない
+        set(FormEdit {
+            allowed: false,
+            minutes: None,
+        });
+        for (method, path, body) in [("GET", &answer, None), ("POST", &edit, Some(edit_body))] {
+            let (code, _, b) = http_with(port, method, path, body, &h);
+            assert_eq!(code, 403, "{b}");
+            assert!(
+                b.contains("editClosed") && b.contains("受け付けていません"),
+                "{b}"
+            );
+        }
+        assert_eq!(
+            rows(&shared.lock().unwrap(), &schema)[1]["name"],
+            json!("佐藤")
+        );
+
+        // 設定を戻せば、同じトークンでまた直せる（許さない間にトークンは捨てない）
+        set(FormEdit::default());
+        assert_eq!(http_with(port, "POST", &edit, Some(edit_body), &h).0, 200);
+        assert_eq!(
+            rows(&shared.lock().unwrap(), &schema)[1]["name"],
+            json!("直した")
+        );
+
+        // 期限: 送信から 10 分の設定で、11 分前に渡したことにする → 403（期間が過ぎた）。トークンは捨てられる
+        set(FormEdit {
+            allowed: true,
+            minutes: Some(10),
+        });
+        {
+            let mut edits = server.shared.edits.lock().unwrap();
+            let long_ago = Instant::now()
+                .checked_sub(Duration::from_secs(11 * 60))
+                .expect("monotonic clock is old enough");
+            edits.get_mut(&et).unwrap().2 = long_ago;
+        }
+        let (code, _, b) = http_with(port, "POST", &edit, Some(edit_body), &h);
+        assert_eq!(code, 403, "{b}");
+        assert!(b.contains("期間が過ぎました"), "{b}");
+        // 期限を延ばしても、捨てたトークンは戻らない（以降は 404）
+        set(FormEdit {
+            allowed: true,
+            minutes: Some(100),
+        });
+        assert_eq!(http_with(port, "POST", &edit, Some(edit_body), &h).0, 404);
+        // 期限内の新しい回答は直せる
+        let et2 = send("鈴木")["editToken"].as_str().unwrap().to_string();
+        let h2 = [(EDIT_HEADER, et2.as_str())];
+        assert_eq!(http_with(port, "POST", &edit, Some(edit_body), &h2).0, 200);
     }
 
     #[test]

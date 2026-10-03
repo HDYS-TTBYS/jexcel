@@ -28,6 +28,8 @@ export default function FormsPanel({ backend, file, onSnapshot, onError, onConfi
 
   // 編集中の設定。「適用」で初めてファイルに反映する
   const [draft, setDraft] = useState({ name: "", target: "", description: "", columns: [] as string[] });
+  // 修正の設定など、下書きに関係ない項目が変わっても、編集中の下書きを捨てないよう、使う項目だけを鍵にする
+  const appliedKey = JSON.stringify(selected ? [selected.name, selected.sheet, selected.schema, selected.description ?? "", selected.columns] : null);
   const applied = useMemo(
     () => ({
       name: selected?.name ?? "",
@@ -35,7 +37,8 @@ export default function FormsPanel({ backend, file, onSnapshot, onError, onConfi
       description: selected?.description ?? "",
       columns: selected?.columns ?? [],
     }),
-    [selected],
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [appliedKey],
   );
   useEffect(() => setDraft(applied), [applied]);
   const changed = JSON.stringify(draft) !== JSON.stringify(applied);
@@ -82,6 +85,22 @@ export default function FormsPanel({ backend, file, onSnapshot, onError, onConfi
     } catch (e) {
       onError(String(e));
     }
+  };
+
+  // 修正できる期間。入力が終わったとき（フォーカスが外れる・Enter）に反映する
+  const [editMinutes, setEditMinutes] = useState("");
+  useEffect(() => setEditMinutes(selected?.edit?.minutes ? String(selected.edit.minutes) : ""), [selected?.id, selected?.edit?.minutes]);
+  const commitMinutes = () => {
+    if (!selected) return;
+    const text = editMinutes.trim();
+    const minutes = text === "" ? null : Number(text);
+    if (minutes !== null && (!Number.isInteger(minutes) || minutes < 1 || minutes > 43200)) {
+      onError("修正できる期間は 1〜43200 分（30 日）の整数にしてください");
+      setEditMinutes(selected.edit?.minutes ? String(selected.edit.minutes) : "");
+      return;
+    }
+    if (minutes === (selected.edit?.minutes ?? null)) return;
+    void run(() => backend.setFormEdit(selected.id, selected.edit?.allowed !== false, minutes));
   };
 
   const apply = () => {
@@ -246,6 +265,35 @@ export default function FormsPanel({ backend, file, onSnapshot, onError, onConfi
               {draftSchema?.columns.some((c) => c.required && canBeField(c) && !draft.columns.includes(c.id)) && (
                 <p className="muted warn">必須の列が入力欄に入っていません。回答のたびに「必須です」で拒否されます。</p>
               )}
+            </fieldset>
+            <fieldset className="fields">
+              <legend>送信後の修正（変えるとすぐ反映されます）</legend>
+              <label className="check">
+                <input
+                  type="checkbox"
+                  aria-label="回答者が送信後に修正できる"
+                  checked={selected.edit?.allowed !== false}
+                  onChange={(e) => void run(() => backend.setFormEdit(selected.id, e.target.checked, selected.edit?.minutes ?? null))}
+                />
+                回答者が、送信した内容をあとから直せる
+              </label>
+              {selected.edit?.allowed !== false && (
+                <label>
+                  修正できる期間（分。空なら期限なし）
+                  <input
+                    aria-label="修正できる期間（分）"
+                    inputMode="numeric"
+                    value={editMinutes}
+                    onChange={(e) => setEditMinutes(e.target.value)}
+                    onBlur={commitMinutes}
+                    onKeyDown={(e) => e.key === "Enter" && commitMinutes()}
+                    placeholder="例: 60（1 時間）、1440（1 日）"
+                  />
+                </label>
+              )}
+              <p className="muted">
+                直せるのは、送信した端末だけです（送信の応答で渡す修正用の合い鍵を、その端末が覚えています）。配信を止めると、期限内でも直せなくなります。
+              </p>
             </fieldset>
             <div className="actions left">
               <button className="primary" disabled={!changed} onClick={apply}>

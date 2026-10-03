@@ -82,6 +82,16 @@ export interface Form {
   /** 入力欄にする列の ID（表示順） */
   columns: string[];
   description?: string;
+  /** 送信済みの回答の修正の設定。無ければ「直せる・期限なし」 */
+  edit?: FormEdit;
+}
+
+/** 送信済みの回答を、回答者が後から直せるか。 */
+export interface FormEdit {
+  /** 直せるか。省略は true */
+  allowed?: boolean;
+  /** 送信から何分まで直せるか（1〜43200）。省略は期限なし（配信を止めるまで） */
+  minutes?: number;
 }
 
 /** 配信中のフォームの URL */

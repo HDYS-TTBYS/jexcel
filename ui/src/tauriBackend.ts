@@ -70,6 +70,7 @@ export const tauriBackend: Backend = {
 
   addForm: (sheet, schema, name) => invoke("add_form", { sheet, schema, name }),
   updateForm: (id, name, sheet, schema, columns, description) => invoke("update_form", { id, name, sheet, schema, columns, description }),
+  setFormEdit: (id, allowed, minutes) => invoke("set_form_edit", { id, allowed, minutes }),
   deleteForm: (id) => invoke("delete_form", { id }),
   formsStart: (port, accessCode) => invoke("forms_start", { port, accessCode: accessCode || null }),
   formsStop: () => invoke("forms_stop"),

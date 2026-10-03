@@ -132,7 +132,7 @@ pub enum Change {
         id: String,
         name: String,
     },
-    /// 題名・対象の表・入力欄・説明のいずれかが変わった
+    /// 題名・対象の表・入力欄・説明・修正の設定のいずれかが変わった
     FormChanged {
         id: String,
         name: String,
@@ -604,6 +604,7 @@ mod tests {
             schema: "d".into(),
             columns: vec!["a".into()],
             description: String::new(),
+            edit: Default::default(),
         });
         assert_eq!(
             diff(&base, &with),
@@ -616,6 +617,16 @@ mod tests {
         m.forms[0].columns.push("b".into());
         assert_eq!(
             diff(&with, &m),
+            vec![Change::FormChanged {
+                id: "f1".into(),
+                name: "受付".into()
+            }]
+        );
+        // 修正の設定だけが変わっても、フォームの変更として出る
+        let mut e = with.clone();
+        e.forms[0].edit.minutes = Some(30);
+        assert_eq!(
+            diff(&with, &e),
             vec![Change::FormChanged {
                 id: "f1".into(),
                 name: "受付".into()

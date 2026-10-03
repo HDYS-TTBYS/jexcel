@@ -48,6 +48,8 @@ export interface Backend {
 
   addForm(sheet: string, schema: string, name: string): Promise<Snapshot>;
   updateForm(id: string, name: string, sheet: string, schema: string, columns: string[], description: string): Promise<Snapshot>;
+  /** 送信済みの回答の修正の設定。`minutes` が null なら期限なし */
+  setFormEdit(id: string, allowed: boolean, minutes: number | null): Promise<Snapshot>;
   deleteForm(id: string): Promise<Snapshot>;
   /** LAN へのフォーム配信。回答は開いているファイルに行として追加される（未保存の変更になる）。 */
   /** accessCode を渡すと、回答者に合言葉を求める（ASCII の 4〜64 文字。ファイルには保存しない） */
