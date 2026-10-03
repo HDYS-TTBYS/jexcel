@@ -1099,6 +1099,81 @@ fn xlsx_rules_charts_and_row_ranges_follow_the_shifted_rows() {
 }
 
 #[test]
+fn xlsx_chart_caches_are_rebuilt_from_the_filled_cells() {
+    let mut pkg = Package::read(&nested_xlsx_with_other_references()).unwrap();
+    pkg.set(
+        "xl/charts/chart1.xml",
+        concat!(
+            "<c:chartSpace xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\"><c:chart><c:plotArea><c:barChart><c:ser>",
+            "<c:cat><c:strRef><c:f>明細!$A$3:$A$5</c:f><c:strCache><c:ptCount val=\"3\"/><c:pt idx=\"0\"><c:v>古い</c:v></c:pt></c:strCache></c:strRef></c:cat>",
+            "<c:val><c:numRef><c:f>明細!$B$3:$B$5</c:f><c:numCache><c:formatCode>General</c:formatCode><c:ptCount val=\"3\"/><c:pt idx=\"0\"><c:v>999</c:v></c:pt></c:numCache></c:numRef></c:val>",
+            // 2 次元の範囲は触らない
+            "<c:val><c:numRef><c:f>明細!$A$3:$B$5</c:f><c:numCache><c:ptCount val=\"1\"/><c:pt idx=\"0\"><c:v>7</c:v></c:pt></c:numCache></c:numRef></c:val>",
+            "</c:ser></c:barChart></c:plotArea></c:chart></c:chartSpace>"
+        )
+        .as_bytes()
+        .to_vec(),
+    );
+    let out = render_with(Kind::Xlsx, &pkg.write().unwrap(), &mut Nest::sample())
+        .unwrap_or_else(|e| panic!("{e}"));
+    let root = part(&out, "xl/charts/chart1.xml");
+    let mut caches = vec![];
+    for local in ["strCache", "numCache"] {
+        elements(&root, local, &mut caches);
+    }
+    // 各キャッシュの (ptCount, [(idx, 値)])
+    let points = |c: &Element| -> (String, Vec<(String, String)>) {
+        let mut count = vec![];
+        elements(c, "ptCount", &mut count);
+        let mut pts = vec![];
+        elements(c, "pt", &mut pts);
+        (
+            count[0].attr("val").unwrap().to_string(),
+            pts.iter()
+                .map(|p| {
+                    let mut v = vec![];
+                    elements(p, "v", &mut v);
+                    (p.attr("idx").unwrap().to_string(), v[0].text())
+                })
+                .collect(),
+        )
+    };
+    let texts_of = |e: &Element, local: &str| -> Vec<String> {
+        let mut els = vec![];
+        elements(e, local, &mut els);
+        els.iter().map(|x| x.text()).collect()
+    };
+    let owned = |v: &[(&str, &str)]| -> Vec<(String, String)> {
+        v.iter()
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .collect()
+    };
+    // 見出し・小計の行も含めた 3〜9 行目の文字列（空のセルは点なし）
+    assert_eq!(
+        points(caches[0]),
+        (
+            "7".to_string(),
+            owned(&[
+                ("0", "ねじ"),
+                ("1", "a"),
+                ("2", "b"),
+                ("3", "小計"),
+                ("4", "板"),
+                ("6", "小計")
+            ])
+        )
+    );
+    // 数値は数値のセルだけ。formatCode は残る
+    assert_eq!(
+        points(caches[1]),
+        ("7".to_string(), owned(&[("0", "3"), ("4", "1")]))
+    );
+    assert!(texts_of(caches[1], "formatCode") == ["General"]);
+    // 2 次元の範囲のキャッシュは触らない
+    assert_eq!(points(caches[2]), ("1".to_string(), owned(&[("0", "7")])));
+}
+
+#[test]
 fn xlsx_three_d_references_are_shifted_or_rejected() {
     let template = nested_xlsx_with_other_references();
     let with_formula = |f: &str| {

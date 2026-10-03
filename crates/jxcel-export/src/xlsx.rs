@@ -153,6 +153,9 @@ pub fn process(pkg: &mut Package, src: &mut dyn Source) -> Result<()> {
             }
         }
     }
+    if !changed_sheets.is_empty() {
+        refresh_chart_caches(pkg, &names, &changed_sheets)?;
+    }
     if any {
         if let Some(b) = pkg.get("xl/workbook.xml") {
             let mut doc = xml::parse(b)?;
@@ -167,6 +170,166 @@ pub fn process(pkg: &mut Package, src: &mut dyn Source) -> Result<()> {
         return Err(expr_error("3D 参照", message));
     }
     Ok(())
+}
+
+/// グラフの系列が持つ保存済みの値（`<c:numCache>`・`<c:strCache>`）を、差し込み後のセルの値で作り直す。
+/// 対象は、書き換えたシートの 1 行または 1 列の範囲（`Sheet1!$B$2:$B$9`）。数式のセル（計算済みの値は
+/// 捨てている）と空のセルは点を作らない（Excel・LibreOffice は開くときに計算して更新する）。
+/// 2 次元の範囲・複数の領域・書き換えていないシートの系列は触らない。
+fn refresh_chart_caches(
+    pkg: &mut Package,
+    names: &std::collections::HashMap<String, String>,
+    changed: &std::collections::HashSet<String>,
+) -> Result<()> {
+    let charts: Vec<String> = pkg
+        .names()
+        .filter(|n| n.starts_with("xl/charts/") && n.ends_with(".xml") && !n.contains("/_rels/"))
+        .map(String::from)
+        .collect();
+    if charts.is_empty() {
+        return Ok(());
+    }
+    let shared = match pkg.get("xl/sharedStrings.xml") {
+        Some(b) => shared_strings(&xml::parse(b)?.root),
+        None => vec![],
+    };
+    // 書き換えたシートのセルの値（シート名の小文字 → (行, 列) → 値）
+    let mut grids: std::collections::HashMap<String, ChartGrid> = Default::default();
+    for (part, sheet_name) in names {
+        if !changed.contains(sheet_name) {
+            continue;
+        }
+        let Some(bytes) = pkg.get(part) else { continue };
+        let doc = xml::parse(bytes)?;
+        grids.insert(sheet_name.to_lowercase(), chart_grid(&doc.root, &shared));
+    }
+    for name in charts {
+        let mut doc = xml::parse(pkg.get(&name).expect("listed"))?;
+        if refresh_series(&mut doc.root, &grids) {
+            pkg.set(&name, xml::write(&doc)?);
+        }
+    }
+    Ok(())
+}
+
+/// セルの値: `true` なら数値（文字列としては書いた文字のまま）。
+type ChartGrid = std::collections::HashMap<(u32, i64), (bool, String)>;
+
+fn chart_grid(root: &Element, shared: &[String]) -> ChartGrid {
+    let mut grid = ChartGrid::new();
+    let Some(sd) = child(root, "sheetData") else {
+        return grid;
+    };
+    for rn in &sd.children {
+        let Node::Element(row) = rn else { continue };
+        for cn in &row.children {
+            let Node::Element(c) = cn else { continue };
+            if c.local() != "c" || child(c, "f").is_some() {
+                continue;
+            }
+            let Some((col, _, r)) = c.attr("r").and_then(parse_ref) else {
+                continue;
+            };
+            let Some(col) = col_index(col) else { continue };
+            let value = match c.attr("t") {
+                Some("s" | "inlineStr") => cell_text(c, shared).map(|s| (false, s)),
+                Some("str") => child(c, "v").map(|v| (false, v.text())),
+                Some("e") => None,
+                _ => child(c, "v")
+                    .map(|v| v.text())
+                    .filter(|t| !t.trim().is_empty())
+                    .map(|t| (true, t.trim().to_string())),
+            };
+            if let Some(v) = value.filter(|(_, s)| !s.is_empty()) {
+                grid.insert((r, col), v);
+            }
+        }
+    }
+    grid
+}
+
+/// `Sheet1!$B$2:$B$9` → (シート名, 1 行か 1 列に並んだセルの (行, 列))。解釈できなければ None。
+fn chart_cells(f: &str) -> Option<(String, Vec<(u32, i64)>)> {
+    let (sheet, range) = f.rsplit_once('!')?;
+    if range.contains(['(', ',']) {
+        return None;
+    }
+    let sheet = match sheet.strip_prefix('\'') {
+        Some(q) => q.strip_suffix('\'')?.replace("''", "'"),
+        None => sheet.to_string(),
+    };
+    let (a, b) = range.split_once(':').unwrap_or((range, range));
+    let (ca, _, ra) = parse_ref(a)?;
+    let (cb, _, rb) = parse_ref(b)?;
+    let (ca, cb) = (col_index(ca)?, col_index(cb)?);
+    if ca > cb || ra > rb || (ca != cb && ra != rb) || (rb - ra) as i64 + (cb - ca) > 20000 {
+        return None;
+    }
+    let cells = if ca == cb {
+        (ra..=rb).map(|r| (r, ca)).collect()
+    } else {
+        (ca..=cb).map(|c| (ra, c)).collect()
+    };
+    Some((sheet, cells))
+}
+
+fn refresh_series(el: &mut Element, grids: &std::collections::HashMap<String, ChartGrid>) -> bool {
+    let mut changed = false;
+    let numeric = el.local() == "numRef";
+    if numeric || el.local() == "strRef" {
+        let cells = child(el, "f").and_then(|f| chart_cells(&f.text()));
+        if let Some((sheet, cells)) = cells {
+            if let Some(grid) = grids.get(&sheet.to_lowercase()) {
+                let cache_name = if numeric { "numCache" } else { "strCache" };
+                if let Some(cache) = child_mut(el, cache_name) {
+                    let values: Vec<Option<&str>> = cells
+                        .iter()
+                        .map(|k| {
+                            grid.get(k)
+                                .filter(|(is_num, _)| *is_num || !numeric)
+                                .map(|(_, s)| s.as_str())
+                        })
+                        .collect();
+                    rebuild_cache(cache, &values);
+                    changed = true;
+                }
+            }
+        }
+        return changed;
+    }
+    for n in &mut el.children {
+        if let Node::Element(e) = n {
+            changed |= refresh_series(e, grids);
+        }
+    }
+    changed
+}
+
+/// キャッシュの点（`ptCount`・`pt`）を値で作り直す。`formatCode` などほかの子は残す。
+fn rebuild_cache(cache: &mut Element, values: &[Option<&str>]) {
+    let p = prefix(&cache.name).to_string();
+    cache
+        .children
+        .retain(|n| !matches!(n, Node::Element(e) if matches!(e.local(), "ptCount" | "pt")));
+    let at = cache
+        .children
+        .iter()
+        .position(|n| matches!(n, Node::Element(e) if e.local() == "formatCode"))
+        .map_or(0, |i| i + 1);
+    let mut fresh = vec![];
+    let mut count = Element::new(&format!("{p}ptCount"));
+    count.set_attr("val", &values.len().to_string());
+    fresh.push(Node::Element(count));
+    for (i, v) in values.iter().enumerate() {
+        let Some(v) = v else { continue };
+        let mut pt = Element::new(&format!("{p}pt"));
+        pt.set_attr("idx", &i.to_string());
+        let mut ve = Element::new(&format!("{p}v"));
+        ve.set_text(v);
+        pt.children.push(Node::Element(ve));
+        fresh.push(Node::Element(pt));
+    }
+    cache.children.splice(at..at, fresh);
 }
 
 fn expr_error(expr: &str, message: impl Into<String>) -> Error {
