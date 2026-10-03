@@ -297,3 +297,53 @@ test("フォーム配信: 回答者ごとの合言葉", async ({ browser }) => {
     setTimeout(() => srv.kill(), 1000).unref();
   }
 });
+
+// ストレージが使えない環境（プライベートブラウズなど）: 送信できる。修正の鍵を覚えられないだけ（開き直すと新しい回答になる）
+test("フォーム配信: localStorage が使えなくても送信できる", async ({ page: p }) => {
+  test.skip(!existsSync(bin) && !process.env.CI, `${bin} がありません（cargo build -p jxcel-app --example serve_forms）`);
+  await p.addInitScript(() => {
+    const boom = () => { throw new DOMException("blocked", "SecurityError"); };
+    Storage.prototype.getItem = boom;
+    Storage.prototype.setItem = boom;
+    Storage.prototype.removeItem = boom;
+  });
+  const srv = spawn(bin, [], { stdio: ["pipe", "pipe", "inherit"] });
+  let out = "";
+  srv.stdout.on("data", (d) => (out += d));
+  const waitFor = async (pred, what) => {
+    const t = Date.now();
+    while (!pred()) {
+      if (Date.now() - t > 10_000) throw new Error(`待ち時間切れ: ${what}\n${out}`);
+      await new Promise((r) => setTimeout(r, 50));
+    }
+  };
+  try {
+    await waitFor(() => out.includes("READY"), "サーバーの起動");
+    const url = out.match(/URL (\S+)/)[1];
+    const errs = [];
+    p.on("pageerror", (e) => errs.push(e.message));
+    await p.goto(url);
+    await p.waitForSelector("form button");
+    const field = (n) => p.locator("label", { hasText: n }).locator("input, select");
+    await field("氏名").fill("山田");
+    await field("区分").selectOption("個人");
+    await p.locator("form button[type=submit]").click();
+    await expect(p.locator("#msg")).toContainText("送信しました");
+    await waitFor(() => out.includes("ROWS"), "回答の到着");
+    // 今のページの中では、そのまま修正できる
+    await field("人数").fill("3");
+    await p.locator("form button[type=submit]").click();
+    await expect(p.locator("#msg")).toContainText("修正を送信しました");
+    await waitFor(() => (out.match(/ROWS /g) || []).length >= 2, "修正の反映");
+    expect(JSON.parse([...out.matchAll(/ROWS (.*)/g)].pop()[1])[0].people).toBe(3);
+    // 開き直すと鍵は覚えていないので、空の新しい回答になる
+    await p.reload();
+    await p.waitForSelector("form button");
+    expect(await field("氏名").inputValue()).toBe("");
+    expect(await p.locator("form button[type=submit]").innerText()).toBe("送信");
+    expect(errs).toEqual([]);
+  } finally {
+    srv.stdin.write("\n");
+    setTimeout(() => srv.kill(), 1000).unref();
+  }
+});
