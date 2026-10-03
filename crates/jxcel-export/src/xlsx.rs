@@ -34,6 +34,8 @@ struct Ctx<'a> {
     date1904: bool,
     /// いま処理しているシートの名前
     sheet_name: Option<String>,
+    /// 書き出したが注意が要ること（呼び出し元へ返す。重複は 1 つにまとめる）
+    notes: Vec<String>,
     /// いま処理しているシートのピボットテーブルの出力範囲（行の始め・終わり、列の始め・終わり）。
     /// 中身は元データの写しなので差し込みの対象にしない（開くときの更新で作り直される）
     pivot_areas: Vec<(u32, u32, i64, i64)>,
@@ -68,7 +70,7 @@ impl Scope {
     }
 }
 
-pub fn process(pkg: &mut Package, src: &mut dyn Source) -> Result<()> {
+pub fn process(pkg: &mut Package, src: &mut dyn Source, notes: &mut Vec<String>) -> Result<()> {
     let shared = match pkg.get("xl/sharedStrings.xml") {
         Some(b) => shared_strings(&xml::parse(b)?.root),
         None => vec![],
@@ -103,6 +105,7 @@ pub fn process(pkg: &mut Package, src: &mut dyn Source) -> Result<()> {
         date1904,
         sheet_name: None,
         pivot_areas: vec![],
+        notes: vec![],
     };
     let names = sheet_names(pkg)?;
     // 行がずれたシートの記録（シート名 → 記録）。定義名の参照をずらすのに使う
@@ -177,6 +180,7 @@ pub fn process(pkg: &mut Package, src: &mut dyn Source) -> Result<()> {
     if let Some(message) = moved.error.take() {
         return Err(expr_error("3D 参照", message));
     }
+    notes.append(&mut ctx.notes);
     Ok(())
 }
 
@@ -573,6 +577,17 @@ fn is_date_format_code(code: &str) -> bool {
     false
 }
 
+/// `YYYY-MM-DD` で始まる日付・日時の文字列か。
+fn looks_like_date(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() >= 10
+        && b[..4].iter().all(u8::is_ascii_digit)
+        && b[4] == b'-'
+        && b[5..7].iter().all(u8::is_ascii_digit)
+        && b[7] == b'-'
+        && b[8..10].iter().all(u8::is_ascii_digit)
+}
+
 /// 1970-01-01 からの日数（グレゴリオ暦）。
 fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
@@ -792,6 +807,7 @@ fn shift_pivot_locations(pkg: &mut Package, sheet_part: &str, moves: &Moves) -> 
 /// - 差し込みで書き換えたシート（ループのないシートも含む）が元データなら、開くときに更新させる（`refreshOnLoad`）。
 ///   保存済みのキャッシュは差し込み前のデータだから
 /// - 元データが表（テーブル）・定義名（`name`）でシートが分からないものは、どこかのシートを書き換えていれば更新させる
+/// - 更新させるキャッシュは、保存済みの記録（古いデータ）の部品も取り除く（`drop_pivot_records`）
 fn shift_pivot_sources(
     pkg: &mut Package,
     moved: &Moved,
@@ -831,11 +847,78 @@ fn shift_pivot_sources(
             }
         }
         if hit {
+            // 開くときに更新させる。保存済みの記録は差し込み前のデータ（テンプレートを作った人の見本のデータなど）で、
+            // 更新で作り直されるので、ファイルに残さない（「元データをファイルに保存しない」= saveData="0" の形にする）
             doc.root.set_attr("refreshOnLoad", "1");
+            if drop_pivot_records(pkg, &name) {
+                doc.root.set_attr("saveData", "0");
+                doc.root.remove_attr("r:id");
+                doc.root.remove_attr("recordCount");
+            }
             pkg.set(&name, xml::write(&doc)?);
         }
     }
     Ok(())
+}
+
+/// ピボットキャッシュの記録の部品（`pivotCacheRecords*.xml`）と、それを指す関係の定義・`[Content_Types].xml` の
+/// 項目を取り除く。取り除いたら true。
+fn drop_pivot_records(pkg: &mut Package, definition: &str) -> bool {
+    let (dir, file) = definition.rsplit_once('/').unwrap_or(("", definition));
+    let rels_name = format!("{dir}/_rels/{file}.rels");
+    let Some(bytes) = pkg.get(&rels_name) else {
+        return false;
+    };
+    let Ok(mut rels) = xml::parse(bytes) else {
+        return false;
+    };
+    let mut parts = vec![];
+    rels.root.children.retain(|n| {
+        let Node::Element(r) = n else { return true };
+        if r.local() == "Relationship"
+            && r.attr("Type")
+                .is_some_and(|t| t.ends_with("/pivotCacheRecords"))
+        {
+            if let Some(t) = r.attr("Target") {
+                parts.push(resolve_part_path(dir, t));
+            }
+            return false;
+        }
+        true
+    });
+    if parts.is_empty() {
+        return false;
+    }
+    let left = rels
+        .root
+        .children
+        .iter()
+        .any(|n| matches!(n, Node::Element(r) if r.local() == "Relationship"));
+    match (left, xml::write(&rels)) {
+        (true, Ok(b)) => pkg.set(&rels_name, b),
+        _ => {
+            // 関係が残らないなら、関係の定義の部品ごと取り除く
+            pkg.remove(&rels_name);
+            parts.push(rels_name);
+        }
+    }
+    for part in &parts {
+        pkg.remove(part);
+    }
+    if let Some(ct) = pkg
+        .get("[Content_Types].xml")
+        .and_then(|b| xml::parse(b).ok())
+    {
+        let mut ct = ct;
+        ct.root.children.retain(|n| {
+            !matches!(n, Node::Element(o) if o.local() == "Override"
+                && o.attr("PartName").is_some_and(|p| parts.iter().any(|x| p.trim_start_matches('/') == x)))
+        });
+        if let Ok(b) = xml::write(&ct) {
+            pkg.set("[Content_Types].xml", b);
+        }
+    }
+    true
 }
 
 /// 部品 `dir` からの相対パス（`../drawings/drawing1.xml`）か、絶対パス（`/xl/drawings/…`）を、部品名にする。
@@ -1837,7 +1920,20 @@ fn cell(c: &mut Element, ctx: &mut Ctx, scope: &Scope) -> Result<bool> {
             }
             Value::String(s) if is_date_cell(c, ctx) => match excel_serial(&s, ctx.date1904) {
                 Some(serial) => set_value(c, &p, None, &serial),
-                None => set_inline(c, &p, &s),
+                None => {
+                    // Excel の日付は 1900 年（1904 年方式なら 1904 年）より前を表せないので、文字列のまま書く。黙らず知らせる
+                    if looks_like_date(&s) {
+                        let at = c.attr("r").unwrap_or("?");
+                        let sheet = ctx.sheet_name.as_deref().unwrap_or("?");
+                        let note = format!(
+                            "{sheet} の {at}: 「{s}」は Excel の日付で表せない（1900 年より前など）ので、文字列で書きました"
+                        );
+                        if !ctx.notes.contains(&note) {
+                            ctx.notes.push(note);
+                        }
+                    }
+                    set_inline(c, &p, &s)
+                }
             },
             other => set_inline(c, &p, &display(&other)),
         }

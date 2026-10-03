@@ -1419,6 +1419,100 @@ fn xlsx_pivot_tables_follow_the_shifted_rows_and_refresh_on_load() {
 }
 
 #[test]
+fn xlsx_dates_before_1900_are_written_as_text_and_reported() {
+    // 日付の表示形式のセル（B2）に 1900 年より前の日付が来ると、Excel の日付にできないので文字列で書く。黙らず注意として返す
+    let mut fake = Fake::new(items(1));
+    fake.top.insert("発行日", json!("1850-05-01"));
+    let (out, notes) = jxcel_export::render_with_notes(Kind::Xlsx, XLSX, &mut fake)
+        .unwrap_or_else(|e| panic!("{e}"));
+    let (c, _) = sheet(&out);
+    assert_eq!(c["B2"].t.as_deref(), Some("inlineStr"));
+    assert_eq!(text(&c, "B2"), "1850-05-01");
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(
+        notes[0].contains("B2") && notes[0].contains("1850-05-01") && notes[0].contains("1900"),
+        "{notes:?}"
+    );
+
+    // 普通の日付は注意なし。日付の表示形式でないセルの日付の文字列は、そもそも日付にしないので注意もなし
+    let (_, notes) =
+        jxcel_export::render_with_notes(Kind::Xlsx, XLSX, &mut Fake::new(items(1))).unwrap();
+    assert!(notes.is_empty(), "{notes:?}");
+}
+
+#[test]
+fn xlsx_pivot_caches_that_refresh_on_load_drop_their_stale_records() {
+    // 更新させるキャッシュの保存済みの記録は、差し込み前のデータ（テンプレートの見本など）なので、ファイルに残さない
+    let mut pkg = Package::read(&nested_xlsx_with_other_references()).unwrap();
+    let ct = String::from_utf8(pkg.get("[Content_Types].xml").unwrap().to_vec()).unwrap();
+    pkg.set(
+        "[Content_Types].xml",
+        ct.replace(
+            "</Types>",
+            concat!(
+                "<Override PartName=\"/xl/pivotCache/pivotCacheRecords1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.pivotCacheRecords+xml\"/>",
+                "<Override PartName=\"/xl/pivotCache/pivotCacheRecords2.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.pivotCacheRecords+xml\"/>",
+                "</Types>"
+            ),
+        )
+        .into_bytes(),
+    );
+    let def = |sheet: &str| {
+        format!(
+            r#"<pivotCacheDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:id="rId1" recordCount="2"><cacheSource type="worksheet"><worksheetSource ref="A2:C5" sheet="{sheet}"/></cacheSource></pivotCacheDefinition>"#
+        )
+        .into_bytes()
+    };
+    let rels = |n: u32| {
+        format!(
+            r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotCacheRecords" Target="pivotCacheRecords{n}.xml"/></Relationships>"#
+        )
+        .into_bytes()
+    };
+    // 1 つ目は差し込みで書き換わるシート（明細）が元データ、2 つ目は書き換わらないシート（Sheet2 のうち、欄のない側）
+    pkg.set("xl/pivotCache/pivotCacheDefinition1.xml", def("明細"));
+    pkg.set(
+        "xl/pivotCache/_rels/pivotCacheDefinition1.xml.rels",
+        rels(1),
+    );
+    pkg.set(
+        "xl/pivotCache/pivotCacheRecords1.xml",
+        b"<pivotCacheRecords/>".to_vec(),
+    );
+    pkg.set("xl/pivotCache/pivotCacheDefinition2.xml", def("Sheet2"));
+    pkg.set(
+        "xl/pivotCache/_rels/pivotCacheDefinition2.xml.rels",
+        rels(2),
+    );
+    pkg.set(
+        "xl/pivotCache/pivotCacheRecords2.xml",
+        b"<pivotCacheRecords/>".to_vec(),
+    );
+    let out = render_with(Kind::Xlsx, &pkg.write().unwrap(), &mut Nest::sample())
+        .unwrap_or_else(|e| panic!("{e}"));
+    let out_pkg = Package::read(&out).unwrap();
+    let has = |n: &str| out_pkg.get(n).is_some();
+
+    // 更新させるキャッシュ: 記録・関係の定義・Content_Types の項目が消え、定義は saveData="0"（r:id と recordCount も外す）
+    assert!(!has("xl/pivotCache/pivotCacheRecords1.xml"));
+    assert!(!has("xl/pivotCache/_rels/pivotCacheDefinition1.xml.rels"));
+    let c1 = part(&out, "xl/pivotCache/pivotCacheDefinition1.xml");
+    assert_eq!(c1.attr("refreshOnLoad"), Some("1"));
+    assert_eq!(c1.attr("saveData"), Some("0"));
+    assert_eq!(c1.attr("r:id"), None);
+    assert_eq!(c1.attr("recordCount"), None);
+    let ct = String::from_utf8(out_pkg.get("[Content_Types].xml").unwrap().to_vec()).unwrap();
+    assert!(!ct.contains("pivotCacheRecords1.xml"), "{ct}");
+    // 更新させないキャッシュ（元データのシートに差し込みがない）は、そのまま
+    assert!(has("xl/pivotCache/pivotCacheRecords2.xml"));
+    assert!(has("xl/pivotCache/_rels/pivotCacheDefinition2.xml.rels"));
+    let c2 = part(&out, "xl/pivotCache/pivotCacheDefinition2.xml");
+    assert_eq!(c2.attr("refreshOnLoad"), None);
+    assert_eq!(c2.attr("r:id"), Some("rId1"));
+    assert!(ct.contains("pivotCacheRecords2.xml"));
+}
+
+#[test]
 fn xlsx_pivot_output_cells_are_not_filled_in() {
     // ピボットテーブルの出力範囲は元データの写し（欄や {{#each}} の印を含みうる）で、開くときの更新で作り直される。
     // 差し込みも行ループの印の検出もしない

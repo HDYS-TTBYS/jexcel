@@ -226,13 +226,80 @@ function mockSamples(): MacroSample[] {
 const PLACEHOLDER_RE = /\{\{(.+?)\}\}/g;
 const placeholdersOf = (text: string) => [...text.matchAll(PLACEHOLDER_RE)].map((m) => m[1].trim()).filter(Boolean);
 
-/** 差し込み欄の式を全行で評価する（Rust 側と同じ prelude.js の evalExprs）。 */
-function evalExprsInBrowser(file: JxcelFile, sheet: string, schemaId: string, exprs: string[]): { v?: unknown; e?: string }[][] {
+type EvalCell = { v?: unknown; e?: string };
+/** 行ループ 1 つの評価結果: 対象の式のエラー、または要素ごとの（欄の値, 入れ子のループの結果） */
+type LoopNode = { e: string } | { items: { v: EvalCell[]; l: LoopNode[] }[] };
+interface EvalRow {
+  top: EvalCell[];
+  loops: LoopNode[];
+}
+/** テンプレートの行ループ（`{{#each 式}}`）。`parent` は外側のループの番号。 */
+interface MockLoop {
+  source: string;
+  parent: number | null;
+  exprs: string[];
+}
+
+/** 差し込み欄の式と行ループを全行で評価する（Rust 側と同じ prelude.js の evalExprs）。 */
+function evalRowsInBrowser(file: JxcelFile, sheet: string, schemaId: string, exprs: string[], loops: MockLoop[] = []): EvalRow[] {
   const fake = loadRuntime();
   const state = (fake.__makeState as (d: JxcelFile) => { evalExprs: (s: unknown) => void; finish: (r: unknown) => string })(structuredClone(file));
-  state.evalExprs({ sheet, schemaId, exprs });
-  // 行ごとに { top: 通常の式の結果, loops: 行ループの結果 }。モックは行ループを使わない
-  return (JSON.parse(state.finish(null)).exprs as { top: { v?: unknown; e?: string }[] }[]).map((r) => r.top);
+  state.evalExprs({ sheet, schemaId, exprs, loops });
+  return JSON.parse(state.finish(null)).exprs as EvalRow[];
+}
+
+/**
+ * テンプレートの本文（テスト用に登録するテキスト）から、差し込み欄と行ループを取り出す。Rust の `parse_blocks` と同じ規則:
+ * `{{/each}}` があれば、`{{#each}}` と組にして入れ子にできる（スタック）。なければ、印のある行（改行区切り）ごとの 1 行ループ。
+ */
+function parseTemplateText(text: string): { placeholders: string[]; loops: MockLoop[] } {
+  const placeholders: string[] = [];
+  const loops: MockLoop[] = [];
+  const add = (list: string[], e: string) => {
+    if (e && !list.includes(e)) list.push(e);
+  };
+  const tokens = (s: string) => [...s.matchAll(PLACEHOLDER_RE)].map((m) => m[1].trim());
+  if (text.includes("{{/each}}")) {
+    const stack: number[] = [];
+    for (const t of tokens(text)) {
+      if (t.startsWith("#each ")) {
+        loops.push({ source: t.slice(6).trim(), parent: stack.length ? stack[stack.length - 1] : null, exprs: [] });
+        stack.push(loops.length - 1);
+      } else if (t === "/each") {
+        if (stack.length === 0) throw "{{/each}} に対応する {{#each}} がありません";
+        stack.pop();
+      } else add(stack.length ? loops[stack[stack.length - 1]].exprs : placeholders, t);
+    }
+    if (stack.length) throw "{{#each}} に対応する {{/each}} がありません";
+  } else {
+    for (const line of text.split(/\r?\n/)) {
+      const ts = tokens(line);
+      const mark = ts.find((t) => t.startsWith("#each "));
+      if (mark) {
+        loops.push({ source: mark.slice(6).trim(), parent: null, exprs: ts.filter((t) => t !== mark).filter((t, i, a) => a.indexOf(t) === i) });
+      } else ts.forEach((t) => add(placeholders, t));
+    }
+  }
+  return { placeholders, loops };
+}
+
+/** 行ごとの繰り返しの回数。入れ子のループは外側の要素すべての合計。対象の式がエラーならそのエラー。 */
+function loopCounts(loops: MockLoop[], row: EvalRow): CellResult[] {
+  const totals: (number | string)[] = loops.map(() => 0);
+  const walk = (k: number, node: LoopNode) => {
+    if ("e" in node) {
+      totals[k] = node.e;
+      return;
+    }
+    if (typeof totals[k] === "number") totals[k] = (totals[k] as number) + node.items.length;
+    const children = loops.map((l, j) => ({ l, j })).filter(({ l }) => l.parent === k);
+    for (const item of node.items) children.forEach(({ j }, idx) => walk(j, item.l[idx]));
+  };
+  let top = 0;
+  loops.forEach((l, k) => {
+    if (l.parent === null) walk(k, row.loops[top++]);
+  });
+  return totals.map((t) => (typeof t === "string" ? { e: t } : { v: t }));
 }
 
 export function createMockBackend(): Backend {
@@ -243,8 +310,25 @@ export function createMockBackend(): Backend {
   // ブラウザ内の「ディスク」。パス → { file, commits }
   const disk = new Map<string, { file: JxcelFile; commits: typeof commits }>();
 
-  // ブラウザ単体にはテンプレートの中身を読む手段がないので、差し込み欄は「対象の表の全列」として見せる
+  // ブラウザ単体にはテンプレートの中身を読む手段がないので、差し込み欄は「対象の表の全列」として見せる。
+  // テスト用に `window.__mockTemplate(パス, 本文)` で本文を登録しておくと、その本文の欄と行ループを使う。
   const mockPlaceholders = new Map<string, string[]>();
+  const mockTemplateTexts = new Map<string, string>();
+  const mockLoops = new Map<string, MockLoop[]>();
+  const useTemplateText = (id: string, templatePath: string, columns: string[]) => {
+    const text = mockTemplateTexts.get(templatePath);
+    if (text === undefined) {
+      mockPlaceholders.set(id, columns);
+      mockLoops.delete(id);
+      return;
+    }
+    const t = parseTemplateText(text);
+    mockPlaceholders.set(id, t.placeholders);
+    mockLoops.set(id, t.loops);
+  };
+  if (typeof window !== "undefined") {
+    (window as unknown as { __mockTemplate?: (p: string, text: string) => void }).__mockTemplate = (p, text) => void mockTemplateTexts.set(p, text);
+  }
   // フォーム配信（模擬）: 起動中のポートと、回答が届いたときに UI へ知らせるハンドラ
   let formsPort: number | null = null;
   let formsChanged: (() => void) | null = null;
@@ -535,7 +619,7 @@ export function createMockBackend(): Backend {
           schema: schema.id,
           filename: schema.columns[0] ? `{{${schema.columns[0].name}}}` : "{{_no}}",
         });
-        mockPlaceholders.set(id, schema.columns.map((c) => c.name));
+        useTemplateText(id, templatePath, schema.columns.map((c) => c.name));
       });
     },
     updateExport: async (id, name, sheet, schema, filename, filter) =>
@@ -551,12 +635,15 @@ export function createMockBackend(): Backend {
         if (!e) throw "書き出し が見つかりません";
         if (!new RegExp(`\\.${e.kind}$`, "i").test(templatePath)) throw `この書き出しのテンプレートは .${e.kind} です。同じ種類のファイルを選んでください`;
         e.templateName = templatePath.split("/").pop()!;
+        const columns = f.sheets.find((s) => s.id === e.sheet)?.schemas.find((s) => s.id === e.schema)?.columns.map((c) => c.name) ?? [];
+        useTemplateText(id, templatePath, columns);
       }),
     deleteExport: async (id) =>
       edit((f) => {
         if (!f.exports.some((e) => e.id === id)) throw "書き出し が見つかりません";
         f.exports = f.exports.filter((e) => e.id !== id);
         mockPlaceholders.delete(id);
+        mockLoops.delete(id);
       }),
     exportPreview: async (id, limit): Promise<ExportPreview> => {
       if (!file) throw "ファイルが開かれていません";
@@ -566,12 +653,20 @@ export function createMockBackend(): Backend {
       const nameExprs = placeholdersOf(e.filename || "{{_no}}");
       const filter = e.filter?.trim();
       const exprs = [...new Set([...placeholders, ...nameExprs, ...(filter ? [filter] : [])])];
-      const matrix = evalExprsInBrowser(file, e.sheet, e.schema, exprs);
+      const loops = mockLoops.get(id) ?? [];
+      const evaluated = evalRowsInBrowser(file, e.sheet, e.schema, exprs, loops);
+      const matrix = evaluated.map((r) => r.top);
       const cell = (r: { v?: unknown; e?: string }): CellResult => (r.e !== undefined ? { e: r.e } : { v: r.v ?? null });
       const used = new Set<string>();
       return {
         placeholders,
-        loops: [], // ブラウザ単体ではテンプレートの中身を読めないので、行ループは分からない
+        // 登録した本文があれば、その行ループ（件数は Rust 側と同じ評価器で数える）。なければ分からない
+        loops: loops.map((l, k) => ({
+          source: l.source,
+          parent: l.parent,
+          exprs: l.exprs,
+          counts: evaluated.slice(0, limit).map((r) => loopCounts(loops, r)[k]),
+        })),
         totalRows: matrix.length,
         rows: matrix.slice(0, limit).map((row, i) => {
           const at = (x: string) => row[exprs.indexOf(x)];

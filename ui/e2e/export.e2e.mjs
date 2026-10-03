@@ -99,3 +99,39 @@ test("テンプレート書き出しのパネル", async ({ page: p }) => {
 
   expect(errs).toEqual([]);
 });
+
+// 行ループのプレビュー: ブラウザ単体のモックはテンプレートの実体を持たないので、テスト用に本文を登録して確かめる
+// （件数は Rust 側と同じ評価器で数える。入れ子のループは外側の要素すべての合計）
+test("書き出しのプレビュー: 行ループの件数（入れ子を含む）", async ({ page: p }) => {
+  const errs = [];
+  p.on("pageerror", (e) => errs.push("pageerror: " + e.message));
+  const check = (name, cond, extra = "") => expect.soft(!!cond, name + (cond ? "" : " " + extra)).toBe(true);
+  const panel = () => p.getByRole("complementary", { name: "書き出し" });
+  await p.goto("/");
+  await p.getByRole("button", { name: "新規作成" }).click();
+  await p.getByRole("dialog").getByRole("button", { name: "OK" }).click();
+  await p.waitForSelector(".ag-row");
+  const cell = (i) => p.locator(`.ag-row[row-index="${i}"] [col-id]:not([col-id="__delete"])`).first();
+  await cell(0).dblclick(); await p.keyboard.type("A社"); await p.keyboard.press("Enter");
+  await p.getByRole("button", { name: "+ 行を追加" }).click();
+  await cell(1).dblclick(); await p.keyboard.type("B商事"); await p.keyboard.press("Enter");
+  await p.waitForTimeout(300);
+
+  // 登録した本文: 外側のループ（列1 の文字ごと）と、その中の入れ子のループ（固定の 2 要素）
+  await p.evaluate(() =>
+    window.__mockTemplate("/mock/請求書.docx", '請求書 {{列1}}\n{{#each 列1.split("")}}\n{{_n}} {{_item}}\n{{#each [1,2]}}{{_i}}{{/each}}\n{{/each}}\n'),
+  );
+  await p.getByRole("button", { name: "書き出し", exact: true }).click();
+  await panel().getByRole("button", { name: "+ テンプレートを追加" }).click();
+  await panel().getByLabel("書き出しの名前").waitFor();
+  await panel().locator(".loops").waitFor();
+  const text = await panel().locator(".loops").innerText();
+  check("外側のループが出る", text.includes('{{#each 列1.split("")}}') && text.includes("_n") && text.includes("_item"), text);
+  check("入れ子のループが出る", text.includes("{{#each [1,2]}}") && text.includes("の中）"), text);
+  // A社 = 2 文字、B商事 = 3 文字。入れ子は外側の要素ごとに 2 件なので合計 4 件・6 件
+  check("外側の回数", /1 行目 2 件 \/ 2 行目 3 件/.test(text), text);
+  check("入れ子の回数は外側の要素すべての合計", /1 行目 4 件 \/ 2 行目 6 件/.test(text), text);
+  check("ループの外の欄は『列1』だけ", (await panel().locator(".preview thead").innerText()).includes("列1"));
+
+  expect(errs).toEqual([]);
+});

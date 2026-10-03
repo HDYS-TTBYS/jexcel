@@ -164,6 +164,8 @@ export interface ExportResult {
   written: { rowNo: number; filename: string }[];
   skipped: number;
   errors: { rowNo: number; message: string }[];
+  /** 書き出したが、注意が要ること（1900 年より前の日付を Excel の日付にできず文字列で書いた、など） */
+  warnings: { rowNo: number; message: string }[];
 }
 
 /** 日時列のオフセット一括変換の結果 */

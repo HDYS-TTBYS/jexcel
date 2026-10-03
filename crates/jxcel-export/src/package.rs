@@ -40,6 +40,11 @@ impl Package {
         }
     }
 
+    /// 部品を取り除く（無ければ何もしない）。
+    pub fn remove(&mut self, name: &str) {
+        self.entries.retain(|(n, _)| n != name);
+    }
+
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.entries.iter().map(|(n, _)| n.as_str())
     }

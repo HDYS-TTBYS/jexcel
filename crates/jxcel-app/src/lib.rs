@@ -79,6 +79,8 @@ pub struct ExportResult {
     pub skipped: usize,
     /// 書き出せなかった行（他の行は書き出されている）
     pub errors: Vec<ExportRowError>,
+    /// 書き出したが、注意が要ること（1900 年より前の日付を文字列で書いた、など）
+    pub warnings: Vec<ExportRowError>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -921,6 +923,14 @@ impl Session {
             skipped: report.skipped,
             errors: report
                 .errors
+                .into_iter()
+                .map(|e| ExportRowError {
+                    row_no: e.row_no,
+                    message: e.message,
+                })
+                .collect(),
+            warnings: report
+                .warnings
                 .into_iter()
                 .map(|e| ExportRowError {
                     row_no: e.row_no,

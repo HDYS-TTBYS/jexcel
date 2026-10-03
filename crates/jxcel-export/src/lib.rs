@@ -241,6 +241,15 @@ pub fn render(kind: Kind, template: &[u8], resolve: &mut Resolver) -> Result<Vec
 
 /// 行ループを含めて差し込みを行った新しいファイルを返す。
 pub fn render_with(kind: Kind, template: &[u8], source: &mut dyn Source) -> Result<Vec<u8>> {
+    render_with_notes(kind, template, source).map(|(bytes, _)| bytes)
+}
+
+/// `render_with` に、書き出したが注意が要ること（Excel の日付にできず文字列で書いた、など）の一覧を添えたもの。
+pub fn render_with_notes(
+    kind: Kind,
+    template: &[u8],
+    source: &mut dyn Source,
+) -> Result<(Vec<u8>, Vec<String>)> {
     let mut pkg = package::Package::read(template)?;
     if pkg.get(required_part(kind)).is_none() {
         return Err(Error::NotATemplate(format!(
@@ -249,11 +258,12 @@ pub fn render_with(kind: Kind, template: &[u8], source: &mut dyn Source) -> Resu
             required_part(kind)
         )));
     }
+    let mut notes = vec![];
     match kind {
         Kind::Docx => docx::process(&mut pkg, source)?,
-        Kind::Xlsx => xlsx::process(&mut pkg, source)?,
+        Kind::Xlsx => xlsx::process(&mut pkg, source, &mut notes)?,
     }
-    pkg.write()
+    Ok((pkg.write()?, notes))
 }
 
 /// テンプレートの差し込み欄の一覧。

@@ -7,7 +7,7 @@ use jxcel_macro::{CellResult, ItemEval, LoopRequest, LoopResult, Options, RowEva
 use serde_json::Value;
 
 use crate::placeholder::{find, replace_all};
-use crate::{plan, render_with, Error, Kind, Plan, Result, Source};
+use crate::{plan, render_with_notes, Error, Kind, Plan, Result, Source};
 
 /// 書き出しの指定。
 pub struct Spec<'a> {
@@ -45,6 +45,8 @@ pub struct Report {
     pub skipped: usize,
     /// 書き出せなかった行（他の行は書き出される）
     pub errors: Vec<RowError>,
+    /// 書き出したが、注意が要ること（1900 年より前の日付を Excel の日付にできず文字列で書いた、など）
+    pub warnings: Vec<RowError>,
 }
 
 /// 評価する式の一覧（テンプレートの欄、ファイル名の欄、絞り込み）。重複は 1 つにまとめる。
@@ -318,8 +320,11 @@ pub fn export(file: &JxcelFile, spec: &Spec, opts: &Options) -> Result<Report> {
             plan: &plan,
             eval,
         };
-        match render_with(spec.kind, spec.template, &mut source) {
-            Ok(bytes) => {
+        match render_with_notes(spec.kind, spec.template, &mut source) {
+            Ok((bytes, notes)) => {
+                for message in notes {
+                    report.warnings.push(fail(message));
+                }
                 let filename = finish_filename(&stem, row_no, spec.kind.extension(), &mut used);
                 report.files.push(GeneratedFile {
                     row_id: row_id.clone(),

@@ -303,6 +303,18 @@ export default function ExportPanel({ backend, file, onSnapshot, onError, onConf
                   </ul>
                 </>
               )}
+              {result.warnings.length > 0 && (
+                <>
+                  <p className="out-warn">書き出しましたが、注意が {result.warnings.length} 件あります</p>
+                  <ul className="out-warn">
+                    {result.warnings.map((w, i) => (
+                      <li key={i}>
+                        {w.rowNo} 行目: {w.message}
+                      </li>
+                    ))}
+                  </ul>
+                </>
+              )}
             </div>
           )}
         </div>
