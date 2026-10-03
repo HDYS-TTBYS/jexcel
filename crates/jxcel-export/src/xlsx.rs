@@ -183,7 +183,8 @@ pub fn process(pkg: &mut Package, src: &mut dyn Source) -> Result<()> {
 /// グラフの系列が持つ保存済みの値（`<c:numCache>`・`<c:strCache>`）を、差し込み後のセルの値で作り直す。
 /// 対象は、書き換えたシートの 1 行または 1 列の範囲（`Sheet1!$B$2:$B$9`）。数式のセル（計算済みの値は
 /// 捨てている）と空のセルは点を作らない（Excel・LibreOffice は開くときに計算して更新する）。
-/// 2 次元の範囲・複数の領域・書き換えていないシートの系列は触らない。
+/// 複数の領域（`(Sheet1!$A$1:$A$3,Sheet1!$C$1:$C$3)`）は、領域の順につなげる。
+/// 2 次元の範囲・書き換えたシートを指さない系列は触らない。
 fn refresh_chart_caches(
     pkg: &mut Package,
     names: &std::collections::HashMap<String, String>,
@@ -201,23 +202,30 @@ fn refresh_chart_caches(
         Some(b) => shared_strings(&xml::parse(b)?.root),
         None => vec![],
     };
-    // 書き換えたシートのセルの値（シート名の小文字 → (行, 列) → 値）
+    // 各シートのセルの値（シート名の小文字 → (行, 列) → 値）。複数の領域が書き換えていないシートも指せるよう、全シート分
     let mut grids: std::collections::HashMap<String, ChartGrid> = Default::default();
     for (part, sheet_name) in names {
-        if !changed.contains(sheet_name) {
-            continue;
-        }
         let Some(bytes) = pkg.get(part) else { continue };
         let doc = xml::parse(bytes)?;
         grids.insert(sheet_name.to_lowercase(), chart_grid(&doc.root, &shared));
     }
+    let cx = ChartCtx {
+        grids,
+        changed: changed.iter().map(|n| n.to_lowercase()).collect(),
+    };
     for name in charts {
         let mut doc = xml::parse(pkg.get(&name).expect("listed"))?;
-        if refresh_series(&mut doc.root, &grids) {
+        if refresh_series(&mut doc.root, &cx) {
             pkg.set(&name, xml::write(&doc)?);
         }
     }
     Ok(())
+}
+
+struct ChartCtx {
+    grids: std::collections::HashMap<String, ChartGrid>,
+    /// 書き換えたシートの名前（小文字）。これを指さない系列は触らない
+    changed: std::collections::HashSet<String>,
 }
 
 /// セルの値: `true` なら数値（文字列としては書いた文字のまま）。
@@ -256,8 +264,40 @@ fn chart_grid(root: &Element, shared: &[String]) -> ChartGrid {
     grid
 }
 
-/// `Sheet1!$B$2:$B$9` → (シート名, 1 行か 1 列に並んだセルの (行, 列))。解釈できなければ None。
-fn chart_cells(f: &str) -> Option<(String, Vec<(u32, i64)>)> {
+/// 1 つの領域: (シート名, 1 行か 1 列に並んだセルの (行, 列))。
+type ChartArea = (String, Vec<(u32, i64)>);
+
+/// 系列の参照 → 領域ごとの (シート名, 1 行か 1 列に並んだセルの (行, 列))。
+/// `Sheet1!$B$2:$B$9` か、複数の領域 `(Sheet1!$A$1:$A$3,Sheet1!$C$1:$C$3)`。解釈できなければ None。
+fn chart_areas(f: &str) -> Option<Vec<ChartArea>> {
+    let f = f.trim();
+    let inner = f
+        .strip_prefix('(')
+        .and_then(|x| x.strip_suffix(')'))
+        .unwrap_or(f);
+    // 引用符の外のカンマで領域に分ける（シート名の中のカンマは区切りではない）
+    let mut parts = vec![];
+    let (mut start, mut quoted) = (0, false);
+    for (i, c) in inner.char_indices() {
+        match c {
+            '\'' => quoted = !quoted,
+            ',' if !quoted => {
+                parts.push(&inner[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&inner[start..]);
+    let areas: Vec<_> = parts
+        .into_iter()
+        .map(|p| chart_area(p.trim()))
+        .collect::<Option<_>>()?;
+    let total: usize = areas.iter().map(|(_, c)| c.len()).sum();
+    (total <= 20_000).then_some(areas)
+}
+
+fn chart_area(f: &str) -> Option<ChartArea> {
     let (sheet, range) = f.rsplit_once('!')?;
     if range.contains(['(', ',']) {
         return None;
@@ -281,20 +321,29 @@ fn chart_cells(f: &str) -> Option<(String, Vec<(u32, i64)>)> {
     Some((sheet, cells))
 }
 
-fn refresh_series(el: &mut Element, grids: &std::collections::HashMap<String, ChartGrid>) -> bool {
+fn refresh_series(el: &mut Element, cx: &ChartCtx) -> bool {
     let mut changed = false;
     let numeric = el.local() == "numRef";
     if numeric || el.local() == "strRef" {
-        let cells = child(el, "f").and_then(|f| chart_cells(&f.text()));
-        if let Some((sheet, cells)) = cells {
-            if let Some(grid) = grids.get(&sheet.to_lowercase()) {
+        let areas = child(el, "f").and_then(|f| chart_areas(&f.text()));
+        if let Some(areas) = areas {
+            // 書き換えたシートを指す系列だけ。全領域のシートの値が分かるときだけ作り直す
+            let touched = areas
+                .iter()
+                .any(|(sheet, _)| cx.changed.contains(&sheet.to_lowercase()));
+            let grids: Option<Vec<&ChartGrid>> = areas
+                .iter()
+                .map(|(sheet, _)| cx.grids.get(&sheet.to_lowercase()))
+                .collect();
+            if let (true, Some(grids)) = (touched, grids) {
                 let cache_name = if numeric { "numCache" } else { "strCache" };
                 if let Some(cache) = child_mut(el, cache_name) {
-                    let values: Vec<Option<&str>> = cells
+                    let values: Vec<Option<&str>> = areas
                         .iter()
-                        .map(|k| {
-                            grid.get(k)
-                                .filter(|(is_num, _)| *is_num || !numeric)
+                        .zip(&grids)
+                        .flat_map(|((_, cells), grid)| cells.iter().map(move |k| grid.get(k)))
+                        .map(|v| {
+                            v.filter(|(is_num, _)| *is_num || !numeric)
                                 .map(|(_, s)| s.as_str())
                         })
                         .collect();
@@ -307,7 +356,7 @@ fn refresh_series(el: &mut Element, grids: &std::collections::HashMap<String, Ch
     }
     for n in &mut el.children {
         if let Node::Element(e) = n {
-            changed |= refresh_series(e, grids);
+            changed |= refresh_series(e, cx);
         }
     }
     changed

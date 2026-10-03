@@ -47,6 +47,7 @@ export default function FormsPanel({ backend, file, onSnapshot, onError, onConfi
   const [status, setStatus] = useState<FormsStatus>({ running: false, port: null, protected: false, urls: [] });
   const [port, setPort] = useState(String(DEFAULT_PORT));
   const [code, setCode] = useState("");
+  const [personal, setPersonal] = useState("");
   const refreshStatus = useCallback(() => backend.formsStatus().then(setStatus, (e) => onError(String(e))), [backend, onError]);
   // フォームの増減・回答の到着で、URL 一覧と回答数を読み直す
   const formsKey = JSON.stringify(forms.map((f) => f.id));
@@ -113,7 +114,7 @@ export default function FormsPanel({ backend, file, onSnapshot, onError, onConfi
     const n = Number(port);
     if (!Number.isInteger(n) || n < 1 || n > 65535) return onError("ポートは 1〜65535 の整数にしてください");
     try {
-      setStatus(await backend.formsStart(n, code.trim() || undefined));
+      setStatus(await backend.formsStart(n, code.trim() || undefined, personal.split(/\r?\n/).map((l) => l.trim()).filter((l) => l)));
     } catch (e) {
       onError(String(e));
     }
@@ -172,6 +173,20 @@ export default function FormsPanel({ backend, file, onSnapshot, onError, onConfi
             {status.running ? `配信中（ポート ${status.port}${status.protected ? "・合言葉あり" : ""}）` : "停止中"}
           </span>
         </div>
+        <label className="personal">
+          回答者ごとの合言葉（任意。1 行に 1 つ・1 人に 1 つ配ります）
+          <textarea
+            aria-label="回答者ごとの合言葉"
+            rows={3}
+            value={personal}
+            disabled={status.running}
+            placeholder={"例:\nyamada-1234\nsato-5678"}
+            onChange={(e) => setPersonal(e.target.value)}
+          />
+        </label>
+        <p className="muted">
+          回答者ごとの合言葉で入った人は、1 つの合言葉につき回答は 1 件で、送信後はその合言葉で（別の端末からも）直せます。全員共通の合言葉とは別のものにしてください。
+        </p>
         <p className="muted warn">
           同じネットワークで URL を知っている人は誰でも（合言葉を決めたときは、合言葉も知っている人が）、回答を行として追加できます。
           合言葉は半角の英数字と記号（4〜64 文字）で、ファイルには保存しません。間違いや存在しない URL が続いた端末は数分間ロックされ、1 台からの回答は 1 分に 30 件までです。回答は開いているファイルに追加され、保存するまで確定しません。

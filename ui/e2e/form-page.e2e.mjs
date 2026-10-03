@@ -221,3 +221,79 @@ for (const [label, args, expectHint] of [
     }
   });
 }
+
+// 回答者ごとの合言葉: 1 人 1 件で、別の端末（別のブラウザ）でも同じ合言葉で自分の回答を直せる
+test("フォーム配信: 回答者ごとの合言葉", async ({ browser }) => {
+  test.skip(!existsSync(bin) && !process.env.CI, `${bin} がありません（cargo build -p jxcel-app --example serve_forms）`);
+  const srv = spawn(bin, ["0", "", "", "yamada-1,sato-22"], { stdio: ["pipe", "pipe", "inherit"] });
+  let out = "";
+  srv.stdout.on("data", (d) => (out += d));
+  const waitFor = async (pred, what) => {
+    const t = Date.now();
+    while (!pred()) {
+      if (Date.now() - t > 10_000) throw new Error(`待ち時間切れ: ${what}\n${out}`);
+      await new Promise((r) => setTimeout(r, 50));
+    }
+  };
+  const open = async (url, code) => {
+    const ctx = await browser.newContext({ viewport: { width: 390, height: 844 } });
+    const p = await ctx.newPage();
+    await p.goto(url);
+    await expect(p.locator("h1")).toHaveText("合言葉が必要です");
+    await p.getByLabel("合言葉").fill(code);
+    await p.getByRole("button", { name: "開く" }).click();
+    await expect(p.locator("h1")).toHaveText("来客受付");
+    return { ctx, p, field: (n) => p.locator("label", { hasText: n }).locator("input, select") };
+  };
+  const rowsNow = () => JSON.parse([...out.matchAll(/ROWS (.*)/g)].pop()[1]);
+  try {
+    await waitFor(() => out.includes("READY"), "サーバーの起動");
+    const url = out.match(/URL (\S+)/)[1];
+
+    // 山田さんが送信する。1 人 1 件なので、新しい回答として送り直すボタンは出ない
+    const a = await open(url, "yamada-1");
+    await a.field("氏名").fill("山田");
+    await a.field("人数").fill("2");
+    await a.field("区分").selectOption("個人");
+    await a.p.locator("form button[type=submit]").click();
+    await expect(a.p.locator("#msg")).toContainText("送信しました");
+    await waitFor(() => out.includes("ROWS"), "回答の到着");
+    expect(await a.p.locator("form button[type=submit]").innerText()).toBe("修正を送信");
+    expect(await a.p.getByRole("button", { name: "新しい回答として送る" }).isVisible()).toBe(false);
+
+    // 別の端末（別のブラウザ）で同じ合言葉 → 前回の回答が入っていて、直せる
+    const b = await open(url, "yamada-1");
+    await expect(b.p.locator("#msg")).toContainText("送信済みの回答です");
+    expect(await b.field("氏名").inputValue()).toBe("山田");
+    expect(await b.field("人数").inputValue()).toBe("2");
+    await b.field("人数").fill("5");
+    await b.p.locator("form button[type=submit]").click();
+    await expect(b.p.locator("#msg")).toContainText("修正を送信しました");
+    await waitFor(() => rowsNow()[0].people === 5, "別の端末からの修正");
+    expect(rowsNow().length).toBe(1);
+
+    // 佐藤さんは別の回答。山田さんの回答は見えない（空の新しいフォーム）
+    const c = await open(url, "sato-22");
+    expect(await c.field("氏名").inputValue()).toBe("");
+    expect(await c.p.locator("form button[type=submit]").innerText()).toBe("送信");
+    await c.field("氏名").fill("佐藤");
+    await c.field("区分").selectOption("法人");
+    await c.p.locator("form button[type=submit]").click();
+    await expect(c.p.locator("#msg")).toContainText("送信しました");
+    await waitFor(() => rowsNow().length === 2, "佐藤さんの回答");
+    expect(rowsNow().map((r) => r.name)).toEqual(["山田", "佐藤"]);
+
+    // 合言葉が違えば入れない
+    const d = await browser.newContext();
+    const dp = await d.newPage();
+    await dp.goto(url);
+    await dp.getByLabel("合言葉").fill("nobody-99");
+    await dp.getByRole("button", { name: "開く" }).click();
+    await expect(dp.locator("#msg")).toContainText("合言葉が違います");
+    for (const x of [a, b, c]) await x.ctx.close();
+    await d.close();
+  } finally {
+    srv.stdin.write("\n");
+    setTimeout(() => srv.kill(), 1000).unref();
+  }
+});

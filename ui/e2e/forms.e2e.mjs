@@ -96,6 +96,18 @@ test("フォーム配信のパネル", async ({ page: p }) => {
   check("空にすると期限なし", (await minutesBox.inputValue()) === "");
   await panel().getByLabel("説明").fill("お名前を入力してください");
 
+  // 回答者ごとの合言葉: 規則に合わないもの・重複は開始できない
+  const personalBox = panel().getByLabel("回答者ごとの合言葉");
+  await personalBox.fill("abc");
+  await panel().getByRole("button", { name: "配信を開始" }).click();
+  await p.waitForFunction(() => document.body.innerText.includes("合言葉は半角"), null, { timeout: 3000 }).catch(() => {});
+  check("短い合言葉は拒否される", (await p.locator("body").innerText()).includes("合言葉は半角") && (await panel().getByRole("button", { name: "配信を開始" }).isVisible()));
+  await personalBox.fill("yamada-1\nyamada-1");
+  await panel().getByRole("button", { name: "配信を開始" }).click();
+  await p.waitForFunction(() => document.body.innerText.includes("重複"), null, { timeout: 3000 }).catch(() => {});
+  check("重複は拒否される", (await p.locator("body").innerText()).includes("重複"));
+  await personalBox.fill("");
+
   // 配信の開始
   check("必須の列を外す前は警告なし", true);
   await panel().getByRole("button", { name: "配信を開始" }).click();

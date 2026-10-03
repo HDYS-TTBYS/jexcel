@@ -109,10 +109,12 @@ function keepEdit(t) {
   editToken = t || "";
   try { editToken ? localStorage.setItem("jxcel-edit:" + base, editToken) : localStorage.removeItem("jxcel-edit:" + base); } catch (_) {}
 }
+// 回答者ごとの合言葉で入った人（1 人 1 件。別の端末でも、合言葉で自分の回答を直せる）か。回答済みで直す状態か
+let personal = false, hasAnswer = false;
 function setMode() {
-  const editing = !!editToken;
-  $("form").querySelector("button[type=submit]").textContent = editing ? "修正を送信" : "送信";
-  $("fresh").hidden = !editing;
+  $("form").querySelector("button[type=submit]").textContent = hasAnswer ? "修正を送信" : "送信";
+  // 合言葉の持ち主は新しい回答を送れない（1 人 1 件）
+  $("fresh").hidden = !hasAnswer || personal;
 }
 function fill(values) {
   for (const f of fields) {
@@ -136,27 +138,34 @@ function editHint() {
 }
 // 修正できなくなった（期限切れ・フォームが修正を受け付けない）。内容は残したまま、新しい回答として送れる状態にする
 function editClosed(why) {
+  if (personal) return msg(why + "。", "err");
   keepEdit("");
+  hasAnswer = false;
   setMode();
   msg(why + "。必要なら、新しい回答として送信してください。", "err");
 }
 function startNew() {
   keepEdit("");
+  hasAnswer = false;
   $("form").reset();
   setMode();
   msg("");
 }
 async function loadAnswer() {
-  if (!editToken) return;
+  if (!editToken && !personal) return;
   try {
-    const res = await fetch(base + "/answer", { headers: headers({ "x-jxcel-edit": editToken }) });
+    const res = await fetch(base + "/answer", { headers: headers(editToken ? { "x-jxcel-edit": editToken } : {}) });
     const body = await res.json().catch(() => ({}));
     if (res.ok) {
       fill(body.values || {});
+      hasAnswer = true;
       setMode();
       msg("送信済みの回答です。直す場合は内容を変えて「修正を送信」を押してください。", "");
-    } else if (res.status === 403 && body.editClosed) { keepEdit(""); setMode(); msg(body.error + "。", ""); }
-    else if (res.status === 404) { keepEdit(""); setMode(); }
+    } else if (res.status === 403 && body.editClosed) {
+      if (!personal) { keepEdit(""); hasAnswer = false; }
+      setMode();
+      msg(body.error + "。", "");
+    } else if (res.status === 404) { keepEdit(""); hasAnswer = false; setMode(); }
   } catch (_) {}
 }
 
@@ -189,15 +198,23 @@ async function onSubmit(e) {
   btn.disabled = true;
   msg("送信中…");
   try {
-    const editing = !!editToken;
+    const editing = hasAnswer;
     const res = await fetch(base + (editing ? "/edit" : "/submit"), {
       method: "POST",
-      headers: headers(Object.assign({ "content-type": "application/json" }, editing ? { "x-jxcel-edit": editToken } : {})),
+      headers: headers(Object.assign({ "content-type": "application/json" }, editing && editToken ? { "x-jxcel-edit": editToken } : {})),
       body: JSON.stringify({ values }),
     });
     const body = await res.json().catch(() => ({}));
     if (res.status === 401 && body.needCode) { code = ""; return askCode("合言葉が変わりました。もう一度入力してください"); }
     if (editing && res.status === 403 && body.editClosed) return editClosed(body.error);
+    // この合言葉では回答済み（別の端末で送った）。その回答を開いて直してもらう
+    if (!editing && res.status === 409 && body.answered) { await loadAnswer(); return msg(body.error + "。", "err"); }
+    if (editing && res.status === 404 && personal) {
+      // 自分の回答が表から消えた。新しく送れる
+      hasAnswer = false;
+      setMode();
+      throw new Error("以前の回答は見つかりません。内容を確かめて、もう一度送信してください。");
+    }
     if (editing && res.status === 404) {
       // 配信が再開された・回答が表から消えた。新しい回答として送り直してもらう
       startNew();
@@ -208,9 +225,11 @@ async function onSubmit(e) {
       msg("修正を送信しました。", "ok");
     } else {
       // 続けて直せるように、内容は残したまま修正の状態にする
-      if (body.editToken) { keepEdit(body.editToken); setMode(); }
+      if (body.editToken) keepEdit(body.editToken);
+      const canEdit = !!body.editToken || (personal && editInfo.allowed !== false);
+      if (canEdit) { hasAnswer = true; setMode(); }
       else $("form").reset();
-      msg(body.editToken ? "送信しました。ありがとうございました。\n" + editHint() : "送信しました。ありがとうございました。", "ok");
+      msg(canEdit ? "送信しました。ありがとうございました。\n" + editHint() : "送信しました。ありがとうございました。", "ok");
     }
   } catch (err) {
     msg(err.message, "err");
@@ -260,7 +279,11 @@ async function load() {
     if (!res.ok) throw new Error(body.error || "フォームを読み込めません（" + res.status + "）");
     $("form").onsubmit = onSubmit;
     editInfo = body.edit || {};
+    personal = body.personal === true;
+    // 合言葉の持ち主は合言葉が鍵。この端末に残った修正用トークン（他の人のものかもしれない）は使わない
+    if (personal) keepEdit("");
     build(body);
+    hasAnswer = !!editToken;
     setMode();
     loadAnswer();
   } catch (err) { $("title").textContent = "フォームを開けません"; msg(err.message, "err"); }

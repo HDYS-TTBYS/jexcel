@@ -237,11 +237,16 @@ fn forms_start(
     forms: Forms,
     port: u16,
     access_code: Option<String>,
+    respondent_codes: Option<Vec<String>>,
 ) -> Reply<FormsStatus> {
     let mut server = forms_lock(&forms)?;
     if server.is_none() {
         let session = Arc::clone(&app);
-        let started = FormServer::start(session, port, access_code, move || {
+        let options = jxcel_app::forms::ServeOptions {
+            access_code,
+            respondent_codes: respondent_codes.unwrap_or_default(),
+        };
+        let started = FormServer::start_with(session, port, options, move || {
             let _ = window.emit("jxcel://changed", ());
         })
         .map_err(|e| e.to_string())?;

@@ -2,10 +2,10 @@
 //! 回答が届くたびに、表の全行を JSON で標準出力に出す。Enter で終了する。
 //!
 //! ```text
-//! cargo run -p jxcel-app --example serve_forms [ポート [合言葉 [no-edit | 修正できる分数]]]
+//! cargo run -p jxcel-app --example serve_forms [ポート [合言葉 [no-edit | 修正できる分数 [回答者ごとの合言葉（カンマ区切り）]]]]
 //! ```
 
-use jxcel_app::forms::FormServer;
+use jxcel_app::forms::{FormServer, ServeOptions};
 use jxcel_app::Session;
 use jxcel_core::{Column, DataType, FormEdit};
 use std::sync::{Arc, Mutex};
@@ -72,7 +72,16 @@ fn main() {
         .unwrap_or(0);
     // 2 番目の引数が合言葉（省略すると合言葉なし）
     let code = std::env::args().nth(2);
-    let server = FormServer::start(shared, port, code, move || {
+    // 4 番目の引数が、回答者ごとの合言葉（カンマ区切り）
+    let respondent_codes = std::env::args()
+        .nth(4)
+        .map(|c| c.split(',').map(String::from).collect())
+        .unwrap_or_default();
+    let options = ServeOptions {
+        access_code: code,
+        respondent_codes,
+    };
+    let server = FormServer::start_with(shared, port, options, move || {
         let snap = for_print.lock().unwrap().current().unwrap();
         let rows: Vec<_> = snap.file.sheets[0]
             .schemas

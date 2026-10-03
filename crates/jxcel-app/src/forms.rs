@@ -29,6 +29,8 @@ const WORKERS: usize = 4;
 const CODE_HEADER: &str = "X-Jxcel-Code";
 /// 回答の修正用トークン（送信の応答で渡す）を送るヘッダ
 const EDIT_HEADER: &str = "X-Jxcel-Edit";
+/// 回答者ごとの合言葉の数の上限
+const MAX_RESPONDENTS: usize = 1000;
 /// 修正用トークンを覚えておく回答の数（超えたら新しい回答には渡さない）
 const MAX_EDITS: usize = 100_000;
 /// 合言葉の長さ（バイト数＝文字数）の範囲
@@ -579,6 +581,10 @@ struct Shared {
     session: Arc<Mutex<Session>>,
     /// 設定されていれば、定義の取得と回答の送信にヘッダで合言葉が要る
     access_code: Option<String>,
+    /// 回答者ごとの合言葉。どれかが合えば入れて、その合言葉の持ち主として扱う（回答は 1 つの合言葉につき 1 件）
+    respondent_codes: Vec<String>,
+    /// (フォーム ID, 回答者の合言葉) → (回答の行 ID, 送信した時刻)。メモリだけ（配信を止めると消える）
+    answers: Mutex<HashMap<(String, String), (String, Instant)>>,
     limiter: Mutex<Limiter>,
     tokens: Mutex<Tokens>,
     submitted: Mutex<HashMap<String, u32>>,
@@ -587,6 +593,15 @@ struct Shared {
     stop: AtomicBool,
     /// 回答を受け付けて表が変わったときに呼ぶ（UI の再描画用）
     on_change: Box<dyn Fn() + Send + Sync>,
+}
+
+/// 配信の設定。
+#[derive(Debug, Clone, Default)]
+pub struct ServeOptions {
+    /// 全員共通の合言葉（任意）
+    pub access_code: Option<String>,
+    /// 回答者ごとの合言葉。1 つにつき 1 人で、その人の回答は 1 件。送信後は同じ合言葉でどの端末からでも直せる
+    pub respondent_codes: Vec<String>,
 }
 
 pub struct FormServer {
@@ -607,15 +622,62 @@ impl FormServer {
         access_code: Option<String>,
         on_change: impl Fn() + Send + Sync + 'static,
     ) -> Result<Self> {
-        let access_code = access_code.filter(|c| !c.is_empty());
-        if let Some(c) = &access_code {
-            // ヘッダで送るので ASCII の印字可能文字だけ（ブラウザの fetch は日本語をヘッダに入れられない）
+        Self::start_with(
+            session,
+            port,
+            ServeOptions {
+                access_code,
+                respondent_codes: vec![],
+            },
+            on_change,
+        )
+    }
+
+    /// `start` に、回答者ごとの合言葉（`ServeOptions::respondent_codes`）を足したもの。
+    pub fn start_with(
+        session: Arc<Mutex<Session>>,
+        port: u16,
+        options: ServeOptions,
+        on_change: impl Fn() + Send + Sync + 'static,
+    ) -> Result<Self> {
+        let access_code = options.access_code.filter(|c| !c.is_empty());
+        let respondent_codes: Vec<String> = options
+            .respondent_codes
+            .into_iter()
+            .map(|c| c.trim().to_string())
+            .filter(|c| !c.is_empty())
+            .collect();
+        // ヘッダで送るので ASCII の印字可能文字だけ（ブラウザの fetch は日本語をヘッダに入れられない）
+        let check = |c: &str| -> Result<()> {
             if !CODE_LEN.contains(&c.len()) || !c.bytes().all(|b| b.is_ascii_graphic()) {
                 return Err(Error::Invalid(format!(
                     "合言葉は半角の英数字と記号（空白なし）の {}〜{} 文字にしてください",
                     CODE_LEN.start(),
                     CODE_LEN.end()
                 )));
+            }
+            Ok(())
+        };
+        if let Some(c) = &access_code {
+            check(c)?;
+        }
+        if respondent_codes.len() > MAX_RESPONDENTS {
+            return Err(Error::Invalid(format!(
+                "回答者ごとの合言葉は {MAX_RESPONDENTS} 件までです"
+            )));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for c in &respondent_codes {
+            check(c)?;
+            if !seen.insert(c.as_str()) {
+                return Err(Error::Invalid(format!(
+                    "回答者ごとの合言葉が重複しています: {c}"
+                )));
+            }
+            if access_code.as_deref() == Some(c.as_str()) {
+                return Err(Error::Invalid(
+                    "回答者ごとの合言葉は、全員共通の合言葉と別のものにしてください".into(),
+                ));
             }
         }
         let server = tiny_http::Server::http(("0.0.0.0", port)).map_err(|e| {
@@ -632,6 +694,8 @@ impl FormServer {
         let shared = Arc::new(Shared {
             session,
             access_code,
+            respondent_codes,
+            answers: Mutex::default(),
             limiter: Mutex::default(),
             tokens: Mutex::default(),
             submitted: Mutex::default(),
@@ -696,7 +760,8 @@ impl FormServer {
         FormsStatus {
             running: true,
             port: Some(self.port),
-            protected: self.shared.access_code.is_some(),
+            protected: self.shared.access_code.is_some()
+                || !self.shared.respondent_codes.is_empty(),
             urls,
         }
     }
@@ -870,34 +935,66 @@ fn handle(shared: &Shared, mut req: tiny_http::Request) {
         }
         found
     };
-    // 合言葉の確認。ヘッダが無いのは数えず（ページを開いた直後の問い合わせ）、間違いは失敗として数える
-    let denied = || -> Option<Value> {
-        let want = shared.access_code.as_deref()?;
+    // 合言葉の確認。合えば、回答者ごとの合言葉ならその合言葉（持ち主の識別）を返す。
+    // ヘッダが無いのは数えず（ページを開いた直後の問い合わせ）、間違いは失敗として数える
+    let identify = || -> std::result::Result<Option<String>, Value> {
+        if shared.access_code.is_none() && shared.respondent_codes.is_empty() {
+            return Ok(None);
+        }
         match code.as_deref() {
-            Some(got) if same_code(got, want) => None,
-            Some(_) => {
-                shared.limiter.lock().unwrap().fail(ip, Instant::now());
-                Some(json!({"error": "合言葉が違います", "needCode": true}))
+            Some(got) => {
+                // どれと比べるときも全部と比べる（合った位置を応答の速さから推測されないように）
+                let mut shared_ok = false;
+                if let Some(want) = shared.access_code.as_deref() {
+                    shared_ok = same_code(got, want);
+                }
+                let mut mine = None;
+                for c in &shared.respondent_codes {
+                    if same_code(got, c) {
+                        mine = Some(c.clone());
+                    }
+                }
+                if shared_ok || mine.is_some() {
+                    Ok(mine)
+                } else {
+                    shared.limiter.lock().unwrap().fail(ip, Instant::now());
+                    Err(json!({"error": "合言葉が違います", "needCode": true}))
+                }
             }
-            None => Some(json!({"error": "合言葉を入力してください", "needCode": true})),
+            None => Err(json!({"error": "合言葉を入力してください", "needCode": true})),
         }
     };
 
-    // 修正用トークンから、このフォームの回答の行 ID を引く。
-    // 知らない・別のフォームのものは 404（失敗として数える）。フォームの設定が許さない・期限が過ぎたものは 403
-    let edit_row = |form: &str| -> std::result::Result<String, (u16, Value)> {
+    // 回答の行 ID を引く。修正用トークン（送信した端末が持つ）か、回答者ごとの合言葉（持ち主ならどの端末でも）で。
+    // 知らない・別のフォームのトークンは 404（失敗として数える）。フォームの設定が許さない・期限が過ぎたものは 403
+    let edit_row = |form: &str, who: Option<&str>| -> std::result::Result<String, (u16, Value)> {
         let not_found = || (404, json!({"error": "修正できる回答が見つかりません"}));
-        let found = edit_token.as_deref().and_then(|t| {
-            shared
-                .edits
-                .lock()
-                .unwrap()
-                .get(t)
-                .filter(|(f, _, _)| f == form)
-                .map(|(_, r, at)| (t.to_string(), r.clone(), *at))
+        // (期限が過ぎたら捨てるトークン, 行 ID, 渡した時刻)
+        // 回答者ごとの合言葉で入った人は、合言葉で引く（端末に残った他人のトークンは見ない）
+        let by_token = edit_token
+            .as_deref()
+            .filter(|_| who.is_none())
+            .and_then(|t| {
+                shared
+                    .edits
+                    .lock()
+                    .unwrap()
+                    .get(t)
+                    .filter(|(f, _, _)| f == form)
+                    .map(|(_, r, at)| (Some(t.to_string()), r.clone(), *at))
+            });
+        let found = by_token.or_else(|| {
+            who.and_then(|c| {
+                shared
+                    .answers
+                    .lock()
+                    .unwrap()
+                    .get(&(form.to_string(), c.to_string()))
+                    .map(|(r, at)| (None, r.clone(), *at))
+            })
         });
         let Some((token, row_id, issued)) = found else {
-            if edit_token.is_some() {
+            if edit_token.is_some() && who.is_none() {
                 shared.limiter.lock().unwrap().fail(ip, Instant::now());
             }
             return Err(not_found());
@@ -914,9 +1011,10 @@ fn handle(shared: &Shared, mut req: tiny_http::Request) {
         match edit_denied(&policy, issued, Instant::now()) {
             None => Ok(row_id),
             Some(why) => {
-                // 期限が過ぎたトークンは捨てる（設定を変えて直せるようにしたときのため、許さない設定のときは残す）
-                if policy.allowed {
-                    shared.edits.lock().unwrap().remove(&token);
+                // 期限が過ぎたトークンは捨てる（設定を変えて直せるようにしたときのため、許さない設定のときは残す）。
+                // 回答者ごとの合言葉の記録は、回答済みの印として残す
+                if let (true, Some(t)) = (policy.allowed, token) {
+                    shared.edits.lock().unwrap().remove(&t);
                 }
                 Err((403, json!({"error": why, "editClosed": true})))
             }
@@ -938,16 +1036,22 @@ fn handle(shared: &Shared, mut req: tiny_http::Request) {
             let Some(id) = form_id(token) else {
                 return respond_json(req, 404, json!({"error": "フォームが見つかりません"}));
             };
-            if let Some(body) = denied() {
-                return respond_json(req, 401, body);
-            }
+            let who = match identify() {
+                Ok(w) => w,
+                Err(body) => return respond_json(req, 401, body),
+            };
             let def = shared
                 .session
                 .lock()
                 .map_err(|_| Error::Invalid("内部状態が壊れています".into()))
                 .and_then(|s| s.form_definition(&id));
             match def {
-                Ok(d) => respond_json(req, 200, serde_json::to_value(d).unwrap()),
+                Ok(d) => {
+                    let mut v = serde_json::to_value(d).unwrap();
+                    // 回答者ごとの合言葉で入った人には、その人の回答を直す画面にする
+                    v["personal"] = json!(who.is_some());
+                    respond_json(req, 200, v)
+                }
                 Err(e) => respond_json(req, error_status(&e), json!({"error": e.to_string()})),
             }
         }
@@ -955,12 +1059,36 @@ fn handle(shared: &Shared, mut req: tiny_http::Request) {
             let Some(id) = form_id(token) else {
                 return respond_json(req, 404, json!({"error": "フォームが見つかりません"}));
             };
-            if let Some(body) = denied() {
-                return respond_json(req, 401, body);
-            }
+            let who = match identify() {
+                Ok(w) => w,
+                Err(body) => return respond_json(req, 401, body),
+            };
             let sent = shared.limiter.lock().unwrap().submit(ip, Instant::now());
             if let Err(wait) = sent {
                 return respond_limited(req, wait, "送信が多すぎます");
+            }
+            // 回答者ごとの合言葉は 1 人 1 件。回答済み（その行がまだ表にある）なら新しい回答は受け付けず、修正してもらう
+            if let Some(c) = &who {
+                let row = shared
+                    .answers
+                    .lock()
+                    .unwrap()
+                    .get(&(id.clone(), c.clone()))
+                    .map(|(r, _)| r.clone());
+                let alive = row.is_some_and(|r| {
+                    shared
+                        .session
+                        .lock()
+                        .map(|s| s.form_answer(&id, &r).is_ok())
+                        .unwrap_or(false)
+                });
+                if alive {
+                    return respond_json(
+                        req,
+                        409,
+                        json!({"error": "この合言葉では回答済みです。内容は修正できます", "answered": true}),
+                    );
+                }
             }
             let values = match read_values(&mut req) {
                 Ok(m) => m,
@@ -979,12 +1107,22 @@ fn handle(shared: &Shared, mut req: tiny_http::Request) {
                         .unwrap()
                         .entry(id.clone())
                         .or_insert(0) += 1;
-                    // 回答者が後から直せるように、この回答だけを指す修正用トークンを渡す（フォームが許していれば）
-                    let allowed = shared
-                        .session
-                        .lock()
-                        .map(|s| s.forms().iter().any(|f| f.id == id && f.edit.allowed))
-                        .unwrap_or(false);
+                    let personal = who.clone();
+                    if let Some(c) = who {
+                        shared
+                            .answers
+                            .lock()
+                            .unwrap()
+                            .insert((id.clone(), c), (row_id.clone(), Instant::now()));
+                    }
+                    // 回答者が後から直せるように、この回答だけを指す修正用トークンを渡す（フォームが許していれば）。
+                    // 回答者ごとの合言葉の人は、合言葉が鍵なので渡さない
+                    let allowed = personal.is_none()
+                        && shared
+                            .session
+                            .lock()
+                            .map(|s| s.forms().iter().any(|f| f.id == id && f.edit.allowed))
+                            .unwrap_or(false);
                     let mut edits = shared.edits.lock().unwrap();
                     let edit = (allowed && edits.len() < MAX_EDITS).then(|| {
                         let t = random_token();
@@ -1003,10 +1141,11 @@ fn handle(shared: &Shared, mut req: tiny_http::Request) {
             let Some(id) = form_id(token) else {
                 return respond_json(req, 404, json!({"error": "フォームが見つかりません"}));
             };
-            if let Some(body) = denied() {
-                return respond_json(req, 401, body);
-            }
-            let row_id = match edit_row(&id) {
+            let who = match identify() {
+                Ok(w) => w,
+                Err(body) => return respond_json(req, 401, body),
+            };
+            let row_id = match edit_row(&id, who.as_deref()) {
                 Ok(r) => r,
                 Err((status, body)) => return respond_json(req, status, body),
             };
@@ -1028,10 +1167,11 @@ fn handle(shared: &Shared, mut req: tiny_http::Request) {
             let Some(id) = form_id(token) else {
                 return respond_json(req, 404, json!({"error": "フォームが見つかりません"}));
             };
-            if let Some(body) = denied() {
-                return respond_json(req, 401, body);
-            }
-            let row_id = match edit_row(&id) {
+            let who = match identify() {
+                Ok(w) => w,
+                Err(body) => return respond_json(req, 401, body),
+            };
+            let row_id = match edit_row(&id, who.as_deref()) {
                 Ok(r) => r,
                 Err((status, body)) => return respond_json(req, status, body),
             };
@@ -1909,6 +2049,169 @@ mod tests {
         let et2 = send("鈴木")["editToken"].as_str().unwrap().to_string();
         let h2 = [(EDIT_HEADER, et2.as_str())];
         assert_eq!(http_with(port, "POST", &edit, Some(edit_body), &h2).0, 200);
+    }
+
+    #[test]
+    fn respondent_codes_are_validated_and_make_the_server_protected() {
+        let (mut s, sheet, schema) = session();
+        s.add_form(&sheet, &schema, "受付").unwrap();
+        let shared = Arc::new(Mutex::new(s));
+        let opts = |shared_code: Option<&str>, codes: &[&str]| ServeOptions {
+            access_code: shared_code.map(String::from),
+            respondent_codes: codes.iter().map(|c| c.to_string()).collect(),
+        };
+        let start = |o| FormServer::start_with(shared.clone(), 0, o, || {});
+        for bad in [
+            opts(None, &["abc"]),                  // 短い
+            opts(None, &["ひみつの合言葉"]),       // 日本語
+            opts(None, &["yamada-1", "yamada-1"]), // 重複
+            opts(Some("shared-1"), &["shared-1"]), // 共通の合言葉と同じ
+        ] {
+            assert!(matches!(start(bad), Err(Error::Invalid(_))));
+        }
+        let many: Vec<String> = (0..MAX_RESPONDENTS + 1)
+            .map(|i| format!("code-{i:05}"))
+            .collect();
+        let too_many = ServeOptions {
+            access_code: None,
+            respondent_codes: many,
+        };
+        assert!(start(too_many).is_err());
+        // 空の行は無視され、回答者ごとの合言葉だけでも「合言葉あり」になる
+        let server = start(opts(None, &["", "yamada-1", "  sato-22  "])).unwrap();
+        assert!(server.status().protected);
+        assert_eq!(server.shared.respondent_codes, ["yamada-1", "sato-22"]);
+    }
+
+    #[test]
+    fn each_respondent_code_answers_once_and_edits_from_any_device() {
+        let (mut s, sheet, schema) = session();
+        s.add_form(&sheet, &schema, "受付").unwrap();
+        let shared = Arc::new(Mutex::new(s));
+        let server = FormServer::start_with(
+            shared.clone(),
+            0,
+            ServeOptions {
+                access_code: Some("shared-all".into()),
+                respondent_codes: vec!["yamada-1".into(), "sato-22".into()],
+            },
+            || {},
+        )
+        .unwrap();
+        let port = server.port();
+        let token = server.status().urls[0]
+            .url
+            .rsplit('/')
+            .next()
+            .unwrap()
+            .to_string();
+        let (def, submit, edit, answer) = (
+            format!("/f/{token}/def"),
+            format!("/f/{token}/submit"),
+            format!("/f/{token}/edit"),
+            format!("/f/{token}/answer"),
+        );
+        let yamada = [(CODE_HEADER, "yamada-1")];
+        let sato = [(CODE_HEADER, "sato-22")];
+        let common = [(CODE_HEADER, "shared-all")];
+        let body = |name: &str| format!(r#"{{"values":{{"name":"{name}","qty":"1"}}}}"#);
+
+        // 定義: 回答者ごとの合言葉の人には personal、共通の合言葉の人には付かない
+        let personal = |h: &[(&str, &str)]| {
+            let (code, _, b) = http_with(port, "GET", &def, None, h);
+            assert_eq!(code, 200, "{b}");
+            serde_json::from_str::<Value>(&b).unwrap()["personal"].clone()
+        };
+        assert_eq!(personal(&yamada), json!(true));
+        assert_eq!(personal(&common), json!(false));
+
+        // 1 つ目の回答。修正用トークンは渡さない（合言葉が鍵）
+        let (code, _, b) = http_with(port, "POST", &submit, Some(&body("山田")), &yamada);
+        assert_eq!(code, 200, "{b}");
+        assert!(serde_json::from_str::<Value>(&b).unwrap()["editToken"].is_null());
+        // 同じ合言葉の 2 回目は 409（回答済み）で、行は増えない
+        let (code, _, b) = http_with(port, "POST", &submit, Some(&body("山田2")), &yamada);
+        assert_eq!(code, 409, "{b}");
+        assert!(b.contains("answered"));
+        assert_eq!(rows(&shared.lock().unwrap(), &schema).len(), 1);
+        // 別の人の合言葉は別の回答として送れる。共通の合言葉は従来どおり何度でも
+        assert_eq!(
+            http_with(port, "POST", &submit, Some(&body("佐藤")), &sato).0,
+            200
+        );
+        assert_eq!(
+            http_with(port, "POST", &submit, Some(&body("誰か")), &common).0,
+            200
+        );
+        assert_eq!(
+            http_with(port, "POST", &submit, Some(&body("誰か2")), &common).0,
+            200
+        );
+        assert_eq!(rows(&shared.lock().unwrap(), &schema).len(), 4);
+
+        // 自分の回答を読める・直せる（修正用トークンなし。どの端末でも）
+        let (code, _, b) = http_with(port, "GET", &answer, None, &yamada);
+        assert_eq!(code, 200, "{b}");
+        assert!(b.contains("山田"));
+        let (code, _, b) = http_with(port, "POST", &edit, Some(&body("山田太郎")), &yamada);
+        assert_eq!(code, 200, "{b}");
+        let r = rows(&shared.lock().unwrap(), &schema);
+        assert_eq!(r[0]["name"], json!("山田太郎"));
+        assert_eq!(r[1]["name"], json!("佐藤")); // 他人の回答は変わらない
+
+        // 他人の回答は読めも直せもしない。共通の合言葉の人には、自分の回答が無い
+        assert!(!http_with(port, "GET", &answer, None, &sato)
+            .2
+            .contains("山田"));
+        assert_eq!(http_with(port, "GET", &answer, None, &common).0, 404);
+        assert_eq!(
+            http_with(port, "POST", &edit, Some(&body("乗っ取り")), &common).0,
+            404
+        );
+        // 他人の修正用トークン（端末に残っていた）を付けても、合言葉の持ち主として扱う
+        let stale_token = "0".repeat(32);
+        let stale = [
+            (CODE_HEADER, "sato-22"),
+            (EDIT_HEADER, stale_token.as_str()),
+        ];
+        let (code, _, b) = http_with(port, "GET", &answer, None, &stale);
+        assert_eq!(code, 200, "{b}");
+        assert!(b.contains("佐藤"));
+
+        // 修正の設定は回答者ごとの合言葉にも効く
+        let fid = server.shared.session.lock().unwrap().forms()[0].id.clone();
+        shared
+            .lock()
+            .unwrap()
+            .set_form_edit(
+                &fid,
+                FormEdit {
+                    allowed: false,
+                    minutes: None,
+                },
+            )
+            .unwrap();
+        let (code, _, b) = http_with(port, "POST", &edit, Some(&body("また直す")), &yamada);
+        assert_eq!(code, 403, "{b}");
+        assert!(b.contains("editClosed"));
+
+        // 回答が表から消えれば、同じ合言葉でまた送れる
+        {
+            let mut guard = shared.lock().unwrap();
+            let d = guard.doc().unwrap();
+            let (sh, sc) = (
+                d.file.sheets[0].id.clone(),
+                d.file.sheets[0].schemas.last().unwrap().id.clone(),
+            );
+            crate::find_schema(&mut d.file, &sh, &sc)
+                .unwrap()
+                .rows
+                .retain(|r| r.cells.get("name") != Some(&json!("山田太郎")));
+        }
+        assert_eq!(
+            http_with(port, "POST", &submit, Some(&body("山田再")), &yamada).0,
+            200
+        );
     }
 
     #[test]

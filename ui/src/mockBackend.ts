@@ -608,10 +608,20 @@ export function createMockBackend(): Backend {
         f.forms = f.forms.filter((x) => x.id !== id);
       }),
     // ブラウザ単体では本物の配信はできない。URL の表示と、回答が届いたときの再描画だけを再現する。
-    formsStart: async (port, accessCode) => {
-      // Rust 側（FormServer::start）と同じ規則
-      if (accessCode && !/^[\x21-\x7e]{4,64}$/.test(accessCode)) throw "合言葉は半角の英数字と記号（空白なし）の 4〜64 文字にしてください";
-      formsProtected = !!accessCode;
+    formsStart: async (port, accessCode, respondentCodes) => {
+      // Rust 側（FormServer::start_with）と同じ規則
+      const ok = (c: string) => /^[\x21-\x7e]{4,64}$/.test(c);
+      if (accessCode && !ok(accessCode)) throw "合言葉は半角の英数字と記号（空白なし）の 4〜64 文字にしてください";
+      const codes = (respondentCodes ?? []).map((c) => c.trim()).filter((c) => c);
+      if (codes.length > 1000) throw "回答者ごとの合言葉は 1000 件までです";
+      const seen = new Set<string>();
+      for (const c of codes) {
+        if (!ok(c)) throw "合言葉は半角の英数字と記号（空白なし）の 4〜64 文字にしてください";
+        if (seen.has(c)) throw `回答者ごとの合言葉が重複しています: ${c}`;
+        if (c === accessCode) throw "回答者ごとの合言葉は、全員共通の合言葉と別のものにしてください";
+        seen.add(c);
+      }
+      formsProtected = !!accessCode || codes.length > 0;
       formsPort = port;
       return formsStatus();
     },

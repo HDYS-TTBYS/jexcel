@@ -1107,6 +1107,8 @@ fn xlsx_chart_caches_are_rebuilt_from_the_filled_cells() {
             "<c:chartSpace xmlns:c=\"http://schemas.openxmlformats.org/drawingml/2006/chart\"><c:chart><c:plotArea><c:barChart><c:ser>",
             "<c:cat><c:strRef><c:f>明細!$A$3:$A$5</c:f><c:strCache><c:ptCount val=\"3\"/><c:pt idx=\"0\"><c:v>古い</c:v></c:pt></c:strCache></c:strRef></c:cat>",
             "<c:val><c:numRef><c:f>明細!$B$3:$B$5</c:f><c:numCache><c:formatCode>General</c:formatCode><c:ptCount val=\"3\"/><c:pt idx=\"0\"><c:v>999</c:v></c:pt></c:numCache></c:numRef></c:val>",
+            // 複数の領域（領域の順につなげる。2 つ目は総合計の 1 つの参照）
+            "<c:cat><c:strRef><c:f>(明細!$A$3:$A$5,明細!$A$6)</c:f><c:strCache><c:ptCount val=\"4\"/></c:strCache></c:strRef></c:cat>",
             // 2 次元の範囲は触らない
             "<c:val><c:numRef><c:f>明細!$A$3:$B$5</c:f><c:numCache><c:ptCount val=\"1\"/><c:pt idx=\"0\"><c:v>7</c:v></c:pt></c:numCache></c:numRef></c:val>",
             "</c:ser></c:barChart></c:plotArea></c:chart></c:chartSpace>"
@@ -1165,12 +1167,28 @@ fn xlsx_chart_caches_are_rebuilt_from_the_filled_cells() {
     );
     // 数値は数値のセルだけ。formatCode は残る
     assert_eq!(
-        points(caches[1]),
+        points(caches[2]),
         ("7".to_string(), owned(&[("0", "3"), ("4", "1")]))
     );
-    assert!(texts_of(caches[1], "formatCode") == ["General"]);
+    assert!(texts_of(caches[2], "formatCode") == ["General"]);
     // 2 次元の範囲のキャッシュは触らない
-    assert_eq!(points(caches[2]), ("1".to_string(), owned(&[("0", "7")])));
+    assert_eq!(points(caches[3]), ("1".to_string(), owned(&[("0", "7")])));
+    // 複数の領域: 3〜9 行目の 7 点に、総合計（10 行目）の 1 点が続く
+    assert_eq!(
+        points(caches[1]),
+        (
+            "8".to_string(),
+            owned(&[
+                ("0", "ねじ"),
+                ("1", "a"),
+                ("2", "b"),
+                ("3", "小計"),
+                ("4", "板"),
+                ("6", "小計"),
+                ("7", "総合計")
+            ])
+        )
+    );
 }
 
 #[test]
