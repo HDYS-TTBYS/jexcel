@@ -1153,10 +1153,21 @@ fn shift_sheet_refs(f: &str, moved: &Moved, skip: Option<&str>) -> String {
                     .collect();
                 if mapped.iter().all(|m| *m == mapped[0]) {
                     out.push_str(&mapped[0]);
+                } else if is_aggregate_argument(&chars, start, end) {
+                    // 集計関数の引数なら、シートごとの参照に分ける（`SUM(A:C!B3)` → `SUM(A!B3,明細!B4,C!B3)`）。
+                    // 3D 参照そのものはシートごとに違うずれ方を表せないため。集計は引数の順に関わらず同じ結果になる
+                    // 3D 参照の先頭（シート名）はすでに出力してあるので、取り消して書き直す
+                    out.truncate(out.len() - chars[start..=bang].iter().collect::<String>().len());
+                    let parts: Vec<String> = moved.order[p.min(q)..=p.max(q)]
+                        .iter()
+                        .zip(&mapped)
+                        .map(|(n, m)| format!("{}!{m}", quote_sheet(n)))
+                        .collect();
+                    out.push_str(&parts.join(","));
                 } else {
                     let whole: String = chars[start..end].iter().collect();
                     moved.fail(format!(
-                        "{whole} は、範囲内のシートで行のずれ方が違うため、ずらせません（行ループのあるシートを 3D 参照に含めないでください）"
+                        "{whole} は、範囲内のシートで行のずれ方が違うため、ずらせません（集計関数（SUM など）の引数ならシートごとに分けられますが、ここでは分けられません。行ループのあるシートを 3D 参照に含めないでください）"
                     ));
                     out.extend(&chars[i..end]);
                 }
@@ -1176,6 +1187,63 @@ fn shift_sheet_refs(f: &str, moved: &Moved, skip: Option<&str>) -> String {
         i = end;
     }
     out
+}
+
+/// 集計関数の引数にそのまま書かれた参照か（`SUM(A:C!B3)`・`SUM(1, A:C!B3)`）。
+/// 集計関数は、引数をシートごとの参照に分けても結果が同じ。`start..end` が参照の範囲。
+fn is_aggregate_argument(chars: &[char], start: usize, end: usize) -> bool {
+    const AGGREGATES: [&str; 12] = [
+        "SUM", "AVERAGE", "COUNT", "COUNTA", "MAX", "MIN", "PRODUCT", "STDEV", "STDEV.S",
+        "STDEV.P", "VAR", "VAR.S",
+    ];
+    let before = chars[..start].iter().rposition(|c| !c.is_whitespace());
+    let after = chars[end..].iter().position(|c| !c.is_whitespace());
+    let (Some(b), Some(a)) = (before, after) else {
+        return false;
+    };
+    if !matches!(chars[b], '(' | ',') || !matches!(chars[end + a], ')' | ',') {
+        return false;
+    }
+    // 外側の `(` を探し（文字列リテラルの中の括弧は数えない）、その前の関数名を読む
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut open = None;
+    for k in (0..start).rev() {
+        match chars[k] {
+            '"' => in_str = !in_str,
+            ')' if !in_str => depth += 1,
+            '(' if !in_str => {
+                if depth == 0 {
+                    open = Some(k);
+                    break;
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+    }
+    let Some(open) = open else { return false };
+    let name: String = chars[..open]
+        .iter()
+        .rev()
+        .take_while(|c| c.is_ascii_alphanumeric() || **c == '.' || **c == '_')
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    AGGREGATES.iter().any(|f| f.eq_ignore_ascii_case(&name))
+}
+
+/// 数式に書くシート名（名前に空白や記号があれば `'` で囲み、中の `'` は `''` にする）。
+fn quote_sheet(name: &str) -> String {
+    let plain = !name.is_empty()
+        && !name.starts_with(|c: char| c.is_ascii_digit())
+        && name.chars().all(|c| c.is_alphanumeric() || c == '_');
+    if plain {
+        name.to_string()
+    } else {
+        format!("'{}'", name.replace('\'', "''"))
+    }
 }
 
 /// 3D 参照の 2 つ目のシート名（`from` から）のあとの `!` の位置。
@@ -2573,10 +2641,19 @@ mod tests {
         // ずれない位置（ループより前）の参照は、どの範囲でも同じなのでそのまま
         assert_eq!(s("SUM(A:D!A2)"), "SUM(A:D!A2)");
         assert_eq!(moved.error.borrow().as_deref(), None);
-        // 動いていないシートを含む範囲で、ずれる行を指すと、結果がそろわない → エラー
-        assert_eq!(s("SUM(A:C!A6)"), "SUM(A:C!A6)");
+        // 動いていないシートを含む範囲で、ずれる行を指すと、結果がそろわない。
+        // 集計関数の引数なら、シートごとの参照に分ける（シート名は必要なら引用符で囲む）
+        assert_eq!(s("SUM(A:C!A6)"), "SUM(A!A6,B!A8,C!A8)");
+        assert_eq!(s("MAX(1,B:D!A6:A7 )"), "MAX(1,B!A8:A9,C!A8:A9,D!A6:A7 )");
+        assert_eq!(moved.error.borrow().as_deref(), None);
+        // 集計関数の引数でなければ、黙って壊さずエラー
+        assert_eq!(s("A:C!A6+1"), "A:C!A6+1");
         let e = moved.error.borrow().clone().unwrap();
         assert!(e.contains("A:C!A6") && e.contains("3D 参照"), "{e}");
+        assert_eq!(quote_sheet("Sheet 5"), "'Sheet 5'");
+        assert_eq!(quote_sheet("it's"), "'it''s'");
+        assert_eq!(quote_sheet("5月"), "'5月'");
+        assert_eq!(quote_sheet("明細"), "明細");
         // 引用符つき（空白のある名前）・文字列リテラルの中・普通の参照
         let mut m2 = Moved::new(order);
         m2.insert("Sheet 5".to_string(), moves(&[(5, 3)], 12).0);

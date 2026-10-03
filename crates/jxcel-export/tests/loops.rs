@@ -1214,9 +1214,34 @@ fn xlsx_three_d_references_are_shifted_or_rejected() {
         formulas_of(&out, "xl/worksheets/sheet2.xml")["A9"],
         "SUM(明細:Sheet2!B1)"
     );
-    // ずれる行を指すと、シートごとに結果が違うのでエラー（黙って壊さない）
-    let e = with_formula("SUM(明細:Sheet2!B6)").unwrap_err();
-    assert!(e.to_string().contains("3D 参照"), "{e}");
+    // ずれる行を指すと、シートごとに結果が違う。集計関数の引数なら、シートごとの参照に分ける
+    let split = |f: &str| {
+        let out = with_formula(f).unwrap_or_else(|e| panic!("{e}"));
+        formulas_of(&out, "xl/worksheets/sheet2.xml")["A9"].clone()
+    };
+    assert_eq!(split("SUM(明細:Sheet2!B6)"), "SUM(明細!B10,Sheet2!B6)");
+    assert_eq!(
+        split("SUM(1, 明細:Sheet2!B6 )"),
+        "SUM(1, 明細!B10,Sheet2!B6 )"
+    );
+    assert_eq!(
+        split("AVERAGE(Sheet2:明細!B3:B6)"),
+        "AVERAGE(明細!B3:B10,Sheet2!B3:B6)"
+    );
+    assert_eq!(
+        split("MAX(IF(1,SUM(明細:Sheet2!B6)))"),
+        "MAX(IF(1,SUM(明細!B10,Sheet2!B6)))"
+    );
+    // 集計関数でない・引数そのものでない場合は、黙って壊さずエラー
+    for f in [
+        "明細:Sheet2!B6+1",
+        "INDEX(明細:Sheet2!B3:B6,1)",
+        "SUM(明細:Sheet2!B6*2)",
+        "SUM(1,\"(\")+INDEX(明細:Sheet2!B6,1)",
+    ] {
+        let e = with_formula(f).unwrap_err();
+        assert!(e.to_string().contains("3D 参照"), "{f}: {e}");
+    }
     // 範囲が動いたシートだけ（明細〜明細）なら、普通の参照と同じにずらす
     let out = with_formula("SUM(明細:明細!B6)").unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(
