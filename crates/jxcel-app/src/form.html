@@ -18,6 +18,7 @@
   input[type=checkbox] { width: auto; margin-right: 8px; transform: scale(1.3); }
   label.check { font-weight: 600; display: flex; align-items: center; }
   button { margin-top: 20px; width: 100%; padding: 10px; font: inherit; font-weight: 600; color: #fff; background: var(--accent); border: 0; border-radius: 8px; cursor: pointer; }
+  button.secondary { margin-top: 10px; background: transparent; color: var(--accent); border: 1px solid var(--accent); }
   button:disabled { opacity: .5; cursor: default; }
   .msg { margin-top: 14px; white-space: pre-wrap; }
   .msg.err { color: var(--err); }
@@ -90,6 +91,55 @@ function build(def) {
   btn.type = "submit";
   btn.textContent = "送信";
   form.append(btn);
+  const fresh = document.createElement("button");
+  fresh.type = "button";
+  fresh.className = "secondary";
+  fresh.id = "fresh";
+  fresh.hidden = true;
+  fresh.textContent = "新しい回答として送る";
+  fresh.onclick = startNew;
+  form.append(fresh);
+}
+
+// 送信済みの回答の修正。サーバーが送信のたびに渡す修正用トークンをこの端末に覚え、
+// 開き直したときも同じ回答を直せる（トークンを知らない人は直せない。配信を止めると無効になる）
+let editToken = "";
+try { editToken = localStorage.getItem("jxcel-edit:" + base) || ""; } catch (_) {}
+function keepEdit(t) {
+  editToken = t || "";
+  try { editToken ? localStorage.setItem("jxcel-edit:" + base, editToken) : localStorage.removeItem("jxcel-edit:" + base); } catch (_) {}
+}
+function setMode() {
+  const editing = !!editToken;
+  $("form").querySelector("button[type=submit]").textContent = editing ? "修正を送信" : "送信";
+  $("fresh").hidden = !editing;
+}
+function fill(values) {
+  for (const f of fields) {
+    const el = inputs[f.id], v = values[f.id];
+    if (f.kind === "bool") { el.checked = v === true; continue; }
+    if (v === undefined || v === null) { el.value = ""; continue; }
+    // 日時は書かれたままの時刻（オフセットは付け直す）。入力欄は分まで
+    el.value = f.kind === "dateTime" ? String(v).slice(0, 16) : String(v);
+  }
+}
+function startNew() {
+  keepEdit("");
+  $("form").reset();
+  setMode();
+  msg("");
+}
+async function loadAnswer() {
+  if (!editToken) return;
+  try {
+    const res = await fetch(base + "/answer", { headers: headers({ "x-jxcel-edit": editToken }) });
+    const body = await res.json().catch(() => ({}));
+    if (res.ok) {
+      fill(body.values || {});
+      setMode();
+      msg("送信済みの回答です。直す場合は内容を変えて「修正を送信」を押してください。", "");
+    } else if (res.status === 404) { keepEdit(""); setMode(); }
+  } catch (_) {}
 }
 
 function collect() {
@@ -121,12 +171,28 @@ async function onSubmit(e) {
   btn.disabled = true;
   msg("送信中…");
   try {
-    const res = await fetch(base + "/submit", { method: "POST", headers: headers({ "content-type": "application/json" }), body: JSON.stringify({ values }) });
+    const editing = !!editToken;
+    const res = await fetch(base + (editing ? "/edit" : "/submit"), {
+      method: "POST",
+      headers: headers(Object.assign({ "content-type": "application/json" }, editing ? { "x-jxcel-edit": editToken } : {})),
+      body: JSON.stringify({ values }),
+    });
     const body = await res.json().catch(() => ({}));
     if (res.status === 401 && body.needCode) { code = ""; return askCode("合言葉が変わりました。もう一度入力してください"); }
+    if (editing && res.status === 404) {
+      // 配信が再開された・回答が表から消えた。新しい回答として送り直してもらう
+      startNew();
+      throw new Error("この回答はもう修正できません。内容を確かめて、新しい回答として送信してください。");
+    }
     if (!res.ok) throw new Error(body.error || "送信に失敗しました（" + res.status + "）");
-    msg("送信しました。ありがとうございました。", "ok");
-    $("form").reset();
+    if (editing) {
+      msg("修正を送信しました。", "ok");
+    } else {
+      // 続けて直せるように、内容は残したまま修正の状態にする
+      if (body.editToken) { keepEdit(body.editToken); setMode(); }
+      else $("form").reset();
+      msg(body.editToken ? "送信しました。ありがとうございました。\n内容を直すときは、そのまま変えて「修正を送信」を押してください。" : "送信しました。ありがとうございました。", "ok");
+    }
   } catch (err) {
     msg(err.message, "err");
   } finally {
@@ -175,6 +241,8 @@ async function load() {
     if (!res.ok) throw new Error(body.error || "フォームを読み込めません（" + res.status + "）");
     $("form").onsubmit = onSubmit;
     build(body);
+    setMode();
+    loadAnswer();
   } catch (err) { $("title").textContent = "フォームを開けません"; msg(err.message, "err"); }
 }
 load();

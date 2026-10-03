@@ -27,6 +27,10 @@ const WORKERS: usize = 4;
 
 /// 合言葉を渡すリクエストヘッダ（URL に載せない）。
 const CODE_HEADER: &str = "X-Jxcel-Code";
+/// 回答の修正用トークン（送信の応答で渡す）を送るヘッダ
+const EDIT_HEADER: &str = "X-Jxcel-Edit";
+/// 修正用トークンを覚えておく回答の数（超えたら新しい回答には渡さない）
+const MAX_EDITS: usize = 100_000;
 /// 合言葉の長さ（バイト数＝文字数）の範囲
 const CODE_LEN: std::ops::RangeInclusive<usize> = 4..=64;
 /// 1 つの端末（IP アドレス）からの失敗（合言葉の間違い・存在しない URL）がこの回数に達すると、窓の間ロックする
@@ -216,9 +220,9 @@ impl Session {
         })
     }
 
-    /// フォームの回答を、対象の表の末尾に 1 行として追加する。
+    /// フォームの回答を、対象の表の末尾に 1 行として追加し、その行の ID を返す。
     /// 型に合わない値・必須の欠落・フォームにない列は拒否し、そのときは何も追加しない。
-    pub fn submit_form(&mut self, id: &str, values: &Map<String, Value>) -> Result<()> {
+    pub fn submit_form(&mut self, id: &str, values: &Map<String, Value>) -> Result<String> {
         let reg = self.registry.clone();
         let d = self.doc()?;
         let form = d
@@ -233,7 +237,95 @@ impl Session {
             coerce(&form, schema, values, &reg)?
         };
         let schema = crate::find_schema(&mut d.file, &form.sheet, &form.schema)?;
-        schema.rows.push(Row::new(cells));
+        let row = Row::new(cells);
+        let row_id = row.id.clone();
+        schema.rows.push(row);
+        d.dirty = true;
+        Ok(row_id)
+    }
+
+    /// 回答（行）の、フォームの入力欄になっている列の現在の値（列 ID → 値）。値のない列は含まない。
+    /// 行が無い（削除された・復元で消えた）ときは `NotFound`。
+    pub fn form_answer(&self, id: &str, row_id: &str) -> Result<Map<String, Value>> {
+        let d = self.doc.as_ref().ok_or(Error::NoFile)?;
+        let form = d
+            .file
+            .forms
+            .iter()
+            .find(|f| f.id == id)
+            .ok_or(Error::NotFound("フォーム"))?;
+        let schema = schema_of(&d.file, form)?;
+        let row = schema
+            .rows
+            .iter()
+            .find(|r| r.id == row_id)
+            .ok_or(Error::NotFound("回答"))?;
+        let mut out = Map::new();
+        for cid in &form.columns {
+            let fillable = schema
+                .columns
+                .iter()
+                .find(|c| &c.id == cid)
+                .is_some_and(|c| field_kind(c).is_some());
+            if let (true, Some(v)) = (fillable, row.cells.get(cid)) {
+                out.insert(cid.clone(), v.clone());
+            }
+        }
+        Ok(out)
+    }
+
+    /// 送信済みの回答（行）を、フォームの入力欄の分だけ書き換える（入力欄にない列は触らない）。
+    /// 検証は送信と同じ。値が空の欄はその列の値を消す。拒否したときは何も変えない。
+    pub fn edit_form_answer(
+        &mut self,
+        id: &str,
+        row_id: &str,
+        values: &Map<String, Value>,
+    ) -> Result<()> {
+        let reg = self.registry.clone();
+        let d = self.doc()?;
+        let form = d
+            .file
+            .forms
+            .iter()
+            .find(|f| f.id == id)
+            .ok_or(Error::NotFound("フォーム"))?
+            .clone();
+        let (cells, fillable) = {
+            let schema = schema_of(&d.file, &form)?;
+            if !schema.rows.iter().any(|r| r.id == row_id) {
+                return Err(Error::NotFound("回答"));
+            }
+            let fillable: Vec<String> = form
+                .columns
+                .iter()
+                .filter(|cid| {
+                    schema
+                        .columns
+                        .iter()
+                        .find(|c| &c.id == *cid)
+                        .is_some_and(|c| field_kind(c).is_some())
+                })
+                .cloned()
+                .collect();
+            (coerce(&form, schema, values, &reg)?, fillable)
+        };
+        let schema = crate::find_schema(&mut d.file, &form.sheet, &form.schema)?;
+        let row = schema
+            .rows
+            .iter_mut()
+            .find(|r| r.id == row_id)
+            .ok_or(Error::NotFound("回答"))?;
+        for cid in fillable {
+            match cells.get(&cid) {
+                Some(v) => {
+                    row.cells.insert(cid, v.clone());
+                }
+                None => {
+                    row.cells.remove(&cid);
+                }
+            }
+        }
         d.dirty = true;
         Ok(())
     }
@@ -470,6 +562,8 @@ struct Shared {
     limiter: Mutex<Limiter>,
     tokens: Mutex<Tokens>,
     submitted: Mutex<HashMap<String, u32>>,
+    /// 修正用のトークン → (フォーム ID, 回答の行 ID)。メモリだけ（配信を止めると無効になる）
+    edits: Mutex<HashMap<String, (String, String)>>,
     stop: AtomicBool,
     /// 回答を受け付けて表が変わったときに呼ぶ（UI の再描画用）
     on_change: Box<dyn Fn() + Send + Sync>,
@@ -521,6 +615,7 @@ impl FormServer {
             limiter: Mutex::default(),
             tokens: Mutex::default(),
             submitted: Mutex::default(),
+            edits: Mutex::default(),
             stop: AtomicBool::new(false),
             on_change: Box::new(on_change),
         });
@@ -679,6 +774,31 @@ fn error_status(e: &Error) -> u16 {
     }
 }
 
+/// リクエストの本文（`{"values": {…}}`）から値を読む。エラーは (状態, メッセージ)。
+fn read_values(
+    req: &mut tiny_http::Request,
+) -> std::result::Result<Map<String, Value>, (u16, &'static str)> {
+    let mut body = Vec::new();
+    if req
+        .as_reader()
+        .take(MAX_BODY + 1)
+        .read_to_end(&mut body)
+        .is_err()
+        || body.len() as u64 > MAX_BODY
+    {
+        return Err((413, "送信内容が大きすぎます"));
+    }
+    match serde_json::from_slice::<Value>(&body)
+        .ok()
+        .and_then(|v| match v.get("values") {
+            Some(Value::Object(m)) => Some(m.clone()),
+            _ => None,
+        }) {
+        Some(m) => Ok(m),
+        None => Err((400, "送信内容が正しくありません")),
+    }
+}
+
 fn handle(shared: &Shared, mut req: tiny_http::Request) {
     let url = req.url().to_string();
     let path = url.split('?').next().unwrap_or("").to_string();
@@ -692,6 +812,11 @@ fn handle(shared: &Shared, mut req: tiny_http::Request) {
         .headers()
         .iter()
         .find(|h| h.field.equiv(CODE_HEADER))
+        .map(|h| h.value.as_str().to_string());
+    let edit_token = req
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv(EDIT_HEADER))
         .map(|h| h.value.as_str().to_string());
 
     // フォームの URL への失敗が続いた端末は、しばらく何も受け付けない
@@ -721,6 +846,23 @@ fn handle(shared: &Shared, mut req: tiny_http::Request) {
             }
             None => Some(json!({"error": "合言葉を入力してください", "needCode": true})),
         }
+    };
+
+    // 修正用トークンから、このフォームの回答の行 ID を引く。知らない・別のフォームのものは失敗として数える
+    let edit_row = |form: &str| -> Option<String> {
+        let found = edit_token.as_deref().and_then(|t| {
+            shared
+                .edits
+                .lock()
+                .unwrap()
+                .get(t)
+                .filter(|(f, _)| f == form)
+                .map(|(_, r)| r.clone())
+        });
+        if found.is_none() && edit_token.is_some() {
+            shared.limiter.lock().unwrap().fail(ip, Instant::now());
+        }
+        found
     };
 
     match (&method, parts.as_slice()) {
@@ -762,26 +904,9 @@ fn handle(shared: &Shared, mut req: tiny_http::Request) {
             if let Err(wait) = sent {
                 return respond_limited(req, wait, "送信が多すぎます");
             }
-            let mut body = Vec::new();
-            if req
-                .as_reader()
-                .take(MAX_BODY + 1)
-                .read_to_end(&mut body)
-                .is_err()
-                || body.len() as u64 > MAX_BODY
-            {
-                return respond_json(req, 413, json!({"error": "送信内容が大きすぎます"}));
-            }
-            let values = match serde_json::from_slice::<Value>(&body).ok().and_then(|v| {
-                match v.get("values") {
-                    Some(Value::Object(m)) => Some(m.clone()),
-                    _ => None,
-                }
-            }) {
-                Some(m) => m,
-                None => {
-                    return respond_json(req, 400, json!({"error": "送信内容が正しくありません"}))
-                }
+            let values = match read_values(&mut req) {
+                Ok(m) => m,
+                Err((status, m)) => return respond_json(req, status, json!({"error": m})),
             };
             let result = shared
                 .session
@@ -789,10 +914,82 @@ fn handle(shared: &Shared, mut req: tiny_http::Request) {
                 .map_err(|_| Error::Invalid("内部状態が壊れています".into()))
                 .and_then(|mut s| s.submit_form(&id, &values));
             match result {
+                Ok(row_id) => {
+                    *shared
+                        .submitted
+                        .lock()
+                        .unwrap()
+                        .entry(id.clone())
+                        .or_insert(0) += 1;
+                    // 回答者が後から直せるように、この回答だけを指す修正用トークンを渡す
+                    let mut edits = shared.edits.lock().unwrap();
+                    let edit = (edits.len() < MAX_EDITS).then(|| {
+                        let t = random_token();
+                        edits.insert(t.clone(), (id, row_id));
+                        t
+                    });
+                    drop(edits);
+                    (shared.on_change)();
+                    respond_json(req, 200, json!({"ok": true, "editToken": edit}))
+                }
+                Err(e) => respond_json(req, error_status(&e), json!({"error": e.to_string()})),
+            }
+        }
+        // 送信済みの回答の現在の値（修正画面の初期値）
+        (tiny_http::Method::Get, ["f", token, "answer"]) => {
+            let Some(id) = form_id(token) else {
+                return respond_json(req, 404, json!({"error": "フォームが見つかりません"}));
+            };
+            if let Some(body) = denied() {
+                return respond_json(req, 401, body);
+            }
+            let Some(row_id) = edit_row(&id) else {
+                return respond_json(req, 404, json!({"error": "修正できる回答が見つかりません"}));
+            };
+            let found = shared
+                .session
+                .lock()
+                .map_err(|_| Error::Invalid("内部状態が壊れています".into()))
+                .and_then(|s| s.form_answer(&id, &row_id));
+            match found {
+                Ok(values) => respond_json(req, 200, json!({"values": values})),
+                Err(Error::NotFound(_)) => {
+                    respond_json(req, 404, json!({"error": "修正できる回答が見つかりません"}))
+                }
+                Err(e) => respond_json(req, error_status(&e), json!({"error": e.to_string()})),
+            }
+        }
+        // 送信済みの回答の修正
+        (tiny_http::Method::Post, ["f", token, "edit"]) => {
+            let Some(id) = form_id(token) else {
+                return respond_json(req, 404, json!({"error": "フォームが見つかりません"}));
+            };
+            if let Some(body) = denied() {
+                return respond_json(req, 401, body);
+            }
+            let Some(row_id) = edit_row(&id) else {
+                return respond_json(req, 404, json!({"error": "修正できる回答が見つかりません"}));
+            };
+            let sent = shared.limiter.lock().unwrap().submit(ip, Instant::now());
+            if let Err(wait) = sent {
+                return respond_limited(req, wait, "送信が多すぎます");
+            }
+            let values = match read_values(&mut req) {
+                Ok(m) => m,
+                Err((status, m)) => return respond_json(req, status, json!({"error": m})),
+            };
+            let result = shared
+                .session
+                .lock()
+                .map_err(|_| Error::Invalid("内部状態が壊れています".into()))
+                .and_then(|mut s| s.edit_form_answer(&id, &row_id, &values));
+            match result {
                 Ok(()) => {
-                    *shared.submitted.lock().unwrap().entry(id).or_insert(0) += 1;
                     (shared.on_change)();
                     respond_json(req, 200, json!({"ok": true}))
+                }
+                Err(Error::NotFound(_)) => {
+                    respond_json(req, 404, json!({"error": "修正できる回答が見つかりません"}))
                 }
                 Err(e) => respond_json(req, error_status(&e), json!({"error": e.to_string()})),
             }
@@ -1232,6 +1429,265 @@ mod tests {
         assert!(head.to_lowercase().contains("retry-after"), "{head}");
         assert_eq!(http_with(port, "POST", &submit, Some(body), &ok).0, 429);
         assert_eq!(rows(&shared.lock().unwrap(), &schema).len(), 1);
+    }
+
+    #[test]
+    fn edit_form_answer_rewrites_only_the_form_columns_of_that_row() {
+        let (mut s, sheet, schema) = session();
+        // フォームは名前・数量だけ。単価はフォームにない列
+        let form = s.add_form(&sheet, &schema, "受付").unwrap().file.forms[0].clone();
+        s.update_form(
+            &form.id,
+            "受付",
+            &sheet,
+            &schema,
+            vec!["name".into(), "qty".into()],
+            "",
+        )
+        .unwrap();
+        let a = s
+            .submit_form(&form.id, &vals(json!({"name": "山田", "qty": "3"})))
+            .unwrap();
+        let b = s
+            .submit_form(&form.id, &vals(json!({"name": "佐藤", "qty": "5"})))
+            .unwrap();
+        // 管理者がフォームにない列を直接入れた
+        let col = s.current().unwrap().file.sheets[0]
+            .schemas
+            .last()
+            .unwrap()
+            .columns[2]
+            .id
+            .clone();
+        assert_eq!(col, "price");
+        {
+            let d = s.doc().unwrap();
+            let sch = crate::find_schema(&mut d.file, &sheet, &schema).unwrap();
+            sch.rows
+                .iter_mut()
+                .find(|r| r.id == a)
+                .unwrap()
+                .cells
+                .insert("price".into(), json!("9.99"));
+        }
+        assert_eq!(
+            s.form_answer(&form.id, &a).unwrap(),
+            vals(json!({"name": "山田", "qty": 3}))
+        );
+
+        // 修正: 数量を変え、名前は同じ。他の行・フォームにない列は変わらない
+        s.edit_form_answer(&form.id, &a, &vals(json!({"name": "山田", "qty": "4"})))
+            .unwrap();
+        let r = rows(&s, &schema);
+        assert_eq!(r[0]["qty"], json!(4));
+        assert_eq!(r[0]["price"], json!("9.99"));
+        assert_eq!(r[1]["qty"], json!(5));
+        // 空の欄はその列の値を消す
+        s.edit_form_answer(&form.id, &a, &vals(json!({"name": "山田", "qty": ""})))
+            .unwrap();
+        assert!(!rows(&s, &schema)[0].contains_key("qty"));
+
+        // 不正な値・必須の欠落・フォームにない列は拒否して、何も変えない
+        let before = rows(&s, &schema);
+        for bad in [
+            json!({"name": "山田", "qty": "x"}),
+            json!({"name": ""}),
+            json!({"name": "山田", "price": "1"}),
+        ] {
+            assert!(s.edit_form_answer(&form.id, &a, &vals(bad)).is_err());
+        }
+        assert_eq!(rows(&s, &schema), before);
+
+        // 行が消えた回答・知らないフォームは NotFound
+        {
+            let d = s.doc().unwrap();
+            let sch = crate::find_schema(&mut d.file, &sheet, &schema).unwrap();
+            sch.rows.retain(|r| r.id != b);
+        }
+        assert!(matches!(
+            s.edit_form_answer(&form.id, &b, &vals(json!({"name": "x"}))),
+            Err(Error::NotFound(_))
+        ));
+        assert!(matches!(
+            s.form_answer(&form.id, &b),
+            Err(Error::NotFound(_))
+        ));
+        assert!(matches!(s.form_answer("nope", &a), Err(Error::NotFound(_))));
+    }
+
+    #[test]
+    fn answers_can_be_edited_over_http_with_the_edit_token() {
+        let (mut s, sheet, schema) = session();
+        s.add_form(&sheet, &schema, "受付").unwrap();
+        let shared = Arc::new(Mutex::new(s));
+        let changes = Arc::new(AtomicBool::new(false));
+        let c2 = changes.clone();
+        let server = FormServer::start(shared.clone(), 0, None, move || {
+            c2.store(true, Ordering::Relaxed)
+        })
+        .unwrap();
+        let port = server.port();
+        let token = server.status().urls[0]
+            .url
+            .rsplit('/')
+            .next()
+            .unwrap()
+            .to_string();
+        let (submit, edit, answer) = (
+            format!("/f/{token}/submit"),
+            format!("/f/{token}/edit"),
+            format!("/f/{token}/answer"),
+        );
+        let (code, _, b) = http(
+            port,
+            "POST",
+            &submit,
+            Some(r#"{"values":{"name":"山田","qty":"2"}}"#),
+        );
+        assert_eq!(code, 200, "{b}");
+        let et = serde_json::from_str::<Value>(&b).unwrap()["editToken"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(et.len(), 32);
+        let h = [(EDIT_HEADER, et.as_str())];
+
+        // 現在の回答を読める
+        let (code, _, b) = http_with(port, "GET", &answer, None, &h);
+        assert_eq!(code, 200, "{b}");
+        let v: Value = serde_json::from_str(&b).unwrap();
+        assert_eq!(v["values"]["name"], json!("山田"));
+        assert_eq!(v["values"]["qty"], json!(2));
+
+        // 修正できる。行は増えず、表の値が変わり、変更が通知される
+        changes.store(false, Ordering::Relaxed);
+        let (code, _, b) = http_with(
+            port,
+            "POST",
+            &edit,
+            Some(r#"{"values":{"name":"山田太郎","qty":"7"}}"#),
+            &h,
+        );
+        assert_eq!(code, 200, "{b}");
+        let r = rows(&shared.lock().unwrap(), &schema);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0]["name"], json!("山田太郎"));
+        assert_eq!(r[0]["qty"], json!(7));
+        assert!(changes.load(Ordering::Relaxed));
+
+        // 検証は送信と同じ。不正なら 400 で変わらない
+        let (code, _, _) = http_with(
+            port,
+            "POST",
+            &edit,
+            Some(r#"{"values":{"name":"山田","qty":"x"}}"#),
+            &h,
+        );
+        assert_eq!(code, 400);
+        assert_eq!(
+            rows(&shared.lock().unwrap(), &schema)[0]["name"],
+            json!("山田太郎")
+        );
+
+        // 別の回答者（トークンなし・違うトークン）は修正も閲覧もできない
+        let body = r#"{"values":{"name":"乗っ取り"}}"#;
+        assert_eq!(http(port, "POST", &edit, Some(body)).0, 404);
+        assert_eq!(http(port, "GET", &answer, None).0, 404);
+        let bad = [(EDIT_HEADER, "0".repeat(32))];
+        let bad = [(bad[0].0, bad[0].1.as_str())];
+        assert_eq!(http_with(port, "POST", &edit, Some(body), &bad).0, 404);
+        assert_eq!(
+            rows(&shared.lock().unwrap(), &schema)[0]["name"],
+            json!("山田太郎")
+        );
+
+        // 回答が表から消えたら、修正はできない
+        {
+            let mut guard = shared.lock().unwrap();
+            let d = guard.doc().unwrap();
+            let (sheet, schema) = (
+                d.file.sheets[0].id.clone(),
+                d.file.sheets[0].schemas.last().unwrap().id.clone(),
+            );
+            crate::find_schema(&mut d.file, &sheet, &schema)
+                .unwrap()
+                .rows
+                .clear();
+        }
+        let (code, _, _) = http_with(port, "POST", &edit, Some(body), &h);
+        assert_eq!(code, 404);
+    }
+
+    #[test]
+    fn edit_tokens_are_per_form_and_need_the_access_code() {
+        let (mut s, sheet, schema) = session();
+        s.add_form(&sheet, &schema, "受付").unwrap();
+        s.add_form(&sheet, &schema, "受付2").unwrap();
+        let shared = Arc::new(Mutex::new(s));
+        let server =
+            FormServer::start(shared.clone(), 0, Some("himitsu-1234".into()), || {}).unwrap();
+        let port = server.port();
+        let tokens: Vec<String> = server
+            .status()
+            .urls
+            .iter()
+            .map(|u| u.url.rsplit('/').next().unwrap().to_string())
+            .collect();
+        let ok = [(CODE_HEADER, "himitsu-1234")];
+        let (_, _, b) = http_with(
+            port,
+            "POST",
+            &format!("/f/{}/submit", tokens[0]),
+            Some(r#"{"values":{"name":"山田"}}"#),
+            &ok,
+        );
+        let et = serde_json::from_str::<Value>(&b).unwrap()["editToken"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let both = [(CODE_HEADER, "himitsu-1234"), (EDIT_HEADER, et.as_str())];
+        let body = r#"{"values":{"name":"変更"}}"#;
+        // 合言葉がなければ、修正用トークンがあっても受け付けない
+        let only_edit = [(EDIT_HEADER, et.as_str())];
+        assert_eq!(
+            http_with(
+                port,
+                "POST",
+                &format!("/f/{}/edit", tokens[0]),
+                Some(body),
+                &only_edit
+            )
+            .0,
+            401
+        );
+        // 別のフォームには使えない
+        assert_eq!(
+            http_with(
+                port,
+                "POST",
+                &format!("/f/{}/edit", tokens[1]),
+                Some(body),
+                &both
+            )
+            .0,
+            404
+        );
+        // 元のフォームでは通る
+        assert_eq!(
+            http_with(
+                port,
+                "POST",
+                &format!("/f/{}/edit", tokens[0]),
+                Some(body),
+                &both
+            )
+            .0,
+            200
+        );
+        assert_eq!(
+            rows(&shared.lock().unwrap(), &schema)[0]["name"],
+            json!("変更")
+        );
     }
 
     #[test]

@@ -52,14 +52,14 @@ async function runFormPage(p, offset) {
     check("入力の種類", JSON.stringify(types) === JSON.stringify(["text", "number", "text", "select-one", "date", "datetime-local", "checkbox"]), JSON.stringify(types));
 
     // 必須を空のまま送信 → サーバーのメッセージが出る
-    await p.locator("form button").click();
+    await p.locator("form button[type=submit]").click();
     await expect(p.locator("#msg")).toContainText("氏名 は必須です");
     check("エラーは赤", ((await p.locator("#msg").getAttribute("class")) || "").includes("err"));
 
     // 型に合わない値
     await p.locator("label", { hasText: "氏名" }).locator("input").fill("山田 太郎");
     await p.locator("label", { hasText: "予算" }).locator("input").fill("abc");
-    await p.locator("form button").click();
+    await p.locator("form button[type=submit]").click();
     await expect(p.locator("#msg")).toContainText("予算");
     check("拒否された回答は表に入らない", !out.includes("ROWS"));
 
@@ -70,7 +70,7 @@ async function runFormPage(p, offset) {
     await p.locator("label", { hasText: "来訪日" }).locator("input").fill("2026-10-02");
     await p.locator("label", { hasText: "来訪時刻" }).locator("input").fill("2026-10-02T10:30");
     await p.locator("label", { hasText: "了承済み" }).locator("input").check();
-    await p.locator("form button").click();
+    await p.locator("form button[type=submit]").click();
     await expect(p.locator("#msg")).toContainText("送信しました");
     await waitFor(() => out.includes("ROWS"), "回答の到着");
     const rows = JSON.parse(out.match(/ROWS (.*)/)[1]);
@@ -78,7 +78,24 @@ async function runFormPage(p, offset) {
     const r = rows[0];
     check("値が列の型で入る", r.name === "山田 太郎" && r.people === 4 && r.price === "12000.50" && r.kind === "法人" && r.day === "2026-10-02" && r.memo === true, JSON.stringify(r));
     check("日時は入力した時刻のまま、端末のオフセット付きで残る", r.at === `2026-10-02T10:30:00${offset}`, r.at);
-    check("送信後に入力欄が空になる", (await p.locator("label", { hasText: "氏名" }).locator("input").inputValue()) === "");
+
+    // 送信後は内容が残り、そのまま直せる（修正）
+    const field = (name) => p.locator("label", { hasText: name }).locator("input, select");
+    check("送信後も入力は残り、修正の状態になる", (await field("氏名").inputValue()) === "山田 太郎" && (await p.locator("form button[type=submit]").innerText()) === "修正を送信");
+    await field("人数").fill("5");
+    await p.locator("form button[type=submit]").click();
+    await expect(p.locator("#msg")).toContainText("修正を送信しました");
+    await waitFor(() => (out.match(/ROWS /g) || []).length >= 2, "修正の反映");
+    const edited = JSON.parse([...out.matchAll(/ROWS (.*)/g)].pop()[1]);
+    check("修正は行を増やさず、値だけ変える", edited.length === 1 && edited[0].people === 5 && edited[0].name === "山田 太郎", JSON.stringify(edited));
+    // 開き直しても、同じ回答を直せる（修正用トークンをこの端末に覚えている）
+    await p.reload();
+    await expect(p.locator("#msg")).toContainText("送信済みの回答です");
+    check("開き直すと前回の内容が入る", (await field("人数").inputValue()) === "5" && (await field("来訪時刻").inputValue()) === "2026-10-02T10:30" && (await field("了承済み").isChecked()));
+    check("修正のボタン", (await p.locator("form button[type=submit]").innerText()) === "修正を送信" && (await p.getByRole("button", { name: "新しい回答として送る" }).isVisible()));
+    // 新しい回答として送る → 空になり、送信は新しい行になる
+    await p.getByRole("button", { name: "新しい回答として送る" }).click();
+    check("新しい回答は空から始まる", (await field("氏名").inputValue()) === "" && (await p.locator("form button[type=submit]").innerText()) === "送信");
 
     // トークンが違えば、フォームの存在も分からない
     const bad = await p.goto(url.replace(/[0-9a-f]{32}$/, "0".repeat(32)));
@@ -128,7 +145,7 @@ test("フォーム配信: 合言葉が要る・間違いが続くとロックさ
     await p.locator("label", { hasText: "氏名" }).locator("input").fill("鈴木");
     await p.locator("label", { hasText: "人数" }).locator("input").fill("2");
     await p.locator("label", { hasText: "区分" }).locator("select").selectOption("個人");
-    await p.locator("form button").click();
+    await p.locator("form button[type=submit]").click();
     await expect(p.locator("#msg")).toContainText("送信しました");
     await waitFor(() => out.includes("ROWS"), "回答の到着");
 
