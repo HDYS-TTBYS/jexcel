@@ -480,6 +480,18 @@ pub struct FormUrl {
     pub url: String,
     /// 配信を始めてから受け付けた回答の数
     pub submitted: u32,
+    /// このフォームがあるファイルの名前
+    pub file: String,
+    /// アプリで別のファイルを開いたあとも、裏で配信を続けているファイルのものか（回答は自動保存される）
+    pub background: bool,
+}
+
+/// 裏で配信を続けているファイル。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackgroundFile {
+    pub name: String,
+    pub path: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -490,6 +502,8 @@ pub struct FormsStatus {
     /// 合言葉が必要か
     pub protected: bool,
     pub urls: Vec<FormUrl>,
+    /// 裏で配信を続けているファイル（`FormServer::release` の番号はこの並び）
+    pub background_files: Vec<BackgroundFile>,
 }
 
 impl FormsStatus {
@@ -499,6 +513,7 @@ impl FormsStatus {
             port: None,
             protected: false,
             urls: vec![],
+            background_files: vec![],
         }
     }
 }
@@ -578,7 +593,10 @@ fn same_code(a: &str, b: &str) -> bool {
 }
 
 struct Shared {
+    /// アプリで開いているファイル
     session: Arc<Mutex<Session>>,
+    /// 別のファイルを開いたあとも、裏で配信を続けているファイル（回答のたびに自動保存する）
+    extras: Mutex<Vec<Arc<Mutex<Session>>>>,
     /// 設定されていれば、定義の取得と回答の送信にヘッダで合言葉が要る
     access_code: Option<String>,
     /// 回答者ごとの合言葉。どれかが合えば入れて、その合言葉の持ち主として扱う（回答は 1 つの合言葉につき 1 件）
@@ -602,6 +620,60 @@ pub struct ServeOptions {
     pub access_code: Option<String>,
     /// 回答者ごとの合言葉。1 つにつき 1 人で、その人の回答は 1 件。送信後は同じ合言葉でどの端末からでも直せる
     pub respondent_codes: Vec<String>,
+}
+
+impl Shared {
+    /// 配信しているすべてのファイル。先頭がアプリで開いているファイル。
+    fn sessions(&self) -> Vec<Arc<Mutex<Session>>> {
+        let mut all = vec![self.session.clone()];
+        all.extend(self.extras.lock().unwrap().iter().cloned());
+        all
+    }
+
+    /// フォームがあるファイルと、それが裏のファイルか。
+    fn owner(&self, form_id: &str) -> Option<(Arc<Mutex<Session>>, bool)> {
+        self.sessions().into_iter().enumerate().find_map(|(i, s)| {
+            let has = s
+                .lock()
+                .map(|g| g.forms().iter().any(|f| f.id == form_id))
+                .unwrap_or(false);
+            has.then_some((s, i > 0))
+        })
+    }
+
+    fn read<R>(&self, form_id: &str, f: impl FnOnce(&Session) -> Result<R>) -> Result<R> {
+        let (s, _) = self.owner(form_id).ok_or(Error::NotFound("フォーム"))?;
+        let g = s
+            .lock()
+            .map_err(|_| Error::Invalid("内部状態が壊れています".into()))?;
+        f(&g)
+    }
+
+    /// フォームがあるファイルを書き換える。裏のファイルなら、成功したらすぐ保存する
+    /// （アプリの画面からは保存できないので、回答を失わないように）。
+    fn write<R>(&self, form_id: &str, f: impl FnOnce(&mut Session) -> Result<R>) -> Result<R> {
+        let (s, background) = self.owner(form_id).ok_or(Error::NotFound("フォーム"))?;
+        let mut g = s
+            .lock()
+            .map_err(|_| Error::Invalid("内部状態が壊れています".into()))?;
+        let out = f(&mut g)?;
+        if background {
+            g.autosave()
+                .map_err(|e| Error::Invalid(format!("回答を保存できませんでした: {e}")))?;
+        }
+        Ok(out)
+    }
+
+    fn form_edit(&self, form_id: &str) -> Option<FormEdit> {
+        self.read(form_id, |s| {
+            s.forms()
+                .into_iter()
+                .find(|f| f.id == form_id)
+                .map(|f| f.edit)
+                .ok_or(Error::NotFound("フォーム"))
+        })
+        .ok()
+    }
 }
 
 pub struct FormServer {
@@ -693,6 +765,7 @@ impl FormServer {
         let server = Arc::new(server);
         let shared = Arc::new(Shared {
             session,
+            extras: Mutex::default(),
             access_code,
             respondent_codes,
             answers: Mutex::default(),
@@ -727,19 +800,29 @@ impl FormServer {
         self.port
     }
 
-    /// 現在のファイルのフォームの URL 一覧。新しいフォームにはトークンを作る。
+    /// 配信しているファイルのフォームの URL 一覧。新しいフォームにはトークンを作る。
     pub fn status(&self) -> FormsStatus {
-        let forms = self
-            .shared
-            .session
-            .lock()
-            .map(|s| s.forms())
-            .unwrap_or_default();
+        // (フォーム, ファイル名, 裏のファイルか)
+        let mut forms = vec![];
+        let mut background_files = vec![];
+        for (i, s) in self.shared.sessions().into_iter().enumerate() {
+            let Ok(g) = s.lock() else { continue };
+            let name = g.file_name().unwrap_or_default();
+            if i > 0 {
+                background_files.push(BackgroundFile {
+                    name: name.clone(),
+                    path: g.file_path().unwrap_or_default(),
+                });
+            }
+            for f in g.forms() {
+                forms.push((f, name.clone(), i > 0));
+            }
+        }
         let mut tokens = self.shared.tokens.lock().unwrap();
         let submitted = self.shared.submitted.lock().unwrap();
         let urls = forms
             .into_iter()
-            .map(|f| {
+            .map(|(f, file, background)| {
                 let token = match tokens.by_form.get(&f.id) {
                     Some(t) => t.clone(),
                     None => {
@@ -754,6 +837,8 @@ impl FormServer {
                     url: format!("http://{}:{}/f/{token}", self.host, self.port),
                     form_id: f.id,
                     name: f.name,
+                    file,
+                    background,
                 }
             })
             .collect();
@@ -763,7 +848,69 @@ impl FormServer {
             protected: self.shared.access_code.is_some()
                 || !self.shared.respondent_codes.is_empty(),
             urls,
+            background_files,
         }
+    }
+
+    /// ファイル（セッション）を裏の配信に加える。アプリで別のファイルを開いても、このファイルのフォームは
+    /// 配信され続け、回答は届くたびに保存される。保存先があり、未保存の変更がなく、フォームがあること。
+    /// すでに配信しているファイルと同じ保存先は加えられない（同じファイルの 2 つのコピーが食い違うため）。
+    pub fn attach(&self, session: Arc<Mutex<Session>>) -> Result<()> {
+        let path = {
+            let g = session
+                .lock()
+                .map_err(|_| Error::Invalid("内部状態が壊れています".into()))?;
+            g.check_background_serving()?;
+            g.file_path()
+        };
+        if self.serves_path(path.as_deref().unwrap_or_default()) {
+            return Err(Error::Invalid(
+                "そのファイルはすでに配信中です。配信をやめてから開いてください".into(),
+            ));
+        }
+        self.shared.extras.lock().unwrap().push(session);
+        Ok(())
+    }
+
+    /// この保存先のファイルを、すでに配信しているか（アプリで開いているものも含む）。
+    pub fn serves_path(&self, path: &str) -> bool {
+        self.shared.sessions().iter().any(|s| {
+            s.lock()
+                .map(|g| g.file_path().as_deref() == Some(path))
+                .unwrap_or(false)
+        })
+    }
+
+    /// 裏の配信を 1 つやめる（`status().background_files` の番号）。保存していない回答があれば保存してから。
+    /// 保存できなければエラーにして、配信を続ける（回答を失わないように）。
+    pub fn release(&self, index: usize) -> Result<()> {
+        let mut extras = self.shared.extras.lock().unwrap();
+        let s = extras
+            .get(index)
+            .ok_or(Error::NotFound("裏で配信しているファイル"))?;
+        {
+            let mut g = s
+                .lock()
+                .map_err(|_| Error::Invalid("内部状態が壊れています".into()))?;
+            if g.is_dirty() {
+                g.autosave()?;
+            }
+        }
+        extras.remove(index);
+        Ok(())
+    }
+
+    /// 裏のファイルの未保存の回答をすべて保存する（配信を止める前に）。
+    pub fn flush_background(&self) -> Result<()> {
+        for s in self.shared.extras.lock().unwrap().iter() {
+            let mut g = s
+                .lock()
+                .map_err(|_| Error::Invalid("内部状態が壊れています".into()))?;
+            if g.is_dirty() {
+                g.autosave()?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -999,13 +1146,7 @@ fn handle(shared: &Shared, mut req: tiny_http::Request) {
             }
             return Err(not_found());
         };
-        let policy = shared
-            .session
-            .lock()
-            .ok()
-            .and_then(|s| s.forms().into_iter().find(|f| f.id == form))
-            .map(|f| f.edit);
-        let Some(policy) = policy else {
+        let Some(policy) = shared.form_edit(form) else {
             return Err(not_found());
         };
         match edit_denied(&policy, issued, Instant::now()) {
@@ -1040,11 +1181,7 @@ fn handle(shared: &Shared, mut req: tiny_http::Request) {
                 Ok(w) => w,
                 Err(body) => return respond_json(req, 401, body),
             };
-            let def = shared
-                .session
-                .lock()
-                .map_err(|_| Error::Invalid("内部状態が壊れています".into()))
-                .and_then(|s| s.form_definition(&id));
+            let def = shared.read(&id, |s| s.form_definition(&id));
             match def {
                 Ok(d) => {
                     let mut v = serde_json::to_value(d).unwrap();
@@ -1075,13 +1212,8 @@ fn handle(shared: &Shared, mut req: tiny_http::Request) {
                     .unwrap()
                     .get(&(id.clone(), c.clone()))
                     .map(|(r, _)| r.clone());
-                let alive = row.is_some_and(|r| {
-                    shared
-                        .session
-                        .lock()
-                        .map(|s| s.form_answer(&id, &r).is_ok())
-                        .unwrap_or(false)
-                });
+                let alive =
+                    row.is_some_and(|r| shared.read(&id, |s| s.form_answer(&id, &r)).is_ok());
                 if alive {
                     return respond_json(
                         req,
@@ -1094,11 +1226,7 @@ fn handle(shared: &Shared, mut req: tiny_http::Request) {
                 Ok(m) => m,
                 Err((status, m)) => return respond_json(req, status, json!({"error": m})),
             };
-            let result = shared
-                .session
-                .lock()
-                .map_err(|_| Error::Invalid("内部状態が壊れています".into()))
-                .and_then(|mut s| s.submit_form(&id, &values));
+            let result = shared.write(&id, |s| s.submit_form(&id, &values));
             match result {
                 Ok(row_id) => {
                     *shared
@@ -1117,12 +1245,8 @@ fn handle(shared: &Shared, mut req: tiny_http::Request) {
                     }
                     // 回答者が後から直せるように、この回答だけを指す修正用トークンを渡す（フォームが許していれば）。
                     // 回答者ごとの合言葉の人は、合言葉が鍵なので渡さない
-                    let allowed = personal.is_none()
-                        && shared
-                            .session
-                            .lock()
-                            .map(|s| s.forms().iter().any(|f| f.id == id && f.edit.allowed))
-                            .unwrap_or(false);
+                    let allowed =
+                        personal.is_none() && shared.form_edit(&id).is_some_and(|e| e.allowed);
                     let mut edits = shared.edits.lock().unwrap();
                     let edit = (allowed && edits.len() < MAX_EDITS).then(|| {
                         let t = random_token();
@@ -1149,11 +1273,7 @@ fn handle(shared: &Shared, mut req: tiny_http::Request) {
                 Ok(r) => r,
                 Err((status, body)) => return respond_json(req, status, body),
             };
-            let found = shared
-                .session
-                .lock()
-                .map_err(|_| Error::Invalid("内部状態が壊れています".into()))
-                .and_then(|s| s.form_answer(&id, &row_id));
+            let found = shared.read(&id, |s| s.form_answer(&id, &row_id));
             match found {
                 Ok(values) => respond_json(req, 200, json!({"values": values})),
                 Err(Error::NotFound(_)) => {
@@ -1183,11 +1303,7 @@ fn handle(shared: &Shared, mut req: tiny_http::Request) {
                 Ok(m) => m,
                 Err((status, m)) => return respond_json(req, status, json!({"error": m})),
             };
-            let result = shared
-                .session
-                .lock()
-                .map_err(|_| Error::Invalid("内部状態が壊れています".into()))
-                .and_then(|mut s| s.edit_form_answer(&id, &row_id, &values));
+            let result = shared.write(&id, |s| s.edit_form_answer(&id, &row_id, &values));
             match result {
                 Ok(()) => {
                     (shared.on_change)();
@@ -2212,6 +2328,171 @@ mod tests {
             http_with(port, "POST", &submit, Some(&body("山田再")), &yamada).0,
             200
         );
+    }
+
+    /// 保存済みで、フォームが 1 つある新しいファイルのセッション。
+    fn saved_session(dir: &std::path::Path, file: &str) -> (Session, String, String, String) {
+        let (mut s, sheet, schema) = session();
+        let form = s.add_form(&sheet, &schema, file).unwrap().file.forms[0]
+            .id
+            .clone();
+        let path = dir.join(format!("{file}.jxcel")).display().to_string();
+        s.save(Some(&path), "初回").unwrap();
+        (s, schema, form, path)
+    }
+
+    #[test]
+    fn several_files_can_be_served_at_once_and_answers_to_background_files_are_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, schema_a, form_a, path_a) = saved_session(dir.path(), "受付A");
+        let (b, schema_b, form_b, path_b) = saved_session(dir.path(), "受付B");
+        let a = Arc::new(Mutex::new(a));
+        let server = FormServer::start(a.clone(), 0, None, || {}).unwrap();
+        let port = server.port();
+
+        // 裏に回せるのは、保存先があり、未保存の変更がなく、フォームがあるファイルだけ
+        let mut unsaved = Session::new();
+        unsaved.new_file("新規").unwrap();
+        assert!(server.attach(Arc::new(Mutex::new(unsaved))).is_err());
+        let mut dirty = b_clone(&path_b);
+        dirty.add_sheet("変更").unwrap();
+        assert!(server.attach(Arc::new(Mutex::new(dirty))).is_err());
+        let mut no_forms = Session::new();
+        no_forms.new_file("フォームなし").unwrap();
+        let p = dir.path().join("no-forms.jxcel").display().to_string();
+        no_forms.save(Some(&p), "x").unwrap();
+        assert!(server.attach(Arc::new(Mutex::new(no_forms))).is_err());
+        // すでに配信しているファイルと同じ保存先は不可（アプリで開いているものも）
+        assert!(server
+            .attach(Arc::new(Mutex::new(b_clone(&path_a))))
+            .is_err());
+
+        server.attach(Arc::new(Mutex::new(b))).unwrap();
+        assert!(server
+            .attach(Arc::new(Mutex::new(b_clone(&path_b))))
+            .is_err());
+        assert!(server.serves_path(&path_a) && server.serves_path(&path_b));
+
+        // 一覧には両方のファイルのフォームが出て、裏のものには印が付く
+        let st = server.status();
+        assert_eq!(st.urls.len(), 2);
+        let url_of = |form: &str| st.urls.iter().find(|u| u.form_id == form).unwrap().clone();
+        assert!(!url_of(&form_a).background && url_of(&form_a).file == "t");
+        assert!(url_of(&form_b).background);
+        assert_eq!(st.background_files.len(), 1);
+        assert_eq!(st.background_files[0].path, path_b);
+        let token_of = |form: &str| url_of(form).url.rsplit('/').next().unwrap().to_string();
+        let body = r#"{"values":{"name":"山田","qty":"2"}}"#;
+
+        // 裏のファイルへの回答は、ファイルに保存される（アプリの画面から保存できないため）
+        let (code, _, r) = http(
+            port,
+            "POST",
+            &format!("/f/{}/submit", token_of(&form_b)),
+            Some(body),
+        );
+        assert_eq!(code, 200, "{r}");
+        let mut reopened = Session::new();
+        reopened.open(&path_b).unwrap();
+        assert_eq!(rows(&reopened, &schema_b).len(), 1);
+        assert!(!reopened.is_dirty());
+        // 修正も保存される
+        let et = serde_json::from_str::<Value>(&r).unwrap()["editToken"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let h = [(EDIT_HEADER, et.as_str())];
+        let (code, _, r2) = http_with(
+            port,
+            "POST",
+            &format!("/f/{}/edit", token_of(&form_b)),
+            Some(r#"{"values":{"name":"山田太郎"}}"#),
+            &h,
+        );
+        assert_eq!(code, 200, "{r2}");
+        let mut reopened = Session::new();
+        reopened.open(&path_b).unwrap();
+        assert_eq!(rows(&reopened, &schema_b)[0]["name"], json!("山田太郎"));
+
+        // アプリで開いているファイルへの回答は、これまでどおり未保存の変更になるだけ
+        let (code, _, r) = http(
+            port,
+            "POST",
+            &format!("/f/{}/submit", token_of(&form_a)),
+            Some(body),
+        );
+        assert_eq!(code, 200, "{r}");
+        assert_eq!(rows(&a.lock().unwrap(), &schema_a).len(), 1);
+        assert!(a.lock().unwrap().is_dirty());
+        let mut on_disk = Session::new();
+        on_disk.open(&path_a).unwrap();
+        assert!(rows(&on_disk, &schema_a).is_empty());
+        // 2 つのファイルの回数は別々に数える
+        let st = server.status();
+        let count = |form: &str| {
+            st.urls
+                .iter()
+                .find(|u| u.form_id == form)
+                .unwrap()
+                .submitted
+        };
+        assert_eq!((count(&form_a), count(&form_b)), (1, 1));
+
+        // 裏の配信をやめる: 以降そのフォームは見つからない。ファイルには回答が残っている
+        server.release(0).unwrap();
+        assert!(server.status().background_files.is_empty());
+        let (code, _, _) = http(
+            port,
+            "POST",
+            &format!("/f/{}/submit", token_of(&form_b)),
+            Some(body),
+        );
+        assert_eq!(code, 404);
+        assert!(matches!(server.release(0), Err(Error::NotFound(_))));
+        let mut reopened = Session::new();
+        reopened.open(&path_b).unwrap();
+        assert_eq!(rows(&reopened, &schema_b).len(), 1);
+    }
+
+    /// 保存済みのファイルを別のセッションで開く。
+    fn b_clone(path: &str) -> Session {
+        let mut s = Session::new();
+        s.open(path).unwrap();
+        s
+    }
+
+    #[test]
+    fn background_answers_unsaved_by_the_server_are_flushed_before_stopping() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, _, _, _) = saved_session(dir.path(), "受付A");
+        let (b, schema_b, _, path_b) = saved_session(dir.path(), "受付B");
+        let server = FormServer::start(Arc::new(Mutex::new(a)), 0, None, || {}).unwrap();
+        let b = Arc::new(Mutex::new(b));
+        server.attach(b.clone()).unwrap();
+        // 何かの事情で裏のファイルに未保存の変更が残っていても、止める前の保存で書き出される
+        {
+            let mut g = b.lock().unwrap();
+            let (sheet, schema) = (
+                g.current().unwrap().file.sheets[0].id.clone(),
+                schema_b.clone(),
+            );
+            let d = g.doc().unwrap();
+            crate::find_schema(&mut d.file, &sheet, &schema)
+                .unwrap()
+                .rows
+                .push(Row::new(BTreeMap::from([(
+                    "name".to_string(),
+                    json!("残り"),
+                )])));
+            d.dirty = true;
+        }
+        server.flush_background().unwrap();
+        assert!(!b.lock().unwrap().is_dirty());
+        let mut reopened = Session::new();
+        reopened.open(&path_b).unwrap();
+        assert!(rows(&reopened, &schema_b)
+            .iter()
+            .any(|r| r["name"] == json!("残り")));
     }
 
     #[test]

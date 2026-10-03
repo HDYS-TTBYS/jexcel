@@ -174,3 +174,48 @@ test("実ウィンドウ: 新規・IPC・保存・開く・履歴・フォーム
   // ウィンドウを閉じる操作の確認（onCloseRequested）は、WebDriver の「ウィンドウを閉じる」がアプリを直接終了させて
   // ハンドラを通らないため、ここでは試せない（ブラウザ単体の e2e の guard で確認している）。
 });
+
+test("実ウィンドウ: 配信を続けたまま別のファイルを開く（裏のファイルの回答は自動保存される）", async () => {
+  const fileA = join(tmp, "受付A.jxcel"), fileB = join(tmp, "受付B.jxcel");
+  // ファイル B（フォームなし）と、ファイル A（フォームあり）を保存する
+  await invoke("new_file", { name: "B" });
+  await invoke("save_file", { path: fileB, message: "B" });
+  let snap = await invoke("new_file", { name: "A" });
+  const sheet = snap.file.sheets[0], schema = sheet.schemas[0], col = schema.columns[0];
+  await invoke("add_form", { sheet: sheet.id, schema: schema.id, name: "受付A" });
+  await invoke("save_file", { path: fileA, message: "A" });
+
+  let st = await invoke("forms_start", { port: 0, accessCode: null, respondentCodes: null });
+  assert.equal(st.running, true);
+  assert.equal(st.urls.length, 1);
+  const urlA = st.urls[0].url.replace(/^http:\/\/[\d.]+/, "http://127.0.0.1");
+
+  // 配信を続けたまま B を開く。A は裏で配信され続ける
+  await assert.rejects(invoke("open_file_keep_serving", { path: fileA }), /すでに配信中/, "いま開いているファイルと同じものは不可");
+  snap = await invoke("open_file_keep_serving", { path: fileB });
+  assert.equal(snap.file.name, "B");
+  st = await invoke("forms_status");
+  assert.equal(st.running, true);
+  assert.deepEqual(st.backgroundFiles.map((b) => b.name), ["A"]);
+  assert.equal(st.urls.length, 1);
+  assert.equal(st.urls[0].background, true);
+  assert.equal(st.urls[0].file, "A");
+  await assert.rejects(invoke("open_file_keep_serving", { path: fileA }), /すでに配信中/, "裏で配信しているファイルは重ねて開けない");
+
+  // 実サーバーに回答 → 裏のファイル A に保存される（アプリは B を開いたまま）
+  const res = await fetch(`${urlA}/submit`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ values: { [col.id]: "裏への回答" } }) });
+  assert.equal(res.status, 200, await res.clone().text());
+  assert.equal((await invoke("current_file")).file.name, "B", "画面のファイルは B のまま");
+
+  // 配信をやめる → A を開き直すと、回答が入っていて、未保存ではない
+  st = await invoke("forms_release", { index: 0 });
+  assert.equal(st.backgroundFiles.length, 0);
+  const after = await invoke("open_file", { path: fileA });
+  const cells = after.file.sheets[0].schemas[0].rows.map((r) => r.cells[col.id]);
+  assert.ok(cells.includes("裏への回答"), JSON.stringify(cells));
+  assert.equal(after.dirty, false);
+
+  // 止める前の保存: 裏のファイルがあっても配信を止められる
+  await invoke("forms_stop");
+  assert.equal((await invoke("forms_status")).running, false);
+});

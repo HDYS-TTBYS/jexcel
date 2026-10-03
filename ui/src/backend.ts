@@ -54,6 +54,10 @@ export interface Backend {
   /** LAN へのフォーム配信。回答は開いているファイルに行として追加される（未保存の変更になる）。 */
   /** accessCode を渡すと、回答者に合言葉を求める（ASCII の 4〜64 文字。ファイルには保存しない） */
   /** `respondentCodes`: 回答者ごとの合言葉（1 つにつき 1 人・1 件。送信後は同じ合言葉でどの端末からでも直せる） */
+  /** 配信を続けたまま別のファイルを開く。いまのファイルは裏で配信し続け、回答は届くたびに保存される */
+  openFileKeepServing(path: string): Promise<Snapshot>;
+  /** 裏で配信しているファイルの配信をやめる（`FormsStatus.backgroundFiles` の番号） */
+  formsRelease(index: number): Promise<FormsStatus>;
   formsStart(port: number, accessCode?: string, respondentCodes?: string[]): Promise<FormsStatus>;
   formsStop(): Promise<FormsStatus>;
   formsStatus(): Promise<FormsStatus>;

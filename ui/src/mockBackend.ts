@@ -250,6 +250,8 @@ export function createMockBackend(): Backend {
   let formsChanged: (() => void) | null = null;
   let formsProtected = false;
   const submitted = new Map<string, number>();
+  // 配信を続けたまま別のファイルを開いたときの、裏のファイル（回答は届くたびにディスクへ保存される）
+  const background: { path: string; file: JxcelFile }[] = [];
   const formsStatus = (): FormsStatus => ({
     running: formsPort !== null,
     port: formsPort,
@@ -257,20 +259,34 @@ export function createMockBackend(): Backend {
     urls:
       formsPort === null
         ? []
-        : (file?.forms ?? []).map((x) => ({
-            formId: x.id,
-            name: x.name,
-            url: `http://192.168.0.10:${formsPort}/f/${x.id.toLowerCase().padEnd(32, "0").slice(0, 32)}`,
-            submitted: submitted.get(x.id) ?? 0,
-          })),
+        : [
+            ...(file ? [{ f: file, bg: false }] : []),
+            ...background.map((b) => ({ f: b.file, bg: true })),
+          ].flatMap(({ f, bg }) =>
+            f.forms.map((x) => ({
+              formId: x.id,
+              name: x.name,
+              url: `http://192.168.0.10:${formsPort}/f/${x.id.toLowerCase().padEnd(32, "0").slice(0, 32)}`,
+              submitted: submitted.get(x.id) ?? 0,
+              file: f.name,
+              background: bg,
+            })),
+          ),
+    backgroundFiles: formsPort === null ? [] : background.map((b) => ({ name: b.file.name, path: b.path })),
   });
   // テスト用: 回答が届いたことにする（フォームは ID か名前、列は ID か列名で指す。Rust 側の submit_form の簡易版。型変換だけで検証はしない）
   const submitMock = (formId: string, values: Record<string, unknown>) => {
     if (!file || formsPort === null) throw "配信中ではありません";
-    const x = file.forms.find((y) => y.id === formId || y.name === formId);
+    // 開いているファイルになければ、裏のファイルから探す（回答はそのままディスクへ保存する）
+    let target = file;
+    let bg = background.find((b) => b.file.forms.some((y) => y.id === formId || y.name === formId));
+    const inCurrent = file.forms.some((y) => y.id === formId || y.name === formId);
+    if (!inCurrent && bg) target = bg.file;
+    else bg = undefined;
+    const x = target.forms.find((y) => y.id === formId || y.name === formId);
     if (!x) throw "フォーム が見つかりません";
     formId = x.id;
-    const s = schemaOf(file, x.sheet, x.schema);
+    const s = schemaOf(target, x.sheet, x.schema);
     const cells: Record<string, unknown> = {};
     for (const [cid, v] of Object.entries(values)) {
       const c = s.columns.find((y) => y.id === cid || y.name === cid);
@@ -278,7 +294,10 @@ export function createMockBackend(): Backend {
       cells[c.id] = c.type.kind === "int" || c.type.kind === "float" ? Number(v) : v;
     }
     s.rows.push({ id: newId(), cells });
-    dirty = true;
+    if (bg) {
+      const d = disk.get(bg.path);
+      if (d) disk.set(bg.path, { file: clone(bg.file), commits: d.commits });
+    } else dirty = true;
     submitted.set(formId, (submitted.get(formId) ?? 0) + 1);
     formsChanged?.();
   };
@@ -625,8 +644,32 @@ export function createMockBackend(): Backend {
       formsPort = port;
       return formsStatus();
     },
+    openFileKeepServing: async (p) => {
+      if (formsPort === null || !file) throw "フォームを配信していません";
+      if (p === path || background.some((b) => b.path === p)) throw "そのファイルはすでに配信中です。配信をやめてから開いてください";
+      const d = disk.get(p);
+      if (!d) throw `${p} を開けません`;
+      // Rust 側（Session::check_background_serving）と同じ条件
+      if (!path) throw "保存してから、別のファイルを開いてください（配信を続けるには、回答を保存できる場所が要ります）";
+      if (dirty) throw "未保存の変更があります。保存してから、別のファイルを開いてください";
+      if (file.forms.length === 0) throw "このファイルにはフォームがありません。配信を続ける必要はないので、そのまま開き直してください";
+      background.push({ path, file: clone(file) });
+      file = clone(d.file);
+      path = p;
+      dirty = false;
+      commits.length = 0;
+      commits.push(...clone(d.commits));
+      return snap();
+    },
+    formsRelease: async (index) => {
+      if (formsPort === null) throw "フォームを配信していません";
+      if (index < 0 || index >= background.length) throw "裏で配信しているファイル が見つかりません";
+      background.splice(index, 1);
+      return formsStatus();
+    },
     formsStop: async () => {
       formsPort = null;
+      background.length = 0;
       return formsStatus();
     },
     formsStatus: async () => formsStatus(),

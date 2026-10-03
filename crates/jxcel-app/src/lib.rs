@@ -322,6 +322,51 @@ impl Session {
         self.snapshot()
     }
 
+    /// 開いているファイルの名前（ファイルが無ければ `None`）。
+    pub fn file_name(&self) -> Option<String> {
+        self.doc.as_ref().map(|d| d.file.name.clone())
+    }
+
+    /// 保存先のパス（未保存の新規ファイルなら `None`）。
+    pub fn file_path(&self) -> Option<String> {
+        self.doc
+            .as_ref()
+            .and_then(|d| d.path.as_ref())
+            .map(|p| p.display().to_string())
+    }
+
+    /// 未保存の変更があるか。
+    pub fn is_dirty(&self) -> bool {
+        self.doc.as_ref().is_some_and(|d| d.dirty)
+    }
+
+    /// 回答が届くたびに保存するための保存（履歴にも記録する）。保存先が無ければエラー。
+    pub fn autosave(&mut self) -> Result<()> {
+        self.save(None, "フォーム回答の自動保存").map(|_| ())
+    }
+
+    /// このファイルを、アプリで別のファイルを開いたあとも裏でフォーム配信し続けられるか。
+    /// 保存先があり、未保存の変更がなく、フォームがあること（回答のたびに自動保存するため）。
+    pub fn check_background_serving(&self) -> Result<()> {
+        let d = self.doc.as_ref().ok_or(Error::NoFile)?;
+        if d.path.is_none() {
+            return Err(Error::Invalid(
+                "保存してから、別のファイルを開いてください（配信を続けるには、回答を保存できる場所が要ります）".into(),
+            ));
+        }
+        if d.dirty {
+            return Err(Error::Invalid(
+                "未保存の変更があります。保存してから、別のファイルを開いてください".into(),
+            ));
+        }
+        if d.file.forms.is_empty() {
+            return Err(Error::Invalid(
+                "このファイルにはフォームがありません。配信を続ける必要はないので、そのまま開き直してください".into(),
+            ));
+        }
+        Ok(())
+    }
+
     // ---- 構造の編集 ----
 
     pub fn add_sheet(&mut self, name: &str) -> Result<Snapshot> {

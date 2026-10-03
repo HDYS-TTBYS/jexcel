@@ -30,6 +30,8 @@ export function App({ backend }: { backend: Backend }) {
   const [showForms, setShowForms] = useState(false);
   const [dialog, setDialog] = useState<DialogSpec | null>(null);
   const [historyKey, setHistoryKey] = useState(0);
+  // フォーム配信中に回答が届くたびに増える（配信パネルが状態を読み直す合図）
+  const [formsTick, setFormsTick] = useState(0);
   // マクロエディタの保留中の編集を書き出す（保存・確認の前に呼ぶ）
   const macroFlush = useRef<(() => Promise<void>) | null>(null);
   const registerFlush = useCallback((f: (() => Promise<void>) | null) => {
@@ -106,6 +108,8 @@ export function App({ backend }: { backend: Backend }) {
   useEffect(() => {
     const unlisten = backend.onFormsChanged(() => {
       backend.current().then(setSnap, () => {});
+      // 裏のファイルへの回答は表に現れないので、配信パネルの回答数は別に読み直させる
+      setFormsTick((t) => t + 1);
     });
     return () => void unlisten.then((f) => f());
   }, [backend, setSnap]);
@@ -314,6 +318,12 @@ export function App({ backend }: { backend: Backend }) {
               onSnapshot={setSnap}
               onError={onError}
               onConfirm={(title, message, onOk) => setDialog({ kind: "confirm", title, message, onOk })}
+              changeTick={formsTick}
+              onOpenedOther={() => {
+                setSheetId(null);
+                setSchemaId(null);
+                setHistoryKey((k) => k + 1);
+              }}
             />
           </Suspense>
         )}

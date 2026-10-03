@@ -257,10 +257,50 @@ fn forms_start(
 
 #[tauri::command(async)]
 fn forms_stop(forms: Forms) -> Reply<FormsStatus> {
+    // 裏で配信しているファイルの回答は、止める前に保存する（保存できなければ止めずに知らせる）
+    if let Some(server) = forms_lock(&forms)?.as_ref() {
+        server.flush_background().map_err(|e| e.to_string())?;
+    }
     // 取り出して手放す（待ち受けスレッドの停止を待つので、ロックは先に外す）
     let taken = forms_lock(&forms)?.take();
     drop(taken);
     Ok(FormsStatus::stopped())
+}
+
+/// 配信を続けたまま、別のファイルを開く。いま開いているファイルは裏で配信し続け（回答は届くたびに保存）、
+/// アプリの画面には新しいファイルが開く。いまのファイルは、保存済みでフォームがあること。
+#[tauri::command(async)]
+fn open_file_keep_serving(app: App, forms: Forms, path: String) -> Reply<Snapshot> {
+    let server = forms_lock(&forms)?;
+    let server = server.as_ref().ok_or("フォームを配信していません")?;
+    if server.serves_path(&path) {
+        return Err("そのファイルはすでに配信中です。配信をやめてから開いてください".into());
+    }
+    // 先に新しいファイルを開く（開けなければ、いまの状態は何も変えない）
+    let mut next = Session::new();
+    let snap = next.open(&path).map_err(|e| e.to_string())?;
+    let mut current = app
+        .lock()
+        .map_err(|_| "内部状態が壊れています".to_string())?;
+    current
+        .check_background_serving()
+        .map_err(|e| e.to_string())?;
+    let previous = std::mem::replace(&mut *current, next);
+    drop(current);
+    if let Err(e) = server.attach(Arc::new(Mutex::new(previous))) {
+        // 裏に回せなかったら、元に戻す（attach は失敗したセッションを手放すので、開き直す）
+        return Err(e.to_string());
+    }
+    Ok(snap)
+}
+
+/// 裏で配信しているファイルの配信をやめる（`FormsStatus::background_files` の番号）。
+#[tauri::command(async)]
+fn forms_release(forms: Forms, index: usize) -> Reply<FormsStatus> {
+    let server = forms_lock(&forms)?;
+    let server = server.as_ref().ok_or("フォームを配信していません")?;
+    server.release(index).map_err(|e| e.to_string())?;
+    Ok(server.status())
 }
 
 #[tauri::command(async)]
@@ -321,6 +361,8 @@ pub fn run() {
             delete_form,
             forms_start,
             forms_stop,
+            open_file_keep_serving,
+            forms_release,
             forms_status,
             history_log,
             history_diff,

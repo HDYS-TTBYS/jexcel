@@ -101,6 +101,16 @@ export interface FormUrl {
   url: string;
   /** 配信を始めてから受け付けた回答の数 */
   submitted: number;
+  /** このフォームがあるファイルの名前 */
+  file: string;
+  /** 別のファイルを開いたあとも裏で配信を続けているファイルのフォームか（回答は届くたびに自動保存される） */
+  background: boolean;
+}
+
+/** 裏で配信を続けているファイル */
+export interface BackgroundFile {
+  name: string;
+  path: string;
 }
 
 export interface FormsStatus {
@@ -109,6 +119,8 @@ export interface FormsStatus {
   /** 回答者に合言葉を求めているか */
   protected: boolean;
   urls: FormUrl[];
+  /** 裏で配信を続けているファイル（`formsRelease` の番号はこの並び） */
+  backgroundFiles: BackgroundFile[];
 }
 
 export interface JxcelFile {

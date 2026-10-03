@@ -150,3 +150,64 @@ test("フォーム配信のパネル", async ({ page: p }) => {
 
   expect(errs).toEqual([]);
 });
+
+// 複数ファイルの同時配信: 配信を続けたまま別のファイルを開くと、元のファイルは裏で配信し続ける
+test("フォーム配信: 配信を続けたまま別のファイルを開く", async ({ page: p }) => {
+  const errs = [];
+  p.on("pageerror", (e) => errs.push("pageerror: " + e.message));
+  const check = (name, cond, extra = "") => expect.soft(!!cond, name + (cond ? "" : " " + extra)).toBe(true);
+  const panel = () => p.getByRole("complementary", { name: "フォーム配信" });
+  const newFile = async (name) => {
+    // ファイルが開いていないときは「新規作成」、開いているときはツールバーの「新規」
+    await p.getByRole("button", { name: /^新規(作成)?$/ }).first().click();
+    const dlg = p.getByRole("dialog");
+    await dlg.getByRole("textbox").fill(name);
+    await dlg.getByRole("button", { name: "OK" }).click();
+    await p.waitForSelector(".ag-row");
+  };
+  const save = async () => {
+    await p.getByRole("button", { name: /^保存/ }).first().click();
+    await p.waitForFunction(() => !/保存\s*\*/.test(document.body.innerText.split("\n").find((l) => l.startsWith("保存")) ?? ""));
+  };
+
+  await p.goto("/");
+  // ファイル B を作って保存する（あとで開く側）
+  await newFile("ファイルB");
+  await p.getByRole("button", { name: "+ 行を追加" }).click();
+  await save();
+  // ファイル A: フォームを作って保存し、配信を始める
+  await newFile("ファイルA");
+  await p.getByRole("button", { name: "フォーム", exact: true }).click();
+  await panel().getByRole("button", { name: "+ フォームを追加" }).click();
+  await panel().getByLabel("フォームの名前").waitFor();
+  await save();
+  await panel().getByRole("button", { name: "配信を開始" }).click();
+  await panel().getByLabel("データの入力 の URL").waitFor();
+
+  // 保存していないと裏には回せない
+  await p.getByRole("button", { name: "+ 行を追加" }).click();
+  await panel().getByRole("button", { name: "配信を続けたまま、別のファイルを開く…" }).click();
+  await p.waitForFunction(() => document.body.innerText.includes("未保存の変更があります"), null, { timeout: 3000 }).catch(() => {});
+  check("未保存のファイルは裏に回せない", (await p.locator("body").innerText()).includes("未保存の変更があります"));
+  await save();
+
+  // 保存済みなら開ける。ファイル A のフォームは配信され続ける
+  await panel().getByRole("button", { name: "配信を続けたまま、別のファイルを開く…" }).click();
+  await panel().getByLabel("裏で配信しているファイル").waitFor();
+  check("裏で配信しているファイルが一覧に出る", (await panel().getByLabel("裏で配信しているファイル").innerText()).includes("ファイルA"));
+  check("元のフォームの URL は残り、別のファイルと分かる", (await panel().getByLabel("配信中の URL").innerText()).includes("別のファイル「ファイルA」"));
+  check("開いたのはファイル B（フォームなし）", (await panel().innerText()).includes("フォームにすると"));
+  check("配信は続いている", (await panel().innerText()).includes("配信中"));
+
+  // 裏のファイルへの回答は届き、回答数が増える
+  await p.evaluate(() => window.__mockSubmit("データの入力", { 列1: "山田" }));
+  await p.waitForFunction(() => document.body.innerText.includes("回答 1 件"));
+  check("裏のファイルの回答数が増える", true);
+
+  // 同じファイルをもう一度は開けない（開いているのは B で、A は配信中）。配信をやめると一覧から消える
+  await panel().getByRole("button", { name: "ファイルA の配信をやめる" }).click();
+  await p.waitForFunction(() => !document.querySelector('[aria-label="裏で配信しているファイル"]'));
+  check("配信をやめると一覧と URL から消える", (await panel().getByLabel("配信中の URL").innerText()).trim() === "");
+
+  expect(errs).toEqual([]);
+});

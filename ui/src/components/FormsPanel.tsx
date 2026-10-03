@@ -9,12 +9,16 @@ interface Props {
   onSnapshot: (s: Snapshot) => void;
   onError: (message: string) => void;
   onConfirm: (title: string, message: string, onOk: () => void) => void;
+  /** 配信を続けたまま別のファイルを開いたとき（画面の選択などを初期化する） */
+  onOpenedOther: () => void;
+  /** 回答が届くたびに増える（裏のファイルへの回答でも、回答数を読み直す） */
+  changeTick: number;
 }
 
 const DEFAULT_PORT = 8787;
 const target = (sheet: string, schema: string) => `${sheet}|${schema}`;
 
-export default function FormsPanel({ backend, file, onSnapshot, onError, onConfirm }: Props) {
+export default function FormsPanel({ backend, file, onSnapshot, onError, onConfirm, onOpenedOther, changeTick }: Props) {
   const forms = file.forms;
   const [selectedId, setSelectedId] = useState<string | null>(forms[0]?.id ?? null);
   const selected: Form | null = forms.find((f) => f.id === selectedId) ?? forms[0] ?? null;
@@ -44,7 +48,7 @@ export default function FormsPanel({ backend, file, onSnapshot, onError, onConfi
   const changed = JSON.stringify(draft) !== JSON.stringify(applied);
 
   // 配信の状態
-  const [status, setStatus] = useState<FormsStatus>({ running: false, port: null, protected: false, urls: [] });
+  const [status, setStatus] = useState<FormsStatus>({ running: false, port: null, protected: false, urls: [], backgroundFiles: [] });
   const [port, setPort] = useState(String(DEFAULT_PORT));
   const [code, setCode] = useState("");
   const [personal, setPersonal] = useState("");
@@ -52,7 +56,7 @@ export default function FormsPanel({ backend, file, onSnapshot, onError, onConfi
   // フォームの増減・回答の到着で、URL 一覧と回答数を読み直す
   const formsKey = JSON.stringify(forms.map((f) => f.id));
   const totalRows = file.sheets.reduce((n, s) => n + s.schemas.reduce((m, c) => m + c.rows.length, 0), 0);
-  useEffect(() => void refreshStatus(), [refreshStatus, formsKey, totalRows]);
+  useEffect(() => void refreshStatus(), [refreshStatus, formsKey, totalRows, changeTick]);
 
   const [copied, setCopied] = useState<string | null>(null);
   const copy = async (formId: string, url: string) => {
@@ -115,6 +119,25 @@ export default function FormsPanel({ backend, file, onSnapshot, onError, onConfi
     if (!Number.isInteger(n) || n < 1 || n > 65535) return onError("ポートは 1〜65535 の整数にしてください");
     try {
       setStatus(await backend.formsStart(n, code.trim() || undefined, personal.split(/\r?\n/).map((l) => l.trim()).filter((l) => l)));
+    } catch (e) {
+      onError(String(e));
+    }
+  };
+  // 配信を続けたまま別のファイルを開く。いまのファイルは裏で配信し続け、回答は届くたびに保存される
+  const openKeeping = async () => {
+    try {
+      const p = await backend.pickOpenPath();
+      if (!p) return;
+      onSnapshot(await backend.openFileKeepServing(p));
+      onOpenedOther();
+      await refreshStatus();
+    } catch (e) {
+      onError(String(e));
+    }
+  };
+  const release = async (index: number) => {
+    try {
+      setStatus(await backend.formsRelease(index));
     } catch (e) {
       onError(String(e));
     }
@@ -198,6 +221,7 @@ export default function FormsPanel({ backend, file, onSnapshot, onError, onConfi
               <li key={u.formId}>
                 <strong>{u.name}</strong>
                 <span className="muted"> 回答 {u.submitted} 件</span>
+                {u.background && <span className="muted"> ・別のファイル「{u.file}」（回答は届くたびに保存）</span>}
                 <div className="url-row">
                   <input readOnly aria-label={`${u.name} の URL`} value={u.url} onFocus={(e) => e.currentTarget.select()} />
                   <button onClick={() => void copy(u.formId, u.url)}>{copied === u.formId ? "コピーしました" : "コピー"}</button>
@@ -205,6 +229,28 @@ export default function FormsPanel({ backend, file, onSnapshot, onError, onConfi
               </li>
             ))}
           </ul>
+        )}
+
+        {status.running && (
+          <>
+            <div className="actions left">
+              <button onClick={() => void openKeeping()} title="いま開いているファイルのフォームは、裏で配信し続けます（回答は届くたびに保存）">
+                配信を続けたまま、別のファイルを開く…
+              </button>
+            </div>
+            {status.backgroundFiles.length > 0 && (
+              <ul className="urls" aria-label="裏で配信しているファイル">
+                {status.backgroundFiles.map((b, i) => (
+                  <li key={b.path}>
+                    <strong>{b.name}</strong> <span className="muted">{b.path}</span>
+                    <button aria-label={`${b.name} の配信をやめる`} onClick={() => void release(i)}>
+                      配信をやめる
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </>
         )}
 
         <h4>フォーム</h4>
