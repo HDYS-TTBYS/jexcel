@@ -10,7 +10,7 @@ jxcel の書き出し（xlsx / docx）と LAN フォームは、**LibreOffice・
 cargo run -p jxcel-export --example make_verification_set -- ./verify
 ```
 
-`./verify` に 18 個のファイルができる（`*.out.docx|xlsx` が差し込み後、`*.out-empty.docx|xlsx` が 0 件の場合）。
+`./verify` に 25 個のファイルができる（`*.out.docx|xlsx` が差し込み後、`*.out-empty.docx|xlsx` が 0 件の場合）。
 サンプルデータは、明細が「ねじ（数 3・付属 a, b）」と「板（数 1・付属なし）」の 2 件。
 
 テンプレートを作り直すとき（`verification/templates/*.xlsx`）は `python3 verification/make_templates.py 出力先 [--uno ポート]`。
@@ -38,6 +38,8 @@ OOXML（ECMA-376）のスキーマで、書き出した全部品（本文・シ�
 | `nested-table.out.docx` | 行の中の表（入れ子の表）の中のループ |
 | `paragraphs.out.docx` | 表の外の段落のループ（`1. ねじ（3 個）`・`-a`・`-b`・`2. 板（1 個）`）。印だけの段落が空行として残らない |
 | `cell-paragraphs.out.docx` | 表のセルの中の段落のループ。セルが空になっても、セルは最後が段落で終わっている（開ける） |
+| `header-footer.out.docx` | ヘッダー・フッターの段落のループ（ヘッダーに「ヘッダー ねじ」「ヘッダー 板」、フッターに「フッター 1: ねじ」「フッター 2: 板」） |
+| `loop.out.docx` | 表の行のループ（請求書の明細）。合計の行が崩れていない |
 | `*.out-empty.docx` | 0 件で、ブロックごと消えている |
 
 ## 3. Excel（xlsx）で見る点
@@ -55,6 +57,7 @@ OOXML（ECMA-376）のスキーマで、書き出した全部品（本文・シ�
 | `x14-sparkline.out.xlsx` | `D1` のスパークラインが 4 本（100・3・1・7）、`D4`（末尾の行の隣）にもスパークライン。`E1` のドロップダウンの候補が 4 つ。`B1:B4` の条件付き書式 |
 | `absolute-anchor.out.xlsx` | 2 つの図が、末尾の行に付いて下に動く／1〜3 行目に掛かっていた図が 1 行ぶん伸びる |
 | `absolute-anchor-row-heights.out.xlsx` | 行の高さがばらばらで、非表示の行もあるシートでも、図が元の行に付いて動く（図 A は末尾の行の中、図 B は 2 行目の中ほどから最後の行の下まで） |
+| `loop.out.xlsx`・`loop-inline.out.xlsx` | 行ループ（共有文字列・インライン文字列の 2 通り）。日付のセルが日付として表示される |
 | `*.out-empty.xlsx` | 0 件でも空の行が 1 行残り、数式の参照が `#REF!` にならない |
 
 ## 4. スマートフォンで見る点（LAN フォーム）

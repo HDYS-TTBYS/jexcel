@@ -164,9 +164,25 @@ def pivots(out, port):
     build("pivot-in-loop-sheet.xlsx", False)
 
 
+def header_footer_docx(out):
+    """ヘッダー・フッターの段落のループ。"""
+    import docx
+
+    d = docx.Document()
+    d.add_paragraph("本文 {{請求番号}}")
+    sec = d.sections[0]
+    h = sec.header
+    h.paragraphs[0].text = "{{#each 明細}}ヘッダー {{品目}}"
+    h.add_paragraph("{{/each}}")
+    f = sec.footer
+    f.paragraphs[0].text = "{{#each 明細}}フッター {{_n}}: {{品目}}"
+    f.add_paragraph("{{/each}}")
+    d.save(os.path.join(out, "header-footer.docx"))
+
+
 if __name__ == "__main__":
     out = sys.argv[1]
     os.makedirs(out, exist_ok=True)
-    three_d(out); absolute_anchor(out, False); absolute_anchor(out, True); x14(out); chart_cf_dv(out)
+    header_footer_docx(out); three_d(out); absolute_anchor(out, False); absolute_anchor(out, True); x14(out); chart_cf_dv(out)
     if "--uno" in sys.argv:
         pivots(out, sys.argv[sys.argv.index("--uno") + 1])

@@ -24,6 +24,8 @@ impl Source for Sample {
         match expr {
             "請求番号" => Ok(json!("INV-7")),
             "合計" => Ok(json!(999)),
+            "取引先" => Ok(json!("A社")),
+            "発行日" => Ok(json!("2026-10-02")),
             e => Err(format!("未定義: {e}")),
         }
     }
@@ -46,6 +48,8 @@ impl Source for Sample {
         let item = &self.items[path[0]];
         match (path.len(), expr) {
             (_, "品目") => Ok(json!(item.0)),
+            (_, "取引先") => self.value(expr),
+            (1, "数 * 単価") => Ok(json!(item.1 * 100)),
             (1, "数") => Ok(json!(item.1)),
             (1, "_n") => Ok(json!(path[0] + 1)),
             (2, "_n") => Ok(json!(path[1] + 1)),
@@ -77,6 +81,9 @@ fn main() {
         "tests/fixtures/paragraphs.docx",
         "tests/fixtures/cell-paragraphs.docx",
         "tests/fixtures/nested.xlsx",
+        "tests/fixtures/loop.docx",
+        "tests/fixtures/loop.xlsx",
+        "tests/fixtures/loop-inline.xlsx",
     ]
     .into_iter()
     .map(|p| (root.join(p), true))
