@@ -184,7 +184,7 @@ pub fn process(pkg: &mut Package, src: &mut dyn Source) -> Result<()> {
 /// 対象は、書き換えたシートの 1 行または 1 列の範囲（`Sheet1!$B$2:$B$9`）。数式のセル（計算済みの値は
 /// 捨てている）と空のセルは点を作らない（Excel・LibreOffice は開くときに計算して更新する）。
 /// 複数の領域（`(Sheet1!$A$1:$A$3,Sheet1!$C$1:$C$3)`）は、領域の順につなげる。
-/// 2 次元の範囲・書き換えたシートを指さない系列は触らない。
+/// 2 次元の範囲は列ごとに並べる。多段の分類軸（`multiLvlStrRef`）は段ごとに作り直す。書き換えたシートを指さない系列は触らない。
 fn refresh_chart_caches(
     pkg: &mut Package,
     names: &std::collections::HashMap<String, String>,
@@ -264,7 +264,7 @@ fn chart_grid(root: &Element, shared: &[String]) -> ChartGrid {
     grid
 }
 
-/// 1 つの領域: (シート名, 1 行か 1 列に並んだセルの (行, 列))。
+/// 1 つの領域: (シート名, 並べたセルの (行, 列))。
 type ChartArea = (String, Vec<(u32, i64)>);
 
 /// 系列の参照 → 領域ごとの (シート名, 1 行か 1 列に並んだセルの (行, 列))。
@@ -310,19 +310,80 @@ fn chart_area(f: &str) -> Option<ChartArea> {
     let (ca, _, ra) = parse_ref(a)?;
     let (cb, _, rb) = parse_ref(b)?;
     let (ca, cb) = (col_index(ca)?, col_index(cb)?);
-    if ca > cb || ra > rb || (ca != cb && ra != rb) || (rb - ra) as i64 + (cb - ca) > 20000 {
+    // 2 次元の範囲は列ごとに並べる（LibreOffice の書き出しに合わせた並び順。1 行・1 列の範囲はそのまま順）
+    if ca > cb || ra > rb || u64::from(rb - ra + 1) * (cb - ca + 1) as u64 > 20_000 {
         return None;
     }
-    let cells = if ca == cb {
-        (ra..=rb).map(|r| (r, ca)).collect()
-    } else {
-        (ca..=cb).map(|c| (ra, c)).collect()
-    };
+    let cells = (ca..=cb)
+        .flat_map(|c| (ra..=rb).map(move |r| (r, c)))
+        .collect();
     Some((sheet, cells))
+}
+
+/// 多段の分類軸（`multiLvlStrRef`）の範囲 `Sheet1!$A$2:$B$9` → (シート名, 最初の行, 最後の行, 最初の列, 最後の列)。
+/// 列が段で、行が分類。解釈できなければ None。
+fn chart_rect(f: &str) -> Option<(String, u32, u32, i64, i64)> {
+    let (sheet, range) = f.trim().rsplit_once('!')?;
+    if range.contains(['(', ',']) {
+        return None;
+    }
+    let sheet = match sheet.strip_prefix('\'') {
+        Some(q) => q.strip_suffix('\'')?.replace("''", "'"),
+        None => sheet.to_string(),
+    };
+    let (a, b) = range.split_once(':')?;
+    let (ca, _, ra) = parse_ref(a)?;
+    let (cb, _, rb) = parse_ref(b)?;
+    let (ca, cb) = (col_index(ca)?, col_index(cb)?);
+    let cells = u64::from(rb.saturating_sub(ra) + 1) * (cb - ca + 1).max(0) as u64;
+    (ca <= cb && ra <= rb && cells <= 20_000).then_some((sheet, ra, rb, ca, cb))
+}
+
+/// 多段の分類軸のキャッシュ（`multiLvlStrCache`）を作り直す。`lvl` の最初が一番右の列（一番内側の段）で、
+/// 左の列へ進む。空のセルは点を作らない（グループの先頭だけに値がある形）。
+fn refresh_multi_level(el: &mut Element, cx: &ChartCtx) -> bool {
+    let Some((sheet, r1, r2, c1, c2)) = child(el, "f").and_then(|f| chart_rect(&f.text())) else {
+        return false;
+    };
+    let key = sheet.to_lowercase();
+    let (true, Some(grid)) = (cx.changed.contains(&key), cx.grids.get(&key)) else {
+        return false;
+    };
+    let Some(cache) = child_mut(el, "multiLvlStrCache") else {
+        return false;
+    };
+    let p = prefix(&cache.name).to_string();
+    cache
+        .children
+        .retain(|n| !matches!(n, Node::Element(e) if matches!(e.local(), "ptCount" | "lvl")));
+    let mut fresh = vec![];
+    let mut count = Element::new(&format!("{p}ptCount"));
+    count.set_attr("val", &(r2 - r1 + 1).to_string());
+    fresh.push(Node::Element(count));
+    for col in (c1..=c2).rev() {
+        let mut lvl = Element::new(&format!("{p}lvl"));
+        for (i, row) in (r1..=r2).enumerate() {
+            let Some((_, text)) = grid.get(&(row, col)) else {
+                continue;
+            };
+            let mut pt = Element::new(&format!("{p}pt"));
+            pt.set_attr("idx", &i.to_string());
+            let mut v = Element::new(&format!("{p}v"));
+            v.set_text(text);
+            pt.children.push(Node::Element(v));
+            lvl.children.push(Node::Element(pt));
+        }
+        fresh.push(Node::Element(lvl));
+    }
+    cache.children.splice(0..0, fresh);
+    true
 }
 
 fn refresh_series(el: &mut Element, cx: &ChartCtx) -> bool {
     let mut changed = false;
+    if el.local() == "multiLvlStrRef" {
+        return refresh_multi_level(el, cx);
+    }
     let numeric = el.local() == "numRef";
     if numeric || el.local() == "strRef" {
         let areas = child(el, "f").and_then(|f| chart_areas(&f.text()));

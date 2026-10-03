@@ -1109,6 +1109,8 @@ fn xlsx_chart_caches_are_rebuilt_from_the_filled_cells() {
             "<c:val><c:numRef><c:f>明細!$B$3:$B$5</c:f><c:numCache><c:formatCode>General</c:formatCode><c:ptCount val=\"3\"/><c:pt idx=\"0\"><c:v>999</c:v></c:pt></c:numCache></c:numRef></c:val>",
             // 複数の領域（領域の順につなげる。2 つ目は総合計の 1 つの参照）
             "<c:cat><c:strRef><c:f>(明細!$A$3:$A$5,明細!$A$6)</c:f><c:strCache><c:ptCount val=\"4\"/></c:strCache></c:strRef></c:cat>",
+            // 多段の分類軸（列が段）
+            "<c:cat><c:multiLvlStrRef><c:f>明細!$A$3:$B$5</c:f><c:multiLvlStrCache><c:ptCount val=\"3\"/><c:lvl><c:pt idx=\"0\"><c:v>古い</c:v></c:pt></c:lvl></c:multiLvlStrCache></c:multiLvlStrRef></c:cat>",
             // 2 次元の範囲は触らない
             "<c:val><c:numRef><c:f>明細!$A$3:$B$5</c:f><c:numCache><c:ptCount val=\"1\"/><c:pt idx=\"0\"><c:v>7</c:v></c:pt></c:numCache></c:numRef></c:val>",
             "</c:ser></c:barChart></c:plotArea></c:chart></c:chartSpace>"
@@ -1171,8 +1173,54 @@ fn xlsx_chart_caches_are_rebuilt_from_the_filled_cells() {
         ("7".to_string(), owned(&[("0", "3"), ("4", "1")]))
     );
     assert!(texts_of(caches[2], "formatCode") == ["General"]);
-    // 2 次元の範囲のキャッシュは触らない
-    assert_eq!(points(caches[3]), ("1".to_string(), owned(&[("0", "7")])));
+    // 2 次元の範囲（3〜9 行目 × A〜B 列）は列ごとに並べる: A 列の 7 行（文字なので数値の点はない）の次に B 列の 7 行
+    let (count, pts2) = points(caches[3]);
+    assert_eq!(count, "14");
+    assert_eq!(
+        pts2,
+        owned(&[("7", "3"), ("8", "ねじ"), ("9", "ねじ"), ("11", "1")])
+            .into_iter()
+            .filter(|(_, v)| v.parse::<f64>().is_ok())
+            .collect::<Vec<_>>()
+    );
+    // 多段の分類軸: 3〜9 行目。最初の段は右の列（B）、次が左の列（A）。空のセルは点を作らない
+    let mut multi = vec![];
+    elements(&root, "multiLvlStrCache", &mut multi);
+    let lvls = {
+        let mut l = vec![];
+        elements(multi[0], "lvl", &mut l);
+        l
+    };
+    assert_eq!(lvls.len(), 2);
+    let pts = |lvl: &Element| -> Vec<(String, String)> {
+        let mut p = vec![];
+        elements(lvl, "pt", &mut p);
+        p.iter()
+            .map(|x| {
+                let mut v = vec![];
+                elements(x, "v", &mut v);
+                (x.attr("idx").unwrap().to_string(), v[0].text())
+            })
+            .collect()
+    };
+    assert_eq!(
+        pts(lvls[0]),
+        owned(&[("0", "3"), ("1", "ねじ"), ("2", "ねじ"), ("4", "1")])
+    );
+    assert_eq!(
+        pts(lvls[1]),
+        owned(&[
+            ("0", "ねじ"),
+            ("1", "a"),
+            ("2", "b"),
+            ("3", "小計"),
+            ("4", "板"),
+            ("6", "小計")
+        ])
+    );
+    let mut count = vec![];
+    elements(multi[0], "ptCount", &mut count);
+    assert_eq!(count[0].attr("val"), Some("7"));
     // 複数の領域: 3〜9 行目の 7 点に、総合計（10 行目）の 1 点が続く
     assert_eq!(
         points(caches[1]),
