@@ -34,7 +34,13 @@ struct Ctx<'a> {
     date1904: bool,
     /// いま処理しているシートの名前
     sheet_name: Option<String>,
+    /// いま処理しているシートのピボットテーブルの出力範囲（行の始め・終わり、列の始め・終わり）。
+    /// 中身は元データの写しなので差し込みの対象にしない（開くときの更新で作り直される）
+    pivot_areas: Vec<(u32, u32, i64, i64)>,
 }
+
+/// ピボットテーブルの出力範囲のセルにつける一時の印（差し込みと行ループの印の検出から外す）。
+const SKIP_ATTR: &str = "jxcel-skip";
 
 /// いまの位置。
 #[derive(Clone)]
@@ -96,6 +102,7 @@ pub fn process(pkg: &mut Package, src: &mut dyn Source) -> Result<()> {
         date_styles,
         date1904,
         sheet_name: None,
+        pivot_areas: vec![],
     };
     let names = sheet_names(pkg)?;
     // 行がずれたシートの記録（シート名 → 記録）。定義名の参照をずらすのに使う
@@ -107,6 +114,7 @@ pub fn process(pkg: &mut Package, src: &mut dyn Source) -> Result<()> {
         let mut doc = xml::parse(pkg.get(name).expect("listed"))?;
         let mut moves = None;
         ctx.sheet_name = names.get(name).cloned();
+        ctx.pivot_areas = pivot_areas(pkg, name)?;
         if sheet(&mut doc.root, &mut ctx, &mut moves)? {
             pkg.set(name, xml::write(&doc)?);
             any = true;
@@ -541,7 +549,10 @@ fn sheet(root: &mut Element, ctx: &mut Ctx, moved: &mut Option<Moves>) -> Result
         ..Default::default()
     };
     if let Some(sd) = child_mut(root, "sheetData") {
-        changed |= sheet_data(sd, ctx, &mut moves)?;
+        mark_pivot_cells(sd, &ctx.pivot_areas, true);
+        let done = sheet_data(sd, ctx, &mut moves);
+        mark_pivot_cells(sd, &ctx.pivot_areas, false);
+        changed |= done?;
     }
     if moves.active {
         fix_references(root, &moves, ctx.sheet_name.as_deref());
@@ -595,6 +606,58 @@ fn related_parts(pkg: &Package, sheet_part: &str, type_suffix: &str) -> Result<V
 }
 
 /// このシートに置かれたピボットテーブルの場所（`<location ref="…">`）を、行がずれたことに合わせて動かす。
+/// このシートに置かれたピボットテーブルの出力範囲（`<location ref>`）。
+fn pivot_areas(pkg: &Package, sheet_part: &str) -> Result<Vec<(u32, u32, i64, i64)>> {
+    let mut out = vec![];
+    for name in related_parts(pkg, sheet_part, "/pivotTable")? {
+        let Some(bytes) = pkg.get(&name) else {
+            continue;
+        };
+        let doc = xml::parse(bytes)?;
+        let Some(r) = child(&doc.root, "location").and_then(|l| l.attr("ref")) else {
+            continue;
+        };
+        let (a, b) = r.split_once(':').unwrap_or((r, r));
+        let (Some((ca, _, ra)), Some((cb, _, rb))) = (parse_ref(a), parse_ref(b)) else {
+            continue;
+        };
+        if let (Some(ca), Some(cb)) = (col_index(ca), col_index(cb)) {
+            out.push((ra, rb, ca, cb));
+        }
+    }
+    Ok(out)
+}
+
+/// 出力範囲のセルに印をつける（`on`）か、外す。
+fn mark_pivot_cells(sd: &mut Element, areas: &[(u32, u32, i64, i64)], on: bool) {
+    if areas.is_empty() {
+        return;
+    }
+    for rn in &mut sd.children {
+        let Node::Element(row) = rn else { continue };
+        for cn in &mut row.children {
+            let Node::Element(c) = cn else { continue };
+            if c.local() != "c" {
+                continue;
+            }
+            if !on {
+                c.remove_attr(SKIP_ATTR);
+                continue;
+            }
+            let inside = c.attr("r").and_then(parse_ref).is_some_and(|(col, _, r)| {
+                col_index(col).is_some_and(|ci| {
+                    areas
+                        .iter()
+                        .any(|&(r1, r2, c1, c2)| (r1..=r2).contains(&r) && (c1..=c2).contains(&ci))
+                })
+            });
+            if inside {
+                c.set_attr(SKIP_ATTR, "1");
+            }
+        }
+    }
+}
+
 fn shift_pivot_locations(pkg: &mut Package, sheet_part: &str, moves: &Moves) -> Result<()> {
     for name in related_parts(pkg, sheet_part, "/pivotTable")? {
         let Some(bytes) = pkg.get(&name) else {
@@ -1381,7 +1444,7 @@ fn row_markers(row: &Element, shared: &[String]) -> Vec<Marker> {
     let mut found = vec![];
     for n in &row.children {
         let Node::Element(c) = n else { continue };
-        if c.local() != "c" {
+        if c.local() != "c" || c.attr(SKIP_ATTR).is_some() {
             continue;
         }
         if let Some(text) = cell_text(c, shared) {
@@ -1511,7 +1574,7 @@ fn cells(row: &mut Element, ctx: &mut Ctx, scope: &Scope) -> Result<bool> {
     let mut changed = false;
     for n in &mut row.children {
         if let Node::Element(c) = n {
-            if c.local() == "c" {
+            if c.local() == "c" && c.attr(SKIP_ATTR).is_none() {
                 changed |= cell(c, ctx, scope)?;
             }
         }

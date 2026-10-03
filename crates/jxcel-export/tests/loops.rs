@@ -1328,6 +1328,58 @@ fn xlsx_pivot_tables_follow_the_shifted_rows_and_refresh_on_load() {
 }
 
 #[test]
+fn xlsx_pivot_output_cells_are_not_filled_in() {
+    // ピボットテーブルの出力範囲は元データの写し（欄や {{#each}} の印を含みうる）で、開くときの更新で作り直される。
+    // 差し込みも行ループの印の検出もしない
+    let mut pkg = Package::read(&nested_xlsx_with_other_references()).unwrap();
+    let text = String::from_utf8(pkg.get("xl/worksheets/sheet2.xml").unwrap().to_vec()).unwrap();
+    pkg.set(
+        "xl/worksheets/sheet2.xml",
+        text.replace(
+            "<row r=\"3\">",
+            concat!(
+                "<row r=\"2\">",
+                "<c r=\"A2\" t=\"inlineStr\"><is><t>{{#each 明細}}{{品目}}</t></is></c>",
+                "<c r=\"B2\" t=\"inlineStr\"><is><t>{{請求番号}}</t></is></c>",
+                "<c r=\"C2\" t=\"inlineStr\"><is><t>{{請求番号}}</t></is></c>",
+                "</row><row r=\"3\">"
+            ),
+        )
+        .into_bytes(),
+    );
+    pkg.set(
+        "xl/worksheets/_rels/sheet2.xml.rels",
+        concat!(
+            "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">",
+            "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotTable\" Target=\"../pivotTables/pivotTable1.xml\"/>",
+            "</Relationships>"
+        )
+        .as_bytes()
+        .to_vec(),
+    );
+    pkg.set(
+        "xl/pivotTables/pivotTable1.xml",
+        br#"<pivotTableDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" name="P" cacheId="1"><location ref="A2:B2" firstHeaderRow="1" firstDataRow="1" firstDataCol="1"/></pivotTableDefinition>"#.to_vec(),
+    );
+    // Nest は {{#each 明細}} の 1 つ目のループ（明細シートのもの）しか想定しない。出力範囲の印を拾えば panic する
+    let out = render_with(Kind::Xlsx, &pkg.write().unwrap(), &mut Nest::sample())
+        .unwrap_or_else(|e| panic!("{e}"));
+    let root = part(&out, "xl/worksheets/sheet2.xml");
+    let mut cells = vec![];
+    elements(&root, "c", &mut cells);
+    let text_of = |r: &str| {
+        let c = cells.iter().find(|c| c.attr("r") == Some(r)).unwrap();
+        assert_eq!(c.attr("jxcel-skip"), None, "一時の印が残っている");
+        let mut ts = vec![];
+        elements(c, "t", &mut ts);
+        ts.iter().map(|t| t.text()).collect::<String>()
+    };
+    assert_eq!(text_of("A2"), "{{#each 明細}}{{品目}}");
+    assert_eq!(text_of("B2"), "{{請求番号}}");
+    assert_eq!(text_of("C2"), "INV-7"); // 範囲の外は差し込む
+}
+
+#[test]
 fn xlsx_pivot_caches_refresh_when_a_sheet_without_loops_is_filled_in() {
     let mut pkg = Package::read(&nested_xlsx_with_other_references()).unwrap();
     // Sheet2（ループなし）に差し込みの欄を足す。これを元データにするキャッシュと、表名が元データのキャッシュ
