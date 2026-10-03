@@ -18,6 +18,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # 書き出した docx / xlsx が OOXML（ECMA-376）のスキーマに違反していないか。Word・Excel の実機に近い厳しさの検査
+      # （LibreOffice は構造が崩れていても黙って読むため、それでは見つからない崩れを見つける）
+      - name: OOXML のスキーマ検証
+        if: runner.os == 'Linux'
+        run: |
+          pip install lxml
+          cargo run -q -p jxcel-export --example make_verification_set -- target/verify
+          python3 crates/jxcel-export/verification/validate_schema.py target/verify
 
   ui:
     runs-on: ubuntu-latest

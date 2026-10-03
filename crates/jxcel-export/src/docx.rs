@@ -278,6 +278,7 @@ fn block_container(el: &mut Element, ctx: &mut Ctx, scope: &mut Scope) -> Result
                 rows: &items,
                 row_base: &base,
                 drop_marker_paragraphs: true,
+                emitted: std::cell::RefCell::new(vec![false; items.len()]),
             },
             (0, items.len() - 1),
             &blocks,
@@ -375,6 +376,7 @@ fn table(tbl: &mut Element, ctx: &mut Ctx, scope: &mut Scope) -> Result<bool> {
             rows: &rows,
             row_base: &row_base,
             drop_marker_paragraphs: false,
+            emitted: std::cell::RefCell::new(vec![false; rows.len()]),
         },
         (0, rows.len() - 1),
         &blocks,
@@ -399,6 +401,20 @@ struct Emit<'a> {
     row_base: &'a [usize],
     /// 印だけの段落を出力しない（本文の段落のループ）
     drop_marker_paragraphs: bool,
+    /// 行の直前の要素（`before`）を、もう出力した行。繰り返す行のコピーのたびに出さない（表の `tblPr` が重複する）。
+    /// 繰り返しが 0 件で行が消えるときも、直前の要素は 1 回だけ出す（`tblPr` が失われない）
+    emitted: std::cell::RefCell<Vec<bool>>,
+}
+
+impl Emit<'_> {
+    /// 行 `i` の直前の要素を、まだ出していなければ出力する。
+    fn flush_before(&self, i: usize, out: &mut Vec<Node>) {
+        let mut done = self.emitted.borrow_mut();
+        if !done[i] {
+            done[i] = true;
+            out.extend(self.rows[i].before.iter().cloned());
+        }
+    }
 }
 
 /// 行 `range`（両端を含む）を出力する。`blocks` の範囲は要素の数だけ繰り返し、それ以外の行はそのまま出す。
@@ -426,15 +442,19 @@ fn emit(
                 scope.pop();
                 r?;
             }
+            // 繰り返しが 0 件で行が出なかった場合も、範囲の行の直前の要素は残す
+            for k in b.first..=b.last {
+                e.flush_before(k, out);
+            }
             i = b.last + 1;
         } else {
             let r = &e.rows[i];
+            e.flush_before(i, out);
             if e.drop_marker_paragraphs && r.row.name == "w:p" && is_marker_only(&r.row) {
                 *changed = true;
                 i += 1;
                 continue;
             }
-            out.extend(r.before.iter().cloned());
             let mut row = r.row.clone();
             // 行の中の入れ子の表のループは、何回繰り返しても同じ番号から始める
             ctx.next_loop = e.row_base[i];

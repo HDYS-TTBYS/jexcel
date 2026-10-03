@@ -1418,6 +1418,64 @@ fn xlsx_pivot_tables_follow_the_shifted_rows_and_refresh_on_load() {
     assert_eq!(c2.attr("refreshOnLoad"), None);
 }
 
+/// 文書中のすべての表が、`tblPr`・`tblGrid`・（行）の順で、見出し部分が 1 回ずつであること
+/// （Word は順序が崩れた表を「修復しますか」と言って開く）。
+fn assert_tables_well_formed(zip: &[u8], what: &str) {
+    let root = part(zip, "word/document.xml");
+    let mut tables = vec![];
+    elements(&root, "tbl", &mut tables);
+    for t in tables {
+        let names: Vec<String> = t
+            .children
+            .iter()
+            .filter_map(|n| match n {
+                Node::Element(e) => Some(e.local().to_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            names.first().map(String::as_str),
+            Some("tblPr"),
+            "{what}: {names:?}"
+        );
+        assert_eq!(
+            names.get(1).map(String::as_str),
+            Some("tblGrid"),
+            "{what}: {names:?}"
+        );
+        assert_eq!(
+            names.iter().filter(|n| *n == "tblPr").count(),
+            1,
+            "{what}: {names:?}"
+        );
+        assert_eq!(
+            names.iter().filter(|n| *n == "tblGrid").count(),
+            1,
+            "{what}: {names:?}"
+        );
+        assert!(names[2..].iter().all(|n| n == "tr"), "{what}: {names:?}");
+        assert!(names.len() > 2, "{what}: 行のない表が残っている");
+    }
+}
+
+#[test]
+fn docx_tables_keep_their_properties_once_however_often_a_row_repeats() {
+    // 表の最初の行がループのとき、繰り返しで `tblPr`・`tblGrid` が行のコピーごとに重複しない
+    let fixtures: [(&str, &[u8]); 4] = [
+        ("nested", NESTED_DOCX),
+        ("nested-table", NESTED_TABLE_DOCX),
+        ("paragraphs", PARAGRAPHS_DOCX),
+        ("cell-paragraphs", CELL_PARAGRAPHS_DOCX),
+    ];
+    for (name, tpl) in fixtures {
+        let out =
+            render_with(Kind::Docx, tpl, &mut Nest::sample()).unwrap_or_else(|e| panic!("{e}"));
+        assert_tables_well_formed(&out, name);
+        let out = render_with(Kind::Docx, tpl, &mut Nest { items: vec![] }).unwrap();
+        assert_tables_well_formed(&out, &format!("{name}（0 件）"));
+    }
+}
+
 #[test]
 fn xlsx_dates_before_1900_are_written_as_text_and_reported() {
     // 日付の表示形式のセル（B2）に 1900 年より前の日付が来ると、Excel の日付にできないので文字列で書く。黙らず注意として返す

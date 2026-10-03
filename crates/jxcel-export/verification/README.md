@@ -15,6 +15,18 @@ cargo run -p jxcel-export --example make_verification_set -- ./verify
 
 テンプレートを作り直すとき（`verification/templates/*.xlsx`）は `python3 verification/make_templates.py 出力先 [--uno ポート]`。
 
+## 1.5. スキーマ検証（実機の代わりに、手元・CI でできる検査）
+
+```text
+pip install lxml
+python3 verification/validate_schema.py ./verify
+```
+
+OOXML（ECMA-376）のスキーマで、書き出した全部品（本文・シート・図形・グラフ・ピボット）を検証し、**書き出しで増えたエラー**だけを
+不具合として数える（初回にスキーマを取得する）。CI の `core (ubuntu)` ジョブでも毎回走る。LibreOffice は構造が崩れていても黙って
+読むので、Word・Excel が「修復しますか」と言う崩れは、これで見つける（実際にこの検査で、表の見出し部分が重複する不具合を直した）。
+実機そのものではないので、下の確認も残る。
+
 ## 2. Word（docx）で見る点
 
 まず、**開いたときに「内容に問題が見つかりました。修復しますか？」と出ないこと**。出たら、そのファイル名を知らせてほしい。
